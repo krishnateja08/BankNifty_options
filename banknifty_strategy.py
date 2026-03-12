@@ -3640,6 +3640,7 @@ document.addEventListener("click",function(e){{
 }});
 </script>
 
+<script>
 // ── Instrument Switcher Data & Logic ─────────────────────────────
 const INSTRUMENT_DATA = {{
   BANKNIFTY: {{
@@ -3803,6 +3804,7 @@ function _updateHeroForInstrument(d) {{
   const instLbls = document.querySelectorAll('.h-stat-lbl[data-stat="spot"]');
   instLbls.forEach(el => {{ el.textContent = d.name + ' SPOT'; }});
 }}
+</script>
 
 {greeks_script}
 {ANIMATED_JS}
