@@ -3407,6 +3407,15 @@ def generate_html(tech, oc, md, ts, vix_data=None, multi_expiry_analyzed=None, e
     bn_pcr_cls= oc["raw_oi_cls"]    if oc else "neutral"
     bn_expiry = oc["expiry"]        if oc else "N/A"
     bn_strikes_json = json.dumps(oc.get("strikes_data", [])) if oc else "[]"
+    # Gauge fields for BN hero widget
+    bn_raw_oi_dir = oc["raw_oi_dir"]       if oc else "UNKNOWN"
+    bn_raw_oi_sig = oc["raw_oi_sig"]       if oc else ""
+    bn_raw_oi_cls = oc["raw_oi_cls"]       if oc else "neutral"
+    bn_chg_bull   = oc["chg_bull_force"]   if oc else 0
+    bn_chg_bear   = oc["chg_bear_force"]   if oc else 0
+    bn_bull_pct   = oc["chg_bull_pct"]     if oc else 50
+    bn_bear_pct   = oc["chg_bear_pct"]     if oc else 50
+    bn_diff       = md["diff"]
     # Build BN all_expiry dict for JS
     _bn_all_exp = {}
     if multi_expiry_analyzed and expiry_list:
@@ -3451,6 +3460,15 @@ def generate_html(tech, oc, md, ts, vix_data=None, multi_expiry_analyzed=None, e
     fn_pcr_cls = fn_oc["raw_oi_cls"]    if fn_oc else "neutral"
     fn_expiry  = fn_oc["expiry"]        if fn_oc else "N/A"
     fn_strikes_json = json.dumps(fn_oc.get("strikes_data", [])) if fn_oc else "[]"
+    # Gauge fields for FN hero widget
+    fn_raw_oi_dir = fn_oc["raw_oi_dir"]       if fn_oc else "UNKNOWN"
+    fn_raw_oi_sig = fn_oc["raw_oi_sig"]       if fn_oc else "FinNifty data unavailable"
+    fn_raw_oi_cls = fn_oc["raw_oi_cls"]       if fn_oc else "neutral"
+    fn_chg_bull   = fn_oc["chg_bull_force"]   if fn_oc else 0
+    fn_chg_bear   = fn_oc["chg_bear_force"]   if fn_oc else 0
+    fn_bull_pct   = fn_oc["chg_bull_pct"]     if fn_oc else 50
+    fn_bear_pct   = fn_oc["chg_bear_pct"]     if fn_oc else 50
+    fn_diff       = fn_md["diff"]             if fn_md else 0
     # Build FN all_expiry dict for JS
     _fn_all_exp = {}
     if fn_multi_expiry and fn_expiry_list:
@@ -3681,7 +3699,11 @@ const INSTRUMENT_DATA = {{
     maxPain:{bn_maxpain}, maxCeStrike:{bn_max_ce}, maxPeStrike:{bn_max_pe},
     support:{bn_sup:.2f}, resistance:{bn_res:.2f}, strongSup:{bn_ssup:.2f}, strongRes:{bn_sres:.2f},
     bias:"{bn_bias}", biasConf:"{bn_conf}", bullScore:{bn_bull}, bearScore:{bn_bear},
+    diff:{bn_diff},
     oiDir:"{bn_oi_dir}", oiSig:"{bn_oi_sig}", pcr_col_cls:"{bn_pcr_cls}",
+    rawOiDir:"{bn_raw_oi_dir}", rawOiSig:"{bn_raw_oi_sig}", rawOiCls:"{bn_raw_oi_cls}",
+    chgBull:{bn_chg_bull}, chgBear:{bn_chg_bear},
+    bullPct:{bn_bull_pct}, bearPct:{bn_bear_pct},
     expiry:"{bn_expiry}", strikes:{bn_strikes_json}, allExpiry:{bn_all_expiry_json}
   }},
   FINNIFTY: {{
@@ -3690,7 +3712,11 @@ const INSTRUMENT_DATA = {{
     maxPain:{fn_maxpain}, maxCeStrike:{fn_max_ce}, maxPeStrike:{fn_max_pe},
     support:{fn_sup:.2f}, resistance:{fn_res:.2f}, strongSup:{fn_ssup:.2f}, strongRes:{fn_sres:.2f},
     bias:"{fn_bias}", biasConf:"{fn_conf}", bullScore:{fn_bull}, bearScore:{fn_bear},
+    diff:{fn_diff},
     oiDir:"{fn_oi_dir}", oiSig:"{fn_oi_sig}", pcr_col_cls:"{fn_pcr_cls}",
+    rawOiDir:"{fn_raw_oi_dir}", rawOiSig:"{fn_raw_oi_sig}", rawOiCls:"{fn_raw_oi_cls}",
+    chgBull:{fn_chg_bull}, chgBear:{fn_chg_bear},
+    bullPct:{fn_bull_pct}, bearPct:{fn_bear_pct},
     expiry:"{fn_expiry}", strikes:{fn_strikes_json}, allExpiry:{fn_all_expiry_json}
   }}
 }};
@@ -3744,6 +3770,90 @@ function switchInstrument(sym) {{
   }}
   const hdr = document.getElementById('hdrInstrumentName');
   if (hdr) hdr.textContent = d.name;
+
+  // ── Update Hero Gauge Widget ──────────────────────────────────
+  const C263 = 263.9;
+  function clamp(v,lo,hi){{ return Math.max(lo,Math.min(hi,v)); }}
+  function fmtChgOI(n) {{
+    if (Math.abs(n) >= 1000000) return (n>0?'+':'')+( n/1000000).toFixed(1)+'M';
+    if (Math.abs(n) >= 1000)    return (n>0?'+':'')+(n/1000).toFixed(0)+'K';
+    return (n>0?'+':'')+n;
+  }}
+  // Gauge arcs
+  const bullOffset = C263 * (1 - clamp(d.bullPct,10,97)/100);
+  const bearOffset = C263 * (1 - clamp(d.bearPct,10,97)/100);
+  document.querySelectorAll('circle[stroke="url(#bull-g)"]').forEach(el=>{{
+    el.style.strokeDashoffset = bullOffset.toFixed(1);
+  }});
+  document.querySelectorAll('circle[stroke="url(#bear-g)"]').forEach(el=>{{
+    el.style.strokeDashoffset = bearOffset.toFixed(1);
+  }});
+  // CHG BULL / CHG BEAR labels inside gauges
+  document.querySelectorAll('.g-val').forEach(el=>{{
+    const lbl = el.nextElementSibling;
+    if (!lbl) return;
+    if (lbl.textContent.trim() === 'CHG BULL') {{
+      el.textContent = fmtChgOI(d.chgBull);
+      el.style.color = '#00c896';
+    }} else if (lbl.textContent.trim() === 'CHG BEAR') {{
+      el.textContent = fmtChgOI(d.chgBear);
+      el.style.color = '#ff6b6b';
+    }}
+  }});
+  // OI signal text & colour
+  const dirColMap = {{ bullish:'#00c896', bearish:'#ff6b6b', neutral:'#6480ff' }};
+  const dirCol = dirColMap[d.rawOiCls] || '#6480ff';
+  const glowMap = {{ '#00c896':'0,200,150', '#ff6b6b':'255,107,107', '#6480ff':'100,128,255' }};
+  const glowRgb = glowMap[dirCol] || '100,128,255';
+  const sigEl = document.querySelector('.h-signal');
+  if (sigEl) {{
+    sigEl.textContent = d.rawOiDir;
+    sigEl.style.color = dirCol;
+    sigEl.style.textShadow = `0 0 20px rgba(${{glowRgb}},.6),0 0 40px rgba(${{glowRgb}},.3)`;
+  }}
+  const subEl = document.querySelector('.h-sub');
+  if (subEl) {{
+    const pcrCol = d.pcr > 1.2 ? '#00c896' : d.pcr < 0.7 ? '#ff6b6b' : '#6480ff';
+    subEl.innerHTML = d.rawOiSig + ' · PCR <span style="color:'+pcrCol+';font-weight:700;">'+d.pcr.toFixed(3)+'</span>';
+  }}
+  const eyeEl = document.querySelector('.h-eyebrow');
+  if (eyeEl) eyeEl.textContent = 'OI NET SIGNAL · ' + d.expiry + ' · SPOT ₹' + Math.round(d.spot).toLocaleString('en-IN');
+  // Bull/Bear strength bars
+  const pillRows = document.querySelectorAll('.pill-row');
+  pillRows.forEach(row => {{
+    const lbl  = row.querySelector('.pill-lbl');
+    const fill = row.querySelector('.pill-fill');
+    const num  = row.querySelector('.pill-num');
+    if (!lbl) return;
+    if (lbl.textContent.trim() === 'BULL STRENGTH') {{
+      const bPct = clamp(d.bullPct,10,97);
+      if (fill) fill.style.width = bPct + '%';
+      if (num)  {{ num.textContent = d.bullPct + '%'; num.style.color = '#00c896'; }}
+    }} else if (lbl.textContent.trim() === 'BEAR STRENGTH') {{
+      const bPct = clamp(d.bearPct,10,97);
+      if (fill) fill.style.width = bPct + '%';
+      if (num)  {{ num.textContent = d.bearPct + '%'; num.style.color = '#ff6b6b'; }}
+    }}
+  }});
+  // Bias chip & scores in h-stat-bottom
+  const bColMap = {{ BULLISH:'#00c896', BEARISH:'#ff6b6b', SIDEWAYS:'#6480ff' }};
+  const bCol  = bColMap[d.bias] || '#6480ff';
+  const bBg   = d.bias==='BULLISH'?'rgba(0,200,150,.08)': d.bias==='BEARISH'?'rgba(255,107,107,.08)':'rgba(100,128,255,.08)';
+  const bBdr  = d.bias==='BULLISH'?'rgba(0,200,150,.22)': d.bias==='BEARISH'?'rgba(255,107,107,.22)':'rgba(100,128,255,.22)';
+  const bArrow= d.bias==='BULLISH'?'▲': d.bias==='BEARISH'?'▼':'◆';
+  const chips = document.querySelectorAll('.h-chip');
+  chips.forEach(chip=>{{
+    if (chip.textContent.includes('▲')||chip.textContent.includes('▼')||chip.textContent.includes('◆')||
+        chip.textContent.includes('BULLISH')||chip.textContent.includes('BEARISH')||chip.textContent.includes('SIDEWAYS')) {{
+      chip.textContent = bArrow + '\u00a0' + d.bias;
+      chip.style.color  = bCol; chip.style.background = bBg; chip.style.borderColor = bBdr;
+    }} else if (chip.textContent.includes('CONF')) {{
+      chip.textContent = d.biasConf + '\u00a0CONF';
+    }}
+  }});
+  const scoreEl = document.querySelector('.h-score');
+  if (scoreEl) scoreEl.textContent = 'Bull\u00a0'+d.bullScore+' · Bear\u00a0'+d.bearScore+' · Diff\u00a0'+(d.diff>=0?'+':'')+d.diff;
+  // ─────────────────────────────────────────────────────────────
   OC.spot=d.spot; OC.atm=d.atm; OC.pcr=d.pcr; OC.maxPain=d.maxPain;
   OC.maxCeStrike=d.maxCeStrike; OC.maxPeStrike=d.maxPeStrike;
   OC.support=d.support; OC.resistance=d.resistance;
