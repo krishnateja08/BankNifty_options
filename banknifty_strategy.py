@@ -1624,7 +1624,6 @@ def build_strategies_html(oc_analysis, tech=None, md=None, multi_expiry_analyzed
 """
     + (f"""
 <script>
-var _activeInstrument = "BANKNIFTY"; // declared early so initAllCards can use it
 const OC={{
   spot:        {spot:.2f},
   atm:         {atm},
@@ -2582,23 +2581,19 @@ function popBadgeStyle(pop) {{
 }}
 
 function initAllCards() {{
-  const gridId = _activeInstrument === 'FINNIFTY' ? 'sc-grid-fn' : 'sc-grid';
-  const legendSuffix = _activeInstrument === 'FINNIFTY' ? 'FN' : '';
   let topPop=0, topName='', topCat='';
   const bullEx = smartPoP('bull_put_spread','bullish');
-  const el_b = document.getElementById('legendBiasVal'+legendSuffix);
+  const el_b = document.getElementById('legendBiasVal');
   if(el_b) {{ el_b.textContent=OC.bias+' ('+OC.biasConf+')'; el_b.style.color=OC.bias==='BULLISH'?'#00c896':OC.bias==='BEARISH'?'#ff6b6b':'#6480ff'; }}
   const srPts = bullEx.srAdj;
-  const el_sr = document.getElementById('legendSRVal'+legendSuffix);
+  const el_sr = document.getElementById('legendSRVal');
   if(el_sr) {{ const srLabel = srPts>5?'Near Support ✓':srPts<-5?'Near Resistance ✗':'Mid Range'; el_sr.textContent=srLabel+' ('+(srPts>=0?'+':'')+srPts+')'; el_sr.style.color=srPts>=0?'#00c896':'#ff6b6b'; }}
   const oiPts = bullEx.oiAdj;
-  const el_oi = document.getElementById('legendOIVal'+legendSuffix);
+  const el_oi = document.getElementById('legendOIVal');
   if(el_oi) {{ const oiLabel = OC.spot>OC.maxPeStrike?'Above PE Wall ✓':'Below PE Wall ✗'; el_oi.textContent=oiLabel+' ('+(oiPts>=0?'+':'')+oiPts+')'; el_oi.style.color=oiPts>=0?'#00c896':'#ff6b6b'; }}
-  const el_pcr = document.getElementById('legendPCRVal'+legendSuffix);
+  const el_pcr = document.getElementById('legendPCRVal');
   if(el_pcr) {{ const pcrLabel = OC.pcr>1.2?'Bullish PCR ':OC.pcr<0.8?'Bearish PCR ':'Neutral PCR '; el_pcr.textContent=pcrLabel+OC.pcr.toFixed(3); el_pcr.style.color=OC.pcr>1.2?'#00c896':OC.pcr<0.8?'#ff6b6b':'#6480ff'; }}
-  const _grid = document.getElementById(gridId);
-  if (!_grid) return;
-  _grid.querySelectorAll('.sc-card').forEach(card=>{{
+  document.querySelectorAll('.sc-card').forEach(card=>{{
     const shape=card.dataset.shape, cat=card.dataset.cat;
     const badge=document.getElementById('pop_'+card.id);
     try {{
@@ -2610,7 +2605,7 @@ function initAllCards() {{
       if(result.pop>topPop) {{ topPop=result.pop; topName=card.dataset.name; topCat=cat; }}
     }}catch(e){{card.dataset.pop=0;if(badge)badge.textContent='—%';}}
   }});
-  const el_rec = document.getElementById('legendRecVal'+legendSuffix);
+  const el_rec = document.getElementById('legendRecVal');
   if(el_rec && topName) {{
     const recCol = topCat==='bullish'?'#00c896':topCat==='bearish'?'#ff6b6b':'#6480ff';
     el_rec.innerHTML=`<span style="color:${{recCol}};">${{topName}}</span> <span style="color:rgba(255,255,255,.75);font-size:13px;">${{topPop}}% PoP</span>`;
@@ -2618,8 +2613,7 @@ function initAllCards() {{
 }}
 
 function sortGridByPoP(cat) {{
-  const gridId2 = _activeInstrument === 'FINNIFTY' ? 'sc-grid-fn' : 'sc-grid';
-  const grid=document.getElementById(gridId2); if(!grid)return;
+  const grid=document.getElementById('sc-grid'); if(!grid)return;
   const cards=Array.from(grid.querySelectorAll(`.sc-card[data-cat="${{cat}}"]`));
   cards.sort((a,b)=>parseInt(b.dataset.pop||0)-parseInt(a.dataset.pop||0));
   cards.forEach(c=>grid.appendChild(c));
@@ -2798,15 +2792,15 @@ body::before{content:'';position:fixed;inset:0;
 header{display:flex;align-items:center;justify-content:space-between;padding:14px 32px;
   background:rgba(6,8,15,.85);backdrop-filter:blur(16px);
   border-bottom:1px solid rgba(255,255,255,.07);position:sticky;top:0;z-index:200;
-  box-shadow:0 1px 0 rgba(0,200,150,.1);gap:20px;overflow:hidden;}
-.logo-wrap{position:relative;height:42px;overflow:hidden;min-width:140px;max-width:200px;flex-shrink:0;}
+  box-shadow:0 1px 0 rgba(0,200,150,.1)}
+.logo-wrap{position:relative;height:42px;overflow:hidden;min-width:400px;}
 .logo-slide{position:absolute;top:0;left:0;width:100%;font-family:var(--fh);font-size:29px;font-weight:700;
   background:linear-gradient(90deg,#00c896,#6480ff);-webkit-background-clip:text;-webkit-text-fill-color:transparent;
   filter:drop-shadow(0 0 12px rgba(0,200,150,.3));opacity:0;transform:translateY(20px);
   transition:opacity .5s ease, transform .5s ease;white-space:nowrap;}
 .logo-slide.active{opacity:1;transform:translateY(0);}
 .logo-slide.exit{opacity:0;transform:translateY(-20px);}
-.hdr-meta{display:flex;align-items:center;gap:14px;font-size:15.9px;color:var(--muted);font-family:var(--fm);flex-shrink:0;}
+.hdr-meta{display:flex;align-items:center;gap:14px;font-size:15.9px;color:var(--muted);font-family:var(--fm)}
 .live-dot{width:7px;height:7px;border-radius:50%;background:#00c896;box-shadow:0 0 10px #00c896;animation:pulse 2s infinite}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.2}}
 .refresh-countdown{display:flex;align-items:center;gap:8px;background:rgba(0,200,150,.07);
@@ -2974,13 +2968,7 @@ footer{padding:16px 32px;border-top:1px solid rgba(255,255,255,.06);background:r
 .greeks-tbl-strike{font-family:'DM Mono',monospace;font-size:17.4px;font-weight:700;color:rgba(255,255,255,.8);}
 .greeks-tbl-cell{font-family:'DM Mono',monospace;font-size:15.9px;font-weight:600;text-align:center;color:rgba(255,255,255,.65);}
 /* ── Instrument Switcher ─────────────────── */
-.hdr-right{display:flex;align-items:center;gap:14px;margin-left:auto;flex-shrink:0;}
-.instrument-switcher{display:flex;align-items:center;gap:8px;flex-shrink:0;}
-.hdr-sep{color:rgba(255,255,255,.15);flex-shrink:0;}
-.hdr-label{color:rgba(255,255,255,.75);font-size:15.9px;font-family:var(--fm);}
-.hdr-ts{color:rgba(255,255,255,.75);font-size:15.9px;font-family:var(--fm);}
-@media(max-width:1100px){.hdr-ts,.hdr-sep{display:none;}}
-@media(max-width:800px){.hdr-label{display:none;}}
+.instrument-switcher{display:flex;align-items:center;gap:6px;flex-shrink:0;}
 .inst-btn{padding:5px 14px;border-radius:20px;border:1px solid;cursor:pointer;
   font-family:var(--fh);font-size:14.5px;font-weight:700;transition:all .2s;background:transparent;
   letter-spacing:.5px;white-space:nowrap;}
@@ -3383,33 +3371,13 @@ def generate_html(tech, oc, md, ts, vix_data=None, multi_expiry_analyzed=None, e
     oi_html        = build_oi_html(oc)               if oc   else ""
     kl_html        = build_key_levels_html(tech, oc) if tech else ""
     strat_html     = build_strategies_html(oc, tech, md, multi_expiry_analyzed=multi_expiry_analyzed, expiry_list=expiry_list, lot_size=lot_size, emit_script=True)
-    _fn_strat_raw  = build_strategies_html(fn_oc, fn_tech, fn_md, multi_expiry_analyzed=fn_multi_expiry, expiry_list=fn_expiry_list, lot_size=60, emit_script=False) if fn_oc else ""
-    # Rename IDs in FN strat HTML to avoid conflicts with BN section
-    fn_strat_html  = (_fn_strat_raw
-        .replace('id="sc-grid"', 'id="sc-grid-fn"')
-        .replace('id="smartPopLegend"', 'id="smartPopLegendFN"')
-        .replace('id="legendBiasVal"', 'id="legendBiasValFN"')
-        .replace('id="legendSRVal"', 'id="legendSRValFN"')
-        .replace('id="legendOIVal"', 'id="legendOIValFN"')
-        .replace('id="legendPCRVal"', 'id="legendPCRValFN"')
-        .replace('id="legendRecVal"', 'id="legendRecValFN"')
-        .replace('id="sc_', 'id="fn_sc_')
-        .replace('id="pop_sc_', 'id="pop_fn_sc_')
-    ) if _fn_strat_raw else ""
+    fn_strat_html  = build_strategies_html(fn_oc, fn_tech, fn_md, multi_expiry_analyzed=fn_multi_expiry, expiry_list=fn_expiry_list, lot_size=60, emit_script=False) if fn_oc else ""
     strikes_html   = build_strikes_html(oc)
     ticker_html    = build_ticker_bar(tech, oc, vix_data)
     gauge_html     = build_dual_gauge_hero(oc, tech, md, ts, instrument=instrument)
     greeks_sidebar = build_greeks_sidebar_html(oc)
     greeks_script  = build_greeks_script_html(oc)
     greeks_table   = build_greeks_table_html(oc)
-    # ── FinNifty versions of all swappable sections ──
-    fn_oi_html        = build_oi_html(fn_oc)                  if fn_oc   else "<p style='color:rgba(255,255,255,.4);padding:20px'>FinNifty OI data unavailable</p>"
-    fn_kl_html        = build_key_levels_html(fn_tech, fn_oc) if fn_tech else "<p style='color:rgba(255,255,255,.4);padding:20px'>FinNifty key levels unavailable</p>"
-    fn_strikes_html   = build_strikes_html(fn_oc)             if fn_oc   else ""
-    fn_ticker_html    = build_ticker_bar(fn_tech, fn_oc, vix_data) if fn_oc else ""
-    fn_gauge_html     = build_dual_gauge_hero(fn_oc, fn_tech, fn_md, ts, instrument="FINNIFTY") if fn_oc else ""
-    fn_greeks_sidebar = build_greeks_sidebar_html(fn_oc)      if fn_oc   else ""
-    fn_greeks_table   = build_greeks_table_html(fn_oc)        if fn_oc   else ""
 
     C = 2 * 3.14159 * 7
     cp    = tech["price"] if tech else 0
@@ -3517,20 +3485,19 @@ def generate_html(tech, oc, md, ts, vix_data=None, multi_expiry_analyzed=None, e
 <div class="app">
 <header>
   <div class="logo-wrap" id="logoWrap"></div>
-  <div class="hdr-right">
+  <div class="hdr-meta">
+    <div class="live-dot"></div>
+    <span>NSE <span id="hdrInstrumentName">{instrument}</span> Options Dashboard</span>
+    <span style="color:rgba(255,255,255,.15);">|</span>
     <div class="instrument-switcher">
       <button class="inst-btn" id="instBtnBN" onclick="switchInstrument('BANKNIFTY')" style="border-color:rgba(0,200,150,.6);color:#00c896;background:rgba(0,200,150,.14);">&#9670; BankNifty</button>
       <button class="inst-btn" id="instBtnFN" onclick="switchInstrument('FINNIFTY')" style="border-color:rgba(255,255,255,.15);color:rgba(255,255,255,.5);">&#9671; FinNifty</button>
     </div>
-    <span class="hdr-sep">|</span>
-    <div class="hdr-meta">
-    <div class="live-dot"></div>
-    <span class="hdr-label">NSE <span id="hdrInstrumentName">{instrument}</span></span>
-    <span class="hdr-sep">|</span>
-    <span class="hdr-ts">Updated:&nbsp;<span style="color:#00c896;font-weight:600;">{ts}</span></span>
-    <span class="hdr-sep">|</span>
+    <span style="color:rgba(255,255,255,.15);">|</span>
+    <span style="color:rgba(255,255,255,.75);">Last report generated:&nbsp;<span style="color:#00c896;font-weight:600;">{ts}</span></span>
+    <span style="color:rgba(255,255,255,.15);">|</span>
     <span style="color:rgba(255,255,255,.75);">IST&nbsp;<span id="liveClock" style="font-family:'DM Mono',monospace;color:#ffd166;font-weight:700;letter-spacing:1px;">--:--:--</span></span>
-    <span class="hdr-sep">|</span>
+    <span style="color:rgba(255,255,255,.15);">|</span>
     <div class="refresh-countdown">
       <div class="countdown-arc-wrap">
         <svg width="18" height="18" viewBox="0 0 18 18">
@@ -3547,15 +3514,12 @@ def generate_html(tech, oc, md, ts, vix_data=None, multi_expiry_analyzed=None, e
     </div>
   </div>
 </header>
-<div id="tickerBN">{ticker_html}</div>
-<div id="tickerFN" style="display:none">{fn_ticker_html}</div>
-<div id="gaugeBN">{gauge_html}</div>
-<div id="gaugeFN" style="display:none">{fn_gauge_html}</div>
+{ticker_html}
+{gauge_html}
 <div class="main">
   <aside class="sidebar">
     <div class="sidebar-sticky-top">
-      <div id="greeksPanelBN">{greeks_sidebar}</div>
-      <div id="greeksPanelFN" style="display:none">{fn_greeks_sidebar}</div>
+      <div id="greeksPanel">{greeks_sidebar}</div>
     </div>
     <div class="sidebar-scroll">
     <div class="sb-sec">
@@ -3582,16 +3546,10 @@ def generate_html(tech, oc, md, ts, vix_data=None, multi_expiry_analyzed=None, e
       <button class="main-tab" id="mainTabStrat" onclick="switchMainTab('strat')">&#128203; Option Strategies Reference</button>
     </div>
     <div id="mainPanelOI">
-      <div id="oiBN"><div id="oi">{oi_html}</div>
+      <div id="oi">{oi_html}</div>
       <div id="kl">{kl_html}</div>
-      <div id="greeksTableBN">{greeks_table}</div>
-      <div id="strikes">{strikes_html}</div></div>
-      <div id="oiFN" style="display:none">
-        <div id="oiFN_inner">{fn_oi_html}</div>
-        <div id="klFN">{fn_kl_html}</div>
-        <div id="greeksTableFN">{fn_greeks_table}</div>
-        <div id="strikesFN">{fn_strikes_html}</div>
-      </div>
+      {greeks_table}
+      <div id="strikes">{strikes_html}</div>
       <div class="section">
         <div style="background:rgba(100,128,255,.06);border:1px solid rgba(100,128,255,.18);
                     border-left:3px solid #6480ff;border-radius:12px;padding:16px 18px;
@@ -3697,7 +3655,7 @@ const INSTRUMENT_DATA = {{
     expiry:"{fn_expiry}", strikes:{fn_strikes_json}, allExpiry:{fn_all_expiry_json}
   }}
 }};
-// _activeInstrument already declared above in Script 1
+let _activeInstrument = "BANKNIFTY";
 function switchInstrument(sym) {{
   if (sym === _activeInstrument) return;
   const d = INSTRUMENT_DATA[sym];
@@ -3706,18 +3664,10 @@ function switchInstrument(sym) {{
     return;
   }}
   _activeInstrument = sym;
-  const isBN = sym === 'BANKNIFTY';
-  // Swap ALL instrument-specific panels
-  const panelPairs = [
-    ['stratBN','stratFN'],['oiBN','oiFN'],['tickerBN','tickerFN'],
-    ['gaugeBN','gaugeFN'],['greeksPanelBN','greeksPanelFN']
-  ];
-  panelPairs.forEach(([bn,fn]) => {{
-    const elBN = document.getElementById(bn);
-    const elFN = document.getElementById(fn);
-    if (elBN) elBN.style.display = isBN ? '' : 'none';
-    if (elFN) elFN.style.display = isBN ? 'none' : '';
-  }});
+  const sBN = document.getElementById('stratBN');
+  const sFN = document.getElementById('stratFN');
+  if (sBN) sBN.style.display = sym==='BANKNIFTY' ? '' : 'none';
+  if (sFN) sFN.style.display = sym==='FINNIFTY'  ? '' : 'none';
   const bnBtn = document.getElementById('instBtnBN');
   const fnBtn = document.getElementById('instBtnFN');
   if (bnBtn && fnBtn) {{
