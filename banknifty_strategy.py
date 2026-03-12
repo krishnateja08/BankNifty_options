@@ -2730,7 +2730,7 @@ function buildIntradaySim(m) {{
       </td>
       <td style="padding:6px 8px;font-family:'DM Mono',monospace;font-size:13px;color:rgba(255,200,80,.82);white-space:nowrap;text-align:left;">${{(OC.spot+mv).toLocaleString('en-IN')}}</td>
       <td style="padding:6px 8px;font-family:'DM Mono',monospace;font-weight:700;font-size:15px;color:${{col}};white-space:nowrap;text-align:right;">${{pnl>=0?'+':''}}\u20b9${{Math.abs(pnl).toLocaleString('en-IN')}}</td>
-      <td style="padding:6px 6px;font-family:'DM Mono',monospace;font-size:13px;font-weight:700;color:${{col}};text-align:right;white-space:nowrap;">${{pctmp}}</td>
+      <td style="padding:6px 6px;font-family:'DM Mono',monospace;font-size:12px;font-weight:700;color:${{col}};text-align:right;white-space:nowrap;opacity:.75;">${{pctmp}}</td>
     </tr>`;
   }});
 
@@ -2759,9 +2759,9 @@ function buildIntradaySim(m) {{
       <thead>
         <tr style="background:rgba(0,0,0,.3);">
           <th style="padding:6px 10px;font-family:DM Mono,monospace;font-size:11px;font-weight:700;letter-spacing:1.2px;text-transform:uppercase;color:rgba(255,205,60,.85);text-align:left;border-bottom:1px solid rgba(255,185,0,.08);">MOVE</th>
-          <th style="padding:6px 8px;font-family:DM Mono,monospace;font-size:11px;font-weight:700;letter-spacing:1.2px;text-transform:uppercase;color:rgba(255,205,60,.85);text-align:left;border-bottom:1px solid rgba(255,185,0,.08);">TODAY P&amp;L</th>
-          <th style="padding:6px 8px;font-family:DM Mono,monospace;font-size:11px;font-weight:700;letter-spacing:1.2px;text-transform:uppercase;color:rgba(255,205,60,.85);text-align:right;border-bottom:1px solid rgba(255,185,0,.08);">VS MAX</th>
-          <th style="padding:6px 6px;border-bottom:1px solid rgba(255,185,0,.08);"></th>
+          <th style="padding:6px 8px;font-family:DM Mono,monospace;font-size:11px;font-weight:700;letter-spacing:1.2px;text-transform:uppercase;color:rgba(255,205,60,.85);text-align:left;border-bottom:1px solid rgba(255,185,0,.08);">NEW SPOT</th>
+          <th style="padding:6px 8px;font-family:DM Mono,monospace;font-size:11px;font-weight:700;letter-spacing:1.2px;text-transform:uppercase;color:rgba(255,205,60,.85);text-align:right;border-bottom:1px solid rgba(255,185,0,.08);">TODAY P&amp;L</th>
+          <th style="padding:6px 6px;border-bottom:1px solid rgba(255,185,0,.08);">VS MAX</th>
         </tr>
       </thead>
       <tbody>${{tRows}}</tbody>
