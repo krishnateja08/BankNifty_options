@@ -3421,16 +3421,17 @@ def generate_html(tech, oc, md, ts, vix_data=None, multi_expiry_analyzed=None, e
 
     # ── FinNifty data for JS INSTRUMENT_DATA blob ──
     lot_size_fn = 60
-    fn_spot    = fn_oc["underlying"]    if fn_oc else 0
-    fn_atm     = fn_oc["atm_strike"]    if fn_oc else 0
-    fn_pcr = fn_oc["pcr_oi"]        if fn_oc else 1.0
-    fn_maxpain = fn_oc["max_pain"]  if fn_oc else 0
+    fn_spot    = fn_oc["underlying"]    if fn_oc else None
+    fn_atm     = fn_oc["atm_strike"]    if fn_oc else None
+    fn_pcr     = fn_oc["pcr_oi"]        if fn_oc else 1.0
+    fn_maxpain = fn_oc["max_pain"]      if fn_oc else 0
     fn_max_ce  = fn_oc["max_ce_strike"] if fn_oc else 0
     fn_max_pe  = fn_oc["max_pe_strike"] if fn_oc else 0
-    fn_sup     = fn_tech["support"]     if fn_tech else fn_spot - 150
-    fn_res     = fn_tech["resistance"]  if fn_tech else fn_spot + 150
-    fn_ssup    = fn_tech["strong_sup"]  if fn_tech else fn_spot - 300
-    fn_sres    = fn_tech["strong_res"]  if fn_tech else fn_spot + 300
+    _fn_spot_fallback = fn_spot if fn_spot is not None else 0
+    fn_sup     = fn_tech["support"]     if fn_tech else _fn_spot_fallback - 150
+    fn_res     = fn_tech["resistance"]  if fn_tech else _fn_spot_fallback + 150
+    fn_ssup    = fn_tech["strong_sup"]  if fn_tech else _fn_spot_fallback - 300
+    fn_sres    = fn_tech["strong_res"]  if fn_tech else _fn_spot_fallback + 300
     fn_bias    = fn_md["bias"]          if fn_md else "SIDEWAYS"
     fn_conf    = fn_md["confidence"]    if fn_md else "LOW"
     fn_bull    = fn_md["bull"]          if fn_md else 4
@@ -3440,6 +3441,9 @@ def generate_html(tech, oc, md, ts, vix_data=None, multi_expiry_analyzed=None, e
     fn_pcr_cls = fn_oc["raw_oi_cls"]    if fn_oc else "neutral"
     fn_expiry  = fn_oc["expiry"]        if fn_oc else "N/A"
     fn_strikes_json = json.dumps(fn_oc.get("strikes_data", [])) if fn_oc else "[]"
+    # Safe JS-renderable values (null when data unavailable, not 0)
+    fn_spot_js = f"{fn_spot:.2f}" if fn_spot is not None else "null"
+    fn_atm_js  = str(fn_atm)      if fn_atm  is not None else "null"
     # Build FN all_expiry dict for JS
     _fn_all_exp = {}
     if fn_multi_expiry and fn_expiry_list:
@@ -3651,8 +3655,8 @@ const INSTRUMENT_DATA = {{
   FINNIFTY: {{
     name: "FinNifty",
     lotSize: {lot_size_fn},
-    spot: {fn_spot:.2f},
-    atm: {fn_atm},
+    spot: {fn_spot_js},
+    atm: {fn_atm_js},
     pcr: {fn_pcr:.3f},
     maxPain: {fn_maxpain},
     maxCeStrike: {fn_max_ce},
@@ -3678,14 +3682,13 @@ let _activeInstrument = "{default_instrument}";
 
 function switchInstrument(sym) {{
   if (sym === _activeInstrument) return;
-  _activeInstrument = sym;
   const d = INSTRUMENT_DATA[sym];
-  if (!d || d.spot === 0) {{
+  if (!d || d.spot === null || d.spot === undefined) {{
     console.warn('switchInstrument: no data for', sym);
     alert(sym + ' data is unavailable (fetch may have failed during last run). Retrying on next refresh.');
-    _activeInstrument = sym === 'FINNIFTY' ? 'BANKNIFTY' : 'FINNIFTY'; // revert
-    return;
+    return;  // _activeInstrument unchanged — no revert needed
   }}
+  _activeInstrument = sym;
 
   // ── Update header buttons ──
   const bnBtn = document.getElementById('instBtnBN');
