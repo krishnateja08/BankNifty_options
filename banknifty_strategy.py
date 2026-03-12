@@ -1791,6 +1791,12 @@ function calcMetrics(shape, smartPop) {{
   const ceWing1 = co1.strike - atm;
   const peWing1 = atm - po1.strike;
 
+  // Near-expiry LTP for calendar strategies (real data from ALL_EXPIRY_DATA)
+  // Must be declared BEFORE _LTP_REQS to avoid JS Temporal Dead Zone errors.
+  const nearCeLTP  = getNearExpiryATMLTP('ce');
+  const nearPeLTP  = getNearExpiryATMLTP('pe');
+  const nearCo1LTP = getNearExpiryOTMLTP('ce', 1);
+
   // ── LTP Gate: never recommend a strategy when any required LTP is null/zero ──
   // If NSE hasn't traded a strike yet (LTP = 0 / null), all P&L figures would be
   // fabricated.  Return null → calling code hides the card entirely.
@@ -1837,11 +1843,6 @@ function calcMetrics(shape, smartPop) {{
   const _reqs = _LTP_REQS[shape];
   if (_reqs && _reqs.some(v => !(v > 0))) return null;
   // ─────────────────────────────────────────────────────────────────────────────
-
-  // Near-expiry LTP for calendar strategies (real data from ALL_EXPIRY_DATA)
-  const nearCeLTP  = getNearExpiryATMLTP('ce');
-  const nearPeLTP  = getNearExpiryATMLTP('pe');
-  const nearCo1LTP = getNearExpiryOTMLTP('ce', 1);
 
   // Greeks helpers
   const gCeAtm = getGreeks('ce', atm);
