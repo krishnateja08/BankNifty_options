@@ -1217,10 +1217,10 @@ def build_oi_html(oc):
     net_pct_display = f"+{net_pct}%" if net_is_bullish else f"−{net_pct}%"
 
     dir_card = f"""
-<div style="display:flex;align-items:stretch;border:1px solid {dir_bdr};border-radius:14px;
+<div style="display:flex;align-items:stretch;flex-wrap:wrap;border:1px solid {dir_bdr};border-radius:14px;
   background:{dir_bg};overflow:hidden;margin-bottom:16px;">
-  <div style="padding:18px 24px;min-width:200px;border-right:1px solid rgba(255,255,255,.07);
-    display:flex;flex-direction:column;justify-content:center;flex-shrink:0;">
+  <div style="padding:18px 24px;min-width:140px;border-right:1px solid rgba(255,255,255,.07);
+    display:flex;flex-direction:column;justify-content:center;flex-shrink:0;flex:0 0 auto;">
     <div style="font-size:12.3px;letter-spacing:2px;text-transform:uppercase;color:rgba(255,255,255,.65);margin-bottom:7px;">OI CHANGE DIRECTION</div>
     <div style="font-size:30.4px;font-weight:700;color:{dir_col};line-height:1.1;margin-bottom:5px;">{oi_dir}</div>
     <div style="font-size:15.2px;color:{dir_col};opacity:.7;">{oi_sig}</div>
@@ -1567,23 +1567,23 @@ def build_strategies_html(oc_analysis, tech=None, md=None, multi_expiry_analyzed
       </div>
     </div>
     <div style="display:flex;gap:10px;flex-wrap:wrap;flex:1;">
-      <div id="legendBias" style="background:rgba(0,0,0,.2);border-radius:8px;padding:8px 12px;min-width:130px;">
+      <div id="legendBias" style="background:rgba(0,0,0,.2);border-radius:8px;padding:8px 12px;min-width:100px;flex:1;">
         <div style="font-size:11.6px;color:rgba(255,255,255,.68);letter-spacing:1.5px;text-transform:uppercase;margin-bottom:4px;">A · BIAS</div>
         <div id="legendBiasVal" style="font-family:'DM Mono',monospace;font-size:17.4px;font-weight:700;color:#8aa0ff;">—</div>
       </div>
-      <div id="legendSR" style="background:rgba(0,0,0,.2);border-radius:8px;padding:8px 12px;min-width:160px;">
+      <div id="legendSR" style="background:rgba(0,0,0,.2);border-radius:8px;padding:8px 12px;min-width:120px;flex:1;">
         <div style="font-size:11.6px;color:rgba(255,255,255,.68);letter-spacing:1.5px;text-transform:uppercase;margin-bottom:4px;">B · S/R ZONE</div>
         <div id="legendSRVal" style="font-family:'DM Mono',monospace;font-size:17.4px;font-weight:700;color:#ffd166;">—</div>
       </div>
-      <div id="legendOI" style="background:rgba(0,0,0,.2);border-radius:8px;padding:8px 12px;min-width:160px;">
+      <div id="legendOI" style="background:rgba(0,0,0,.2);border-radius:8px;padding:8px 12px;min-width:120px;flex:1;">
         <div style="font-size:11.6px;color:rgba(255,255,255,.68);letter-spacing:1.5px;text-transform:uppercase;margin-bottom:4px;">C · OI WALLS</div>
         <div id="legendOIVal" style="font-family:'DM Mono',monospace;font-size:17.4px;font-weight:700;color:#00c8e0;">—</div>
       </div>
-      <div id="legendPCR" style="background:rgba(0,0,0,.2);border-radius:8px;padding:8px 12px;min-width:120px;">
+      <div id="legendPCR" style="background:rgba(0,0,0,.2);border-radius:8px;padding:8px 12px;min-width:100px;flex:1;">
         <div style="font-size:11.6px;color:rgba(255,255,255,.68);letter-spacing:1.5px;text-transform:uppercase;margin-bottom:4px;">D · PCR</div>
         <div id="legendPCRVal" style="font-family:'DM Mono',monospace;font-size:17.4px;font-weight:700;color:#00c896;">—</div>
       </div>
-      <div id="legendRec" style="background:rgba(0,200,150,.06);border:1px solid rgba(0,200,150,.2);border-radius:8px;padding:8px 12px;min-width:180px;">
+      <div id="legendRec" style="background:rgba(0,200,150,.06);border:1px solid rgba(0,200,150,.2);border-radius:8px;padding:8px 12px;min-width:140px;flex:1;">
         <div style="font-size:11.6px;color:rgba(0,200,150,.6);letter-spacing:1.5px;text-transform:uppercase;margin-bottom:4px;">&#9733; TOP STRATEGY</div>
         <div id="legendRecVal" style="font-size:15.9px;font-weight:700;color:#00c896;">Calculating...</div>
       </div>
@@ -1641,7 +1641,8 @@ const OC={{
   bearScore:   {bear_sc},
   strikes:     {strikes_json},
   lotSize:     {lot_size},
-  strikeStep:  100
+  strikeStep:  100,
+  instName:    "BankNifty"
 }};
 
 const STRIKE_MAP={{}};
@@ -2653,7 +2654,8 @@ function buildIntradaySim(m) {{
       <div style="font-family:DM Mono,monospace;font-size:12px;font-weight:700;letter-spacing:1.2px;text-transform:uppercase;color:rgba(255,210,0,.95);">📋 TODAY'S P&amp;L SCENARIOS</div>
       <div style="font-family:DM Mono,monospace;font-size:11px;color:rgba(255,200,60,.7);background:rgba(0,0,0,.25);padding:2px 8px;border-radius:4px;">Delta×move + Theta · 1 day</div>
     </div>
-    <table style="width:100%;border-collapse:collapse;">
+    <div style="overflow-x:auto;-webkit-overflow-scrolling:touch;">
+    <table style="width:100%;min-width:280px;border-collapse:collapse;">
       <thead>
         <tr style="background:rgba(0,0,0,.3);">
           <th style="padding:6px 10px;font-family:DM Mono,monospace;font-size:11px;font-weight:700;letter-spacing:1.2px;text-transform:uppercase;color:rgba(255,205,60,.85);text-align:left;border-bottom:1px solid rgba(255,185,0,.08);">MOVE</th>
@@ -2664,6 +2666,7 @@ function buildIntradaySim(m) {{
       </thead>
       <tbody>${{tRows}}</tbody>
     </table>
+    </div>
     <div style="padding:9px 12px;font-family:DM Mono,monospace;font-size:11px;color:rgba(255,200,70,.75);background:rgba(0,0,0,.25);border-top:1px solid rgba(255,185,0,.1);line-height:1.7;">
       © P&amp;L = <span style="color:rgba(255,215,0,.9);">Delta×move</span> + <span style="color:rgba(255,215,0,.9);">Theta (1 day)</span>. Actual exit P&amp;L may differ due to IV changes. Max profit of ${{m.mpStr}} is achievable at expiry only.
     </div>
@@ -2716,7 +2719,7 @@ function buildIntradaySim(m) {{
         </div>
       </div>
       <div style="margin-top:9px;font-family:DM Mono,monospace;font-size:12px;color:rgba(255,200,70,.75);line-height:1.7;">
-        ${{nt < 0 ? '🔴 <span style="color:#f04050;font-weight:700;">Theta negative</span> — you pay \u20b9' + Math.abs(Math.round(nt)).toLocaleString("en-IN") + '/day for holding. Need BankNifty to move <span style="color:#ffcc00;font-weight:700;">' + Math.ceil(Math.abs(nt)/Math.abs(nd||1)) + ' pts</span> just to break even today.' : '🟢 <span style="color:#38d888;font-weight:700;">Theta positive</span> — you earn \u20b9' + Math.abs(Math.round(nt)).toLocaleString("en-IN") + '/day time decay. Premium selling strategy benefits from flat market.'}}
+        ${{nt < 0 ? '🔴 <span style="color:#f04050;font-weight:700;">Theta negative</span> — you pay \u20b9' + Math.abs(Math.round(nt)).toLocaleString("en-IN") + '/day for holding. Need <b>' + (OC.instName||'Index') + '</b> to move <span style="color:#ffcc00;font-weight:700;">' + Math.ceil(Math.abs(nt)/Math.abs(nd||1)) + ' pts</span> just to break even today.' : '🟢 <span style="color:#38d888;font-weight:700;">Theta positive</span> — you earn \u20b9' + Math.abs(Math.round(nt)).toLocaleString("en-IN") + '/day time decay. Premium selling strategy benefits from flat market.'}}
       </div>
     </div>
   </div>
@@ -2732,7 +2735,7 @@ function buildIntradaySim(m) {{
         <span id="${{simId}}_slv" style="font-weight:700;color:#ffcc00;background:rgba(255,185,0,.12);border:1px solid rgba(255,185,0,.35);border-radius:4px;padding:2px 10px;">Spot: \u20b9${{OC.spot.toLocaleString('en-IN')}}</span>
         <span style="color:#ffcc00;">\u20b9${{slMax.toLocaleString('en-IN')}}</span>
       </div>
-      <input type="range" id="${{simId}}_sl" min="${{slMin}}" max="${{slMax}}" value="${{OC.spot}}" step="100"
+      <input type="range" id="${{simId}}_sl" min="${{slMin}}" max="${{slMax}}" value="${{OC.spot}}" step="${{OC.strikeStep||100}}"
         style="width:100%;height:5px;border-radius:3px;outline:none;border:none;-webkit-appearance:none;cursor:pointer;background:linear-gradient(90deg,#ffcc00 50%,rgba(255,185,0,.2) 50%);"
         onclick="event.stopPropagation()" onmousedown="event.stopPropagation()" ontouchstart="event.stopPropagation()" oninput="simSlide('${{simId}}', this.value, ${{slMin}}, ${{slMax}}, ${{nd}}, ${{nt}}, ${{maxL===null?'null':maxL}}, ${{maxP===null?'null':maxP}})">
     </div>
@@ -2791,7 +2794,7 @@ function simSlide(simId, val, slMin, slMax, nd, nt, maxL, maxP) {{
   const pEl = document.getElementById(simId + '_spnl');
   if (pEl) {{ pEl.textContent = (pnl>=0?'+':'') + '\u20b9' + Math.abs(pnl).toLocaleString('en-IN'); pEl.style.color = col; }}
   const nEl = document.getElementById(simId + '_snote');
-  if (nEl) nEl.textContent = move > 0 ? `BankNifty up ${{move}} pts` : move < 0 ? `BankNifty down ${{Math.abs(move)}} pts` : 'Flat market — theta drag only';
+  if (nEl) nEl.textContent = move > 0 ? `${{OC.instName||'Index'}} up ${{move}} pts` : move < 0 ? `${{OC.instName||'Index'}} down ${{Math.abs(move)}} pts` : 'Flat market — theta drag only';
   const deltaPnl = Math.round(nd * move);
   const dEl = document.getElementById(simId + '_sdelta');
   if (dEl) {{ dEl.textContent = (deltaPnl>=0?'+':'') + '\u20b9' + Math.abs(deltaPnl).toLocaleString('en-IN'); dEl.style.color = deltaPnl >= 0 ? '#38d888' : '#f04050'; }}
@@ -3343,6 +3346,30 @@ footer{padding:16px 32px;border-top:1px solid rgba(255,255,255,.06);background:r
   .logo-slide{font-size:18px;}
   #smartPopLegend{flex-direction:column;}
   .hdr-meta>span:not(:first-child):not(:last-child){display:none;}
+  .sc-card.expanded .sc-detail{overflow-x:auto;-webkit-overflow-scrolling:touch;}
+}
+@media(max-width:380px){
+  .sc-grid{grid-template-columns:1fr;}
+  .gauge-wrap{width:54px;height:54px;}
+  .g-val{font-size:11px;}
+  .g-lbl{font-size:8px;}
+  .h-signal{font-size:16px;}
+  .h-gauges{gap:2px;padding:6px 8px;}
+  .section{padding:10px 8px;}
+  .h-stat{min-width:calc(50% - 2px);}
+  .h-stat-val{font-size:13px;}
+  .h-stat-lbl{font-size:7px;}
+  .s-table th,.s-table td{padding:6px 6px;font-size:12px;}
+  .sc-name{font-size:13px;}
+  .sc-legs{font-size:10px;}
+  .sc-pop-badge{font-size:11px;padding:2px 5px;}
+  .main-tab{font-size:8px;padding:4px 6px;}
+  .kl-val{font-size:12px;}
+  .kl-lbl{font-size:11px;}
+  header{padding:8px 10px;}
+  footer{padding:10px 8px;font-size:12px;}
+  #smartPopLegend>div{flex-direction:column;}
+  .oi-ticker-hdr,.oi-ticker-row{min-width:420px;}
 }
 """
 
@@ -4102,7 +4129,7 @@ function switchInstrument(sym) {{
   OC.strongSup=d.strongSup; OC.strongRes=d.strongRes;
   OC.bias=d.bias; OC.biasConf=d.biasConf;
   OC.bullScore=d.bullScore; OC.bearScore=d.bearScore;
-  OC.lotSize=d.lotSize; OC.strikeStep=d.strikeStep; OC.strikes=d.strikes; OC.expiry=d.expiry;
+  OC.lotSize=d.lotSize; OC.strikeStep=d.strikeStep; OC.instName=d.name; OC.strikes=d.strikes; OC.expiry=d.expiry;
   Object.keys(STRIKE_MAP).forEach(k=>delete STRIKE_MAP[k]);
   OC.strikes.forEach(s=>{{ STRIKE_MAP[s.strike]=s; }});
   Object.keys(ALL_EXPIRY_DATA).forEach(k=>delete ALL_EXPIRY_DATA[k]);
