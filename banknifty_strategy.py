@@ -1744,6 +1744,53 @@ function calcMetrics(shape, smartPop) {{
   const ceWing1 = co1.strike - atm;
   const peWing1 = atm - po1.strike;
 
+  // ── LTP Gate: never recommend a strategy when any required LTP is null/zero ──
+  // If NSE hasn't traded a strike yet (LTP = 0 / null), all P&L figures would be
+  // fabricated.  Return null → calling code hides the card entirely.
+  const _LTP_REQS = {{
+    long_call:         [ce_atm],
+    long_put:          [pe_atm],
+    short_call:        [ce_atm],
+    short_put:         [pe_atm],
+    bull_call_spread:  [ce_atm, co1.ltp],
+    bear_call_spread:  [ce_atm, co1.ltp],
+    bull_put_spread:   [pe_atm, po1.ltp],
+    bear_put_spread:   [pe_atm, po1.ltp],
+    long_straddle:     [ce_atm, pe_atm],
+    short_straddle:    [ce_atm, pe_atm],
+    long_strangle:     [co1.ltp, po1.ltp],
+    short_strangle:    [co1.ltp, po1.ltp],
+    short_iron_fly:    [ce_atm, pe_atm, co1.ltp, po1.ltp],
+    long_iron_fly:     [ce_atm, pe_atm, co1.ltp, po1.ltp],
+    short_iron_condor: [co1.ltp, co2.ltp, po1.ltp, po2.ltp],
+    long_iron_condor:  [co1.ltp, co2.ltp, po1.ltp, po2.ltp],
+    call_butterfly:    [ce_atm, co1.ltp, co2.ltp],
+    bull_butterfly:    [ce_atm, co1.ltp, co2.ltp],
+    put_butterfly:     [pe_atm, po1.ltp, po2.ltp],
+    bear_butterfly:    [pe_atm, po1.ltp, po2.ltp],
+    call_ratio_back:   [ce_atm, co1.ltp],
+    put_ratio_back:    [pe_atm, po1.ltp],
+    call_ratio_spread: [ce_atm, co1.ltp],
+    put_ratio_spread:  [pe_atm, po1.ltp],
+    long_synthetic:    [ce_atm, pe_atm],
+    short_synthetic:   [ce_atm, pe_atm],
+    risk_reversal:     [po1.ltp, co1.ltp],
+    range_forward:     [co1.ltp, po1.ltp],
+    jade_lizard:       [po1.ltp, co1.ltp, co2.ltp],
+    reverse_jade:      [co1.ltp, po1.ltp, po2.ltp],
+    bull_condor:       [ce_atm, co1.ltp, co2.ltp, co3.ltp],
+    bear_condor:       [pe_atm, po1.ltp, po2.ltp, po3.ltp],
+    batman:            [ce_atm, co1.ltp, co2.ltp],
+    double_fly:        [ce_atm, pe_atm, co1.ltp, co2.ltp, po1.ltp, po2.ltp],
+    double_condor:     [ce_atm, pe_atm, co1.ltp, co2.ltp, co3.ltp, po1.ltp, po2.ltp, po3.ltp],
+    call_calendar:     [ce_atm],
+    put_calendar:      [pe_atm],
+    diagonal_calendar: [ce_atm, co1.ltp],
+  }};
+  const _reqs = _LTP_REQS[shape];
+  if (_reqs && _reqs.some(v => !(v > 0))) return null;
+  // ─────────────────────────────────────────────────────────────────────────────
+
   // Greeks helpers
   const gCeAtm = getGreeks('ce', atm);
   const gPeAtm = getGreeks('pe', atm);
@@ -2836,6 +2883,14 @@ function initAllCards() {{
     try {{
       const result = smartPoP(shape, cat);
       const m=calcMetrics(shape, result.pop);
+      // ── Hide card if any required LTP is missing/zero (no live data) ──
+      if (m === null) {{
+        card.style.display = 'none';
+        card.dataset.pop = 0;
+        if (badge) {{ badge.textContent = '—'; badge.setAttribute('style', popBadgeStyle(0)); }}
+        return;
+      }}
+      card.style.display = '';   // restore if previously hidden
       card.dataset.pop=result.pop;
       card.dataset.scoreBreakdown=JSON.stringify(result);
       if(badge) {{ badge.textContent=result.pop+'%'; badge.setAttribute('style', popBadgeStyle(result.pop)); }}
@@ -4006,7 +4061,11 @@ document.addEventListener("click",function(e){{
           const shape=card.dataset.shape, cat=card.dataset.cat;
           const scoreResult=smartPoP(shape,cat);
           const m=calcMetrics(shape,scoreResult.pop);
-          mel.innerHTML=renderMetrics(m, scoreResult);
+          if (m === null) {{
+            mel.innerHTML='<div style="padding:18px 14px;color:#ff9a3c;font-family:DM Mono,monospace;font-size:13px;">⚠ Live LTP unavailable for one or more legs of this strategy.<br><span style="opacity:.7;font-size:12px;">This strike has not traded today. The card will reappear once NSE reports a live price.</span></div>';
+          }} else {{
+            mel.innerHTML=renderMetrics(m, scoreResult);
+          }}
         }}catch(err){{mel.innerHTML='<div class="sc-loading">Could not calculate metrics</div>';}}
       }}
     }}
