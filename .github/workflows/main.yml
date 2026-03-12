@@ -1,0 +1,62 @@
+name: Deploy BankNifty Dashboard to GitHub Pages
+on:
+  push:
+    branches: [ main ]
+  schedule:
+    # Run at 9:15 AM, 11:30 AM, 1:30 PM, 3:45 PM IST
+    # (IST = UTC+5:30 so subtract 5:30 from above)
+    - cron: '45 3 * * 1-5'   # 9:15 AM IST
+    - cron: '00 6 * * 1-5'   # 11:30 AM IST
+    - cron: '00 8 * * 1-5'   # 1:30 PM IST
+    - cron: '15 10 * * 1-5'  # 3:45 PM IST
+  workflow_dispatch:          # manual trigger button
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+jobs:
+  # ── Job 1: Build ─────────────────────────────────────────────
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install curl_cffi pandas numpy yfinance pytz beautifulsoup4 requests scipy
+      - name: Run dashboard generator
+        run: python banknifty_strategy.py
+      - name: Verify output
+        run: |
+          echo "=== Output files ==="
+          ls -lh docs/
+          echo "=== HTML preview (first 5 lines) ==="
+          head -5 docs/banknifty.html
+      - name: Setup GitHub Pages
+        uses: actions/configure-pages@v4
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: 'docs'
+  # ── Job 2: Deploy ────────────────────────────────────────────
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
