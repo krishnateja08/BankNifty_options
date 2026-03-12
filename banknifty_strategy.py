@@ -1624,6 +1624,7 @@ def build_strategies_html(oc_analysis, tech=None, md=None, multi_expiry_analyzed
 """
     + (f"""
 <script>
+var _activeInstrument = "BANKNIFTY"; // declared early so initAllCards can use it
 const OC={{
   spot:        {spot:.2f},
   atm:         {atm},
@@ -2595,7 +2596,9 @@ function initAllCards() {{
   if(el_oi) {{ const oiLabel = OC.spot>OC.maxPeStrike?'Above PE Wall ✓':'Below PE Wall ✗'; el_oi.textContent=oiLabel+' ('+(oiPts>=0?'+':'')+oiPts+')'; el_oi.style.color=oiPts>=0?'#00c896':'#ff6b6b'; }}
   const el_pcr = document.getElementById('legendPCRVal'+legendSuffix);
   if(el_pcr) {{ const pcrLabel = OC.pcr>1.2?'Bullish PCR ':OC.pcr<0.8?'Bearish PCR ':'Neutral PCR '; el_pcr.textContent=pcrLabel+OC.pcr.toFixed(3); el_pcr.style.color=OC.pcr>1.2?'#00c896':OC.pcr<0.8?'#ff6b6b':'#6480ff'; }}
-  document.getElementById(gridId).querySelectorAll('.sc-card').forEach(card=>{{
+  const _grid = document.getElementById(gridId);
+  if (!_grid) return;
+  _grid.querySelectorAll('.sc-card').forEach(card=>{{
     const shape=card.dataset.shape, cat=card.dataset.cat;
     const badge=document.getElementById('pop_'+card.id);
     try {{
@@ -3687,7 +3690,7 @@ const INSTRUMENT_DATA = {{
     expiry:"{fn_expiry}", strikes:{fn_strikes_json}, allExpiry:{fn_all_expiry_json}
   }}
 }};
-let _activeInstrument = "BANKNIFTY";
+// _activeInstrument already declared above in Script 1
 function switchInstrument(sym) {{
   if (sym === _activeInstrument) return;
   const d = INSTRUMENT_DATA[sym];
