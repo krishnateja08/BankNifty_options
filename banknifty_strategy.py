@@ -231,7 +231,8 @@ class NSEOptionChain:
                 if not data:
                     return None
                 underlying = json_data.get("records", {}).get("underlyingValue", 0)
-                atm_strike = round(underlying / 100) * 100
+                step = 50 if self.symbol == "FINNIFTY" else 100
+                atm_strike = round(underlying / step) * step
                 lower_bound = underlying - 2000
                 upper_bound = underlying + 2000
                 rows = []
@@ -1460,7 +1461,7 @@ STRATEGIES_DATA = {
 }
 
 
-def build_strategies_html(oc_analysis, tech=None, md=None, multi_expiry_analyzed=None, expiry_list=None, lot_size=30):
+def build_strategies_html(oc_analysis, tech=None, md=None, multi_expiry_analyzed=None, expiry_list=None, lot_size=30, emit_script=True):
     spot       = oc_analysis["underlying"]   if oc_analysis else 23000
     atm        = oc_analysis["atm_strike"]   if oc_analysis else 23000
     pcr        = oc_analysis["pcr_oi"]       if oc_analysis else 1.0
@@ -1468,9 +1469,6 @@ def build_strategies_html(oc_analysis, tech=None, md=None, multi_expiry_analyzed
     max_ce_s   = oc_analysis["max_ce_strike"] if oc_analysis else atm + 200
     max_pe_s   = oc_analysis["max_pe_strike"] if oc_analysis else atm - 200
     strikes_json = json.dumps(oc_analysis.get("strikes_data", [])) if oc_analysis else "[]"
-    expiry_label = oc_analysis["expiry"] if oc_analysis else "N/A"
-    # Use lot_size to distinguish BN vs FN dropdown IDs (60 = FN)
-    expiry_dd_id = "expiryDropdown" if lot_size != 60 else "expiryDropdownFN"
 
     # Build multi-expiry data for dropdown
     all_expiry_js = {}
@@ -1551,7 +1549,8 @@ def build_strategies_html(oc_analysis, tech=None, md=None, multi_expiry_analyzed
     bear_cards = render_cards(STRATEGIES_DATA["bearish"],       "bearish")
     nd_cards   = render_cards(STRATEGIES_DATA["nondirectional"],"nondirectional")
 
-    return f"""
+    return (
+    f"""
 <div class="section" id="strat">
   <div class="sec-title">STRATEGIES REFERENCE
     <span class="sec-sub">Smart PoP · Live S/R + OI Walls + Market Bias · Click to expand</span>
@@ -1607,7 +1606,7 @@ def build_strategies_html(oc_analysis, tech=None, md=None, multi_expiry_analyzed
     <div style="margin-left:auto;display:flex;align-items:center;gap:8px;">
       <span style="font-size:13px;font-weight:700;letter-spacing:1.5px;text-transform:uppercase;
                    color:rgba(255,209,102,.7);">&#128197; EXPIRY DATE</span>
-      <select id="{expiry_dd_id}" onchange="switchExpiry(this.value, '{expiry_dd_id}')"
+      <select id="expiryDropdown" onchange="switchExpiry(this.value)"
         style="appearance:none;-webkit-appearance:none;
                background:linear-gradient(135deg,rgba(245,197,24,.12),rgba(200,155,10,.06));
                border:1px solid rgba(245,197,24,.45);border-radius:8px;
@@ -1622,6 +1621,8 @@ def build_strategies_html(oc_analysis, tech=None, md=None, multi_expiry_analyzed
   </div>
 </div>
 
+"""
+    + (f"""
 <script>
 const OC={{
   spot:        {spot:.2f},
@@ -1639,8 +1640,7 @@ const OC={{
   bullScore:   {bull_sc},
   bearScore:   {bear_sc},
   strikes:     {strikes_json},
-  lotSize:     {lot_size},
-  expiry:      "{expiry_label}"
+  lotSize:     {lot_size}
 }};
 
 const STRIKE_MAP={{}};
@@ -2628,23 +2628,19 @@ window.addEventListener('load',function(){{
 // ── Multi-Expiry Switcher ─────────────────────────────────────
 const ALL_EXPIRY_DATA = {all_expiry_json};
 
-window.switchExpiry = function(exp, ddId) {{
-  const ddElemId = ddId || (_activeInstrument === 'FINNIFTY' ? 'expiryDropdownFN' : 'expiryDropdown');
-  const activeExpData = (typeof INSTRUMENT_DATA !== 'undefined' && _activeInstrument)
-    ? (INSTRUMENT_DATA[_activeInstrument] && INSTRUMENT_DATA[_activeInstrument].allExpiry) || ALL_EXPIRY_DATA
-    : ALL_EXPIRY_DATA;
-  let d = activeExpData[exp];
+window.switchExpiry = function(exp) {{
+  let d = ALL_EXPIRY_DATA[exp];
   if (!d) {{
-    const sel = document.getElementById(ddElemId);
+    const sel = document.getElementById('expiryDropdown');
     if (sel) {{
       const opts = Array.from(sel.options);
       const curIdx = opts.findIndex(o => o.value === exp);
       for (let i = curIdx + 1; i < opts.length; i++) {{
         const nextExp = opts[i].value;
-        if (activeExpData[nextExp]) {{
+        if (ALL_EXPIRY_DATA[nextExp]) {{
           sel.value = nextExp;
           exp = nextExp;
-          d = activeExpData[nextExp];
+          d = ALL_EXPIRY_DATA[nextExp];
           break;
         }}
       }}
@@ -2675,7 +2671,7 @@ window.switchExpiry = function(exp, ddId) {{
   initAllCards();
   ['bullish','bearish','nondirectional'].forEach(sortGridByPoP);
   // Flash indicator
-  const sel = document.getElementById(ddElemId);
+  const sel = document.getElementById('expiryDropdown');
   if (sel) {{
     sel.style.borderColor = '#00c896';
     sel.style.boxShadow = '0 0 10px rgba(0,200,150,.3)';
@@ -2686,7 +2682,9 @@ window.switchExpiry = function(exp, ddId) {{
   }}
 }};
 </script>
-"""
+""" if emit_script else "")
+    )
+
 
 
 # =================================================================
@@ -3017,7 +3015,7 @@ footer{padding:16px 32px;border-top:1px solid rgba(255,255,255,.06);background:r
   .greeks-table-section{padding:16px 14px;}
   .sc-tabs{flex-direction:column;gap:8px;}
   .sc-tabs>div[style]{margin-left:0!important;width:100%;}
-  #expiryDropdown,#expiryDropdownFN{width:100%;font-size:14px;}
+  #expiryDropdown{width:100%;font-size:14px;}
 }
 @media(max-width:640px){
   header{padding:10px 12px}
@@ -3043,7 +3041,7 @@ footer{padding:16px 32px;border-top:1px solid rgba(255,255,255,.06);background:r
   .h-stat-lbl{font-size:9px;letter-spacing:1px;}
   .sc-tabs{gap:6px;margin-bottom:14px;flex-direction:column;}
   .sc-tabs>div[style]{margin-left:0!important;width:100%!important;}
-  #expiryDropdown,#expiryDropdownFN{width:100%!important;font-size:13px;padding:6px 10px;}
+  #expiryDropdown{width:100%!important;font-size:13px;padding:6px 10px;}
   .sc-tab{padding:6px 14px;font-size:15px;}
   .sc-name{font-size:15px;}
   .sb-btn{font-size:15px;padding:7px 10px;}
@@ -3372,8 +3370,8 @@ def build_greeks_script_html(oc_analysis):
 def generate_html(tech, oc, md, ts, vix_data=None, multi_expiry_analyzed=None, expiry_list=None, instrument="BANKNIFTY", lot_size=30, fn_oc=None, fn_md=None, fn_tech=None, fn_multi_expiry=None, fn_expiry_list=None):
     oi_html        = build_oi_html(oc)               if oc   else ""
     kl_html        = build_key_levels_html(tech, oc) if tech else ""
-    strat_html     = build_strategies_html(oc, tech, md, multi_expiry_analyzed=multi_expiry_analyzed, expiry_list=expiry_list, lot_size=lot_size)
-    fn_strat_html  = build_strategies_html(fn_oc, fn_tech, fn_md, multi_expiry_analyzed=fn_multi_expiry, expiry_list=fn_expiry_list, lot_size=60) if fn_oc else ""
+    strat_html     = build_strategies_html(oc, tech, md, multi_expiry_analyzed=multi_expiry_analyzed, expiry_list=expiry_list, lot_size=lot_size, emit_script=True)
+    fn_strat_html  = build_strategies_html(fn_oc, fn_tech, fn_md, multi_expiry_analyzed=fn_multi_expiry, expiry_list=fn_expiry_list, lot_size=60, emit_script=False) if fn_oc else ""
     strikes_html   = build_strikes_html(oc)
     ticker_html    = build_ticker_bar(tech, oc, vix_data)
     gauge_html     = build_dual_gauge_hero(oc, tech, md, ts, instrument=instrument)
@@ -3432,15 +3430,17 @@ def generate_html(tech, oc, md, ts, vix_data=None, multi_expiry_analyzed=None, e
     lot_size_fn = 60
     fn_spot    = fn_oc["underlying"]    if fn_oc else None
     fn_atm     = fn_oc["atm_strike"]    if fn_oc else None
-    fn_pcr     = fn_oc["pcr_oi"]        if fn_oc else 1.0
-    fn_maxpain = fn_oc["max_pain"]      if fn_oc else 0
+    _fn_sp     = fn_spot or 0
+    fn_spot_js = f"{fn_spot:.2f}" if fn_spot is not None else "null"
+    fn_atm_js  = str(fn_atm) if fn_atm is not None else "null"
+    fn_pcr = fn_oc["pcr_oi"]        if fn_oc else 1.0
+    fn_maxpain = fn_oc["max_pain"]  if fn_oc else 0
     fn_max_ce  = fn_oc["max_ce_strike"] if fn_oc else 0
     fn_max_pe  = fn_oc["max_pe_strike"] if fn_oc else 0
-    _fn_spot_fallback = fn_spot if fn_spot is not None else 0
-    fn_sup     = fn_tech["support"]     if fn_tech else _fn_spot_fallback - 150
-    fn_res     = fn_tech["resistance"]  if fn_tech else _fn_spot_fallback + 150
-    fn_ssup    = fn_tech["strong_sup"]  if fn_tech else _fn_spot_fallback - 300
-    fn_sres    = fn_tech["strong_res"]  if fn_tech else _fn_spot_fallback + 300
+    fn_sup     = fn_tech["support"]     if fn_tech else _fn_sp - 150
+    fn_res     = fn_tech["resistance"]  if fn_tech else _fn_sp + 150
+    fn_ssup    = fn_tech["strong_sup"]  if fn_tech else _fn_sp - 300
+    fn_sres    = fn_tech["strong_res"]  if fn_tech else _fn_sp + 300
     fn_bias    = fn_md["bias"]          if fn_md else "SIDEWAYS"
     fn_conf    = fn_md["confidence"]    if fn_md else "LOW"
     fn_bull    = fn_md["bull"]          if fn_md else 4
@@ -3450,9 +3450,6 @@ def generate_html(tech, oc, md, ts, vix_data=None, multi_expiry_analyzed=None, e
     fn_pcr_cls = fn_oc["raw_oi_cls"]    if fn_oc else "neutral"
     fn_expiry  = fn_oc["expiry"]        if fn_oc else "N/A"
     fn_strikes_json = json.dumps(fn_oc.get("strikes_data", [])) if fn_oc else "[]"
-    # Safe JS-renderable values (null when data unavailable, not 0)
-    fn_spot_js = f"{fn_spot:.2f}" if fn_spot is not None else "null"
-    fn_atm_js  = str(fn_atm)      if fn_atm  is not None else "null"
     # Build FN all_expiry dict for JS
     _fn_all_exp = {}
     if fn_multi_expiry and fn_expiry_list:
@@ -3562,12 +3559,8 @@ def generate_html(tech, oc, md, ts, vix_data=None, multi_expiry_analyzed=None, e
       </div>
     </div>
     <div id="mainPanelStrat" style="display:none;">
-      <div id="stratBN">
-      {strat_html}
-      </div>
-      <div id="stratFN" style="display:none;">
-      {fn_strat_html}
-      </div>
+      <div id="stratBN">{strat_html}</div>
+      <div id="stratFN" style="display:none;">{fn_strat_html}</div>
     </div>
   </main>
 </div>
@@ -3640,172 +3633,77 @@ document.addEventListener("click",function(e){{
 }});
 </script>
 
+
 <script>
-// ── Instrument Switcher Data & Logic ─────────────────────────────
 const INSTRUMENT_DATA = {{
   BANKNIFTY: {{
-    name: "BankNifty",
-    lotSize: {lot_size_bn},
-    spot: {bn_spot:.2f},
-    atm: {bn_atm},
-    pcr: {bn_pcr:.3f},
-    maxPain: {bn_maxpain},
-    maxCeStrike: {bn_max_ce},
-    maxPeStrike: {bn_max_pe},
-    support: {bn_sup:.2f},
-    resistance: {bn_res:.2f},
-    strongSup: {bn_ssup:.2f},
-    strongRes: {bn_sres:.2f},
-    bias: "{bn_bias}",
-    biasConf: "{bn_conf}",
-    bullScore: {bn_bull},
-    bearScore: {bn_bear},
-    oiDir: "{bn_oi_dir}",
-    oiSig: "{bn_oi_sig}",
-    pcr_col_cls: "{bn_pcr_cls}",
-    expiry: "{bn_expiry}",
-    strikes: {bn_strikes_json},
-    allExpiry: {bn_all_expiry_json}
+    name:"BankNifty", lotSize:{lot_size_bn},
+    spot:{bn_spot:.2f}, atm:{bn_atm}, pcr:{bn_pcr:.3f},
+    maxPain:{bn_maxpain}, maxCeStrike:{bn_max_ce}, maxPeStrike:{bn_max_pe},
+    support:{bn_sup:.2f}, resistance:{bn_res:.2f}, strongSup:{bn_ssup:.2f}, strongRes:{bn_sres:.2f},
+    bias:"{bn_bias}", biasConf:"{bn_conf}", bullScore:{bn_bull}, bearScore:{bn_bear},
+    oiDir:"{bn_oi_dir}", oiSig:"{bn_oi_sig}", pcr_col_cls:"{bn_pcr_cls}",
+    expiry:"{bn_expiry}", strikes:{bn_strikes_json}, allExpiry:{bn_all_expiry_json}
   }},
   FINNIFTY: {{
-    name: "FinNifty",
-    lotSize: {lot_size_fn},
-    spot: {fn_spot_js},
-    atm: {fn_atm_js},
-    pcr: {fn_pcr:.3f},
-    maxPain: {fn_maxpain},
-    maxCeStrike: {fn_max_ce},
-    maxPeStrike: {fn_max_pe},
-    support: {fn_sup:.2f},
-    resistance: {fn_res:.2f},
-    strongSup: {fn_ssup:.2f},
-    strongRes: {fn_sres:.2f},
-    bias: "{fn_bias}",
-    biasConf: "{fn_conf}",
-    bullScore: {fn_bull},
-    bearScore: {fn_bear},
-    oiDir: "{fn_oi_dir}",
-    oiSig: "{fn_oi_sig}",
-    pcr_col_cls: "{fn_pcr_cls}",
-    expiry: "{fn_expiry}",
-    strikes: {fn_strikes_json},
-    allExpiry: {fn_all_expiry_json}
+    name:"FinNifty", lotSize:{lot_size_fn},
+    spot:{fn_spot_js}, atm:{fn_atm_js}, pcr:{fn_pcr:.3f},
+    maxPain:{fn_maxpain}, maxCeStrike:{fn_max_ce}, maxPeStrike:{fn_max_pe},
+    support:{fn_sup:.2f}, resistance:{fn_res:.2f}, strongSup:{fn_ssup:.2f}, strongRes:{fn_sres:.2f},
+    bias:"{fn_bias}", biasConf:"{fn_conf}", bullScore:{fn_bull}, bearScore:{fn_bear},
+    oiDir:"{fn_oi_dir}", oiSig:"{fn_oi_sig}", pcr_col_cls:"{fn_pcr_cls}",
+    expiry:"{fn_expiry}", strikes:{fn_strikes_json}, allExpiry:{fn_all_expiry_json}
   }}
 }};
-
-let _activeInstrument = "{default_instrument}";
-
+let _activeInstrument = "BANKNIFTY";
 function switchInstrument(sym) {{
   if (sym === _activeInstrument) return;
   const d = INSTRUMENT_DATA[sym];
-  if (!d || d.spot === null || d.spot === undefined) {{
-    console.warn('switchInstrument: no data for', sym);
-    alert(sym + ' data is unavailable (fetch may have failed during last run). Retrying on next refresh.');
-    return;  // _activeInstrument unchanged — no revert needed
+  if (!d || !d.spot) {{
+    alert(sym + ' data unavailable. Please re-run the script.');
+    return;
   }}
   _activeInstrument = sym;
-
-  // ── Swap strategy section (pre-built HTML for each instrument) ──
-  const stratBN = document.getElementById('stratBN');
-  const stratFN = document.getElementById('stratFN');
-  if (stratBN && stratFN) {{
-    stratBN.style.display = sym === 'BANKNIFTY' ? '' : 'none';
-    stratFN.style.display = sym === 'FINNIFTY'  ? '' : 'none';
-  }}
-
-  // ── Update header buttons ──
+  const sBN = document.getElementById('stratBN');
+  const sFN = document.getElementById('stratFN');
+  if (sBN) sBN.style.display = sym==='BANKNIFTY' ? '' : 'none';
+  if (sFN) sFN.style.display = sym==='FINNIFTY'  ? '' : 'none';
   const bnBtn = document.getElementById('instBtnBN');
   const fnBtn = document.getElementById('instBtnFN');
-  if (bnBtn) {{
-    if (sym === 'BANKNIFTY') {{
-      bnBtn.style.borderColor='rgba(0,200,150,.6)'; bnBtn.style.color='#00c896'; bnBtn.style.background='rgba(0,200,150,.14)';
-      fnBtn.style.borderColor='rgba(255,255,255,.15)'; fnBtn.style.color='rgba(255,255,255,.5)'; fnBtn.style.background='transparent';
+  if (bnBtn && fnBtn) {{
+    if (sym==='BANKNIFTY') {{
+      bnBtn.style.cssText='border-color:rgba(0,200,150,.6);color:#00c896;background:rgba(0,200,150,.14);padding:5px 14px;border-radius:20px;border:1px solid;cursor:pointer;';
+      fnBtn.style.cssText='border-color:rgba(255,255,255,.15);color:rgba(255,255,255,.5);background:transparent;padding:5px 14px;border-radius:20px;border:1px solid;cursor:pointer;';
     }} else {{
-      fnBtn.style.borderColor='rgba(100,128,255,.6)'; fnBtn.style.color='#8aa0ff'; fnBtn.style.background='rgba(100,128,255,.14)';
-      bnBtn.style.borderColor='rgba(255,255,255,.15)'; bnBtn.style.color='rgba(255,255,255,.5)'; bnBtn.style.background='transparent';
+      fnBtn.style.cssText='border-color:rgba(100,128,255,.6);color:#8aa0ff;background:rgba(100,128,255,.14);padding:5px 14px;border-radius:20px;border:1px solid;cursor:pointer;';
+      bnBtn.style.cssText='border-color:rgba(255,255,255,.15);color:rgba(255,255,255,.5);background:transparent;padding:5px 14px;border-radius:20px;border:1px solid;cursor:pointer;';
     }}
   }}
-  const hdrName = document.getElementById('hdrInstrumentName');
-  if (hdrName) hdrName.textContent = d.name;
-
-  // ── Update OC global object used by strategy cards ──
-  OC.spot        = d.spot;
-  OC.atm         = d.atm;
-  OC.pcr         = d.pcr;
-  OC.maxPain     = d.maxPain;
-  OC.maxCeStrike = d.maxCeStrike;
-  OC.maxPeStrike = d.maxPeStrike;
-  OC.support     = d.support;
-  OC.resistance  = d.resistance;
-  OC.strongSup   = d.strongSup;
-  OC.strongRes   = d.strongRes;
-  OC.bias        = d.bias;
-  OC.biasConf    = d.biasConf;
-  OC.bullScore   = d.bullScore;
-  OC.bearScore   = d.bearScore;
-  OC.lotSize     = d.lotSize;
-  OC.strikes     = d.strikes;
-  OC.expiry      = d.expiry;
-
-  // Rebuild STRIKE_MAP
-  Object.keys(STRIKE_MAP).forEach(k => delete STRIKE_MAP[k]);
-  OC.strikes.forEach(s => {{ STRIKE_MAP[s.strike] = s; }});
-
-  // ── Swap ALL_EXPIRY_DATA for the expiry dropdown ──
-  Object.keys(ALL_EXPIRY_DATA).forEach(k => delete ALL_EXPIRY_DATA[k]);
+  const hdr = document.getElementById('hdrInstrumentName');
+  if (hdr) hdr.textContent = d.name;
+  OC.spot=d.spot; OC.atm=d.atm; OC.pcr=d.pcr; OC.maxPain=d.maxPain;
+  OC.maxCeStrike=d.maxCeStrike; OC.maxPeStrike=d.maxPeStrike;
+  OC.support=d.support; OC.resistance=d.resistance;
+  OC.strongSup=d.strongSup; OC.strongRes=d.strongRes;
+  OC.bias=d.bias; OC.biasConf=d.biasConf;
+  OC.bullScore=d.bullScore; OC.bearScore=d.bearScore;
+  OC.lotSize=d.lotSize; OC.strikes=d.strikes; OC.expiry=d.expiry;
+  Object.keys(STRIKE_MAP).forEach(k=>delete STRIKE_MAP[k]);
+  OC.strikes.forEach(s=>{{ STRIKE_MAP[s.strike]=s; }});
+  Object.keys(ALL_EXPIRY_DATA).forEach(k=>delete ALL_EXPIRY_DATA[k]);
   if (d.allExpiry) Object.assign(ALL_EXPIRY_DATA, d.allExpiry);
-
-  // ── Update hero widget values ──
-  _updateHeroForInstrument(d);
-
-  // ── Update expiry dropdown ──
-  const expDdId = sym === 'FINNIFTY' ? 'expiryDropdownFN' : 'expiryDropdown';
-  const expSel = document.getElementById(expDdId);
-  if (expSel) {{
-    expSel.innerHTML = '';
-    const expKeys = Object.keys(d.allExpiry || {{}});
-    expKeys.forEach((exp, i) => {{
-      const opt = document.createElement('option');
-      opt.value = exp; opt.textContent = exp;
-      if (i === 0) opt.selected = true;
-      expSel.appendChild(opt);
-    }});
-  }}
-
-  // ── Collapse expanded strategy cards and recalculate ──
-  document.querySelectorAll('.sc-card.expanded').forEach(c => c.classList.remove('expanded'));
-  document.querySelectorAll('.sc-metrics-live').forEach(m => {{
-    m.innerHTML = '<div class="sc-loading">&#9685; Calculating metrics...</div>';
-  }});
-  initAllCards();
-  ['bullish','bearish','nondirectional'].forEach(sortGridByPoP);
-
-  // ── Flash the instrument name ──
-  if (hdrName) {{
-    hdrName.style.transition='color .3s';
-    hdrName.style.color = sym === 'BANKNIFTY' ? '#00c896' : '#8aa0ff';
-    setTimeout(() => {{ hdrName.style.color = ''; }}, 1200);
-  }}
-}}
-
-function _updateHeroForInstrument(d) {{
-  // Update hero stat values if the hero DOM elements exist
-  const spotEls = document.querySelectorAll('.h-stat-val[data-stat="spot"]');
-  spotEls.forEach(el => {{ el.textContent = '₹' + d.spot.toLocaleString('en-IN', {{minimumFractionDigits:2}}); }});
-  const atmEls = document.querySelectorAll('.h-stat-val[data-stat="atm"]');
-  atmEls.forEach(el => {{ el.textContent = '₹' + d.atm.toLocaleString('en-IN'); }});
-  const expiryEls = document.querySelectorAll('.h-stat-val[data-stat="expiry"]');
-  expiryEls.forEach(el => {{ el.textContent = d.expiry; }});
-  const pcrEls = document.querySelectorAll('.h-stat-val[data-stat="pcr"]');
-  pcrEls.forEach(el => {{ el.textContent = d.pcr.toFixed(3); }});
-  const mpEls = document.querySelectorAll('.h-stat-val[data-stat="maxpain"]');
-  mpEls.forEach(el => {{ el.textContent = '₹' + d.maxPain.toLocaleString('en-IN'); }});
-  // instrument label
-  const instLbls = document.querySelectorAll('.h-stat-lbl[data-stat="spot"]');
-  instLbls.forEach(el => {{ el.textContent = d.name + ' SPOT'; }});
+  document.querySelectorAll('.h-stat-val[data-stat="spot"]').forEach(el=>{{el.textContent='\u20b9'+d.spot.toLocaleString('en-IN',{{minimumFractionDigits:2}});}});
+  document.querySelectorAll('.h-stat-val[data-stat="atm"]').forEach(el=>{{el.textContent='\u20b9'+d.atm.toLocaleString('en-IN');}});
+  document.querySelectorAll('.h-stat-val[data-stat="expiry"]').forEach(el=>{{el.textContent=d.expiry;}});
+  document.querySelectorAll('.h-stat-val[data-stat="pcr"]').forEach(el=>{{el.textContent=d.pcr.toFixed(3);}});
+  document.querySelectorAll('.h-stat-val[data-stat="maxpain"]').forEach(el=>{{el.textContent='\u20b9'+d.maxPain.toLocaleString('en-IN');}});
+  document.querySelectorAll('.h-stat-lbl[data-stat="spot"]').forEach(el=>{{el.textContent=d.name+' SPOT';}});
+  document.querySelectorAll('.sc-card.expanded').forEach(c=>c.classList.remove('expanded'));
+  if (typeof initAllCards==='function') initAllCards();
+  ['bullish','bearish','nondirectional'].forEach(c=>{{if(typeof sortGridByPoP==='function') sortGridByPoP(c);}});
+  if (hdr) {{ hdr.style.color=sym==='BANKNIFTY'?'#00c896':'#8aa0ff'; setTimeout(()=>{{hdr.style.color='';}},1200); }}
 }}
 </script>
-
 {greeks_script}
 {ANIMATED_JS}
 </body>
