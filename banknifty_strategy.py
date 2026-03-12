@@ -114,7 +114,7 @@ class NSEOptionChain:
             "expiry_type": "last_tuesday",   # last Tuesday of month
         },
         "FINNIFTY": {
-            "lot_size": 40,
+            "lot_size": 60,
             "yf_ticker": "^CNXFIN",
             "display_name": "FinNifty",
             "expiry_type": "last_tuesday",   # last Tuesday of month
@@ -1460,7 +1460,7 @@ STRATEGIES_DATA = {
 }
 
 
-def build_strategies_html(oc_analysis, tech=None, md=None, multi_expiry_analyzed=None, expiry_list=None):
+def build_strategies_html(oc_analysis, tech=None, md=None, multi_expiry_analyzed=None, expiry_list=None, lot_size=30):
     spot       = oc_analysis["underlying"]   if oc_analysis else 23000
     atm        = oc_analysis["atm_strike"]   if oc_analysis else 23000
     pcr        = oc_analysis["pcr_oi"]       if oc_analysis else 1.0
@@ -3364,7 +3364,7 @@ def build_greeks_script_html(oc_analysis):
 def generate_html(tech, oc, md, ts, vix_data=None, multi_expiry_analyzed=None, expiry_list=None, instrument="BANKNIFTY", lot_size=30, fn_oc=None, fn_md=None, fn_tech=None, fn_multi_expiry=None, fn_expiry_list=None):
     oi_html        = build_oi_html(oc)               if oc   else ""
     kl_html        = build_key_levels_html(tech, oc) if tech else ""
-    strat_html     = build_strategies_html(oc, tech, md, multi_expiry_analyzed=multi_expiry_analyzed, expiry_list=expiry_list)
+    strat_html     = build_strategies_html(oc, tech, md, multi_expiry_analyzed=multi_expiry_analyzed, expiry_list=expiry_list, lot_size=lot_size)
     strikes_html   = build_strikes_html(oc)
     ticker_html    = build_ticker_bar(tech, oc, vix_data)
     gauge_html     = build_dual_gauge_hero(oc, tech, md, ts)
@@ -3420,7 +3420,7 @@ def generate_html(tech, oc, md, ts, vix_data=None, multi_expiry_analyzed=None, e
     bn_all_expiry_json = json.dumps(_bn_all_exp)
 
     # ── FinNifty data for JS INSTRUMENT_DATA blob ──
-    lot_size_fn = 40
+    lot_size_fn = 60
     fn_spot    = fn_oc["underlying"]    if fn_oc else 0
     fn_atm     = fn_oc["atm_strike"]    if fn_oc else 0
     fn_pcr_val = fn_oc["pcr_oi"]        if fn_oc else 1.0
