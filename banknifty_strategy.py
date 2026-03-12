@@ -3680,7 +3680,12 @@ function switchInstrument(sym) {{
   if (sym === _activeInstrument) return;
   _activeInstrument = sym;
   const d = INSTRUMENT_DATA[sym];
-  if (!d) return;
+  if (!d || d.spot === 0) {{
+    console.warn('switchInstrument: no data for', sym);
+    alert(sym + ' data is unavailable (fetch may have failed during last run). Retrying on next refresh.');
+    _activeInstrument = sym === 'FINNIFTY' ? 'BANKNIFTY' : 'FINNIFTY'; // revert
+    return;
+  }}
 
   // ── Update header buttons ──
   const bnBtn = document.getElementById('instBtnBN');
@@ -3864,9 +3869,9 @@ def main():
     fn_expiry_list = []
     try:
         nse_fn = NSEOptionChain(symbol="FINNIFTY")
-        fn_oc_raw, _, _ = nse_fn.fetch()
+        fn_oc_raw, fn_session, fn_headers = nse_fn.fetch()
         time.sleep(1.5)
-        fn_multi_raw, fn_expiry_list = nse_fn.fetch_multiple_expiries(nse_session, nse_headers, n=15)
+        fn_multi_raw, fn_expiry_list = nse_fn.fetch_multiple_expiries(fn_session, fn_headers, n=15)
         print(f"  FN Expiry list: {fn_expiry_list}")
         for exp, raw in fn_multi_raw.items():
             analyzed = analyze_option_chain(raw, vix=live_vix)
