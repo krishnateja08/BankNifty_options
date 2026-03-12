@@ -1733,6 +1733,53 @@ function getGreeks(type, strike) {{
   else               return {{ delta: row.pe_delta||-0.5, theta: row.pe_theta||0, vega: row.pe_vega||0 }};
 }}
 
+
+// ── Near-expiry LTP helpers for Calendar / Diagonal strategies ──────────
+// Looks up the NEXT available expiry in ALL_EXPIRY_DATA and returns the
+// real traded LTP for the ATM (or OTM+offset) strike.
+// Returns 0 if no real data exists → LTP Gate will block the card.
+function getNearExpiryATMLTP(type) {{
+  try {{
+    const sel = document.getElementById('expiryDropdown');
+    if (!sel) return 0;
+    const opts = Array.from(sel.options).filter(o => !o.disabled);
+    const curIdx = opts.findIndex(o => o.value === sel.value);
+    if (curIdx < 0 || curIdx + 1 >= opts.length) return 0;
+    const nearExp = opts[curIdx + 1].value;
+    const nd = ALL_EXPIRY_DATA[nearExp];
+    if (!nd || !nd.strikes || !nd.strikes.length) return 0;
+    const atm = OC.atm;
+    const row = nd.strikes.find(s => s.strike === atm) ||
+      nd.strikes.reduce((b, s) =>
+        Math.abs(s.strike - atm) < Math.abs(b.strike - atm) ? s : b,
+        nd.strikes[0]);
+    if (!row) return 0;
+    const ltp = type === 'ce' ? (row.ce_ltp || 0) : (row.pe_ltp || 0);
+    return ltp;
+  }} catch(e) {{ return 0; }}
+}}
+
+function getNearExpiryOTMLTP(type, offset) {{
+  try {{
+    const sel = document.getElementById('expiryDropdown');
+    if (!sel) return 0;
+    const opts = Array.from(sel.options).filter(o => !o.disabled);
+    const curIdx = opts.findIndex(o => o.value === sel.value);
+    if (curIdx < 0 || curIdx + 1 >= opts.length) return 0;
+    const nearExp = opts[curIdx + 1].value;
+    const nd = ALL_EXPIRY_DATA[nearExp];
+    if (!nd || !nd.strikes || !nd.strikes.length) return 0;
+    const step = OC.strikeStep || 100;
+    const target = type === 'ce' ? OC.atm + offset * step : OC.atm - offset * step;
+    const row = nd.strikes.find(s => s.strike === target) ||
+      nd.strikes.reduce((b, s) =>
+        Math.abs(s.strike - target) < Math.abs(b.strike - target) ? s : b,
+        nd.strikes[0]);
+    if (!row) return 0;
+    return type === 'ce' ? (row.ce_ltp || 0) : (row.pe_ltp || 0);
+  }} catch(e) {{ return 0; }}
+}}
+
 function calcMetrics(shape, smartPop) {{
   const spot   = OC.spot, atm = OC.atm;
   const lotSz  = OC.lotSize;
@@ -1783,13 +1830,18 @@ function calcMetrics(shape, smartPop) {{
     batman:            [ce_atm, co1.ltp, co2.ltp],
     double_fly:        [ce_atm, pe_atm, co1.ltp, co2.ltp, po1.ltp, po2.ltp],
     double_condor:     [ce_atm, pe_atm, co1.ltp, co2.ltp, co3.ltp, po1.ltp, po2.ltp, po3.ltp],
-    call_calendar:     [ce_atm],
-    put_calendar:      [pe_atm],
-    diagonal_calendar: [ce_atm, co1.ltp],
+    call_calendar:     [ce_atm, nearCeLTP],
+    put_calendar:      [pe_atm, nearPeLTP],
+    diagonal_calendar: [ce_atm, co1.ltp, nearCo1LTP],
   }};
   const _reqs = _LTP_REQS[shape];
   if (_reqs && _reqs.some(v => !(v > 0))) return null;
   // ─────────────────────────────────────────────────────────────────────────────
+
+  // Near-expiry LTP for calendar strategies (real data from ALL_EXPIRY_DATA)
+  const nearCeLTP  = getNearExpiryATMLTP('ce');
+  const nearPeLTP  = getNearExpiryATMLTP('pe');
+  const nearCo1LTP = getNearExpiryOTMLTP('ce', 1);
 
   // Greeks helpers
   const gCeAtm = getGreeks('ce', atm);
@@ -1810,7 +1862,7 @@ function calcMetrics(shape, smartPop) {{
   switch (shape) {{
 
     case 'long_call': {{
-      const p = ce_atm || 150;
+      const p = ce_atm;
       mp = 999999; ml = p * lotSz; be = [atm + p];
       nc = -p * lotSz; margin = p * lotSz;
       ltpParts = [{{ l: 'BUY CE \u20b9' + atm.toLocaleString('en-IN'), v: p, c: '#00c8e0' }}];
@@ -1818,7 +1870,7 @@ function calcMetrics(shape, smartPop) {{
       break;
     }}
     case 'long_put': {{
-      const p = pe_atm || 150;
+      const p = pe_atm;
       mp = 999999; ml = p * lotSz; be = [atm - p];
       nc = -p * lotSz; margin = p * lotSz;
       ltpParts = [{{ l: 'BUY PE \u20b9' + atm.toLocaleString('en-IN'), v: p, c: '#ff9090' }}];
@@ -1826,7 +1878,7 @@ function calcMetrics(shape, smartPop) {{
       break;
     }}
     case 'short_put': {{
-      const p = pe_atm || 150;
+      const p = pe_atm;
       mp = p * lotSz; ml = (atm - p) * lotSz; be = [atm - p];
       nc = p * lotSz; margin = atm * lotSz * 0.15;
       rrRatio = ((atm - p) / p).toFixed(2);
@@ -1835,7 +1887,7 @@ function calcMetrics(shape, smartPop) {{
       break;
     }}
     case 'short_call': {{
-      const p = ce_atm || 150;
+      const p = ce_atm;
       mp = p * lotSz; ml = 999999; be = [atm + p];
       nc = p * lotSz; margin = atm * lotSz * 0.15;
       ltpParts = [{{ l: 'SELL CE \u20b9' + atm.toLocaleString('en-IN'), v: p, c: '#00c8e0' }}];
@@ -1844,7 +1896,7 @@ function calcMetrics(shape, smartPop) {{
     }}
 
     case 'bull_call_spread': {{
-      const bp = ce_atm || 150, sp = co1.ltp || 80;
+      const bp = ce_atm, sp = co1.ltp;
       const nd = bp - sp, sw = ceWing1;
       mp = (sw - nd) * lotSz; ml = nd * lotSz; be = [atm + nd];
       nc = -nd * lotSz; margin = nd * lotSz;
@@ -1857,7 +1909,7 @@ function calcMetrics(shape, smartPop) {{
       break;
     }}
     case 'bull_put_spread': {{
-      const sp = pe_atm || 150, bp = po1.ltp || 80;
+      const sp = pe_atm, bp = po1.ltp;
       const nc2 = sp - bp, sw = peWing1;
       mp = nc2 * lotSz; ml = (sw - nc2) * lotSz; be = [atm - nc2];
       nc = nc2 * lotSz; margin = sw * lotSz;
@@ -1870,7 +1922,7 @@ function calcMetrics(shape, smartPop) {{
       break;
     }}
     case 'bear_call_spread': {{
-      const sp = ce_atm || 150, bp = co1.ltp || 80;
+      const sp = ce_atm, bp = co1.ltp;
       const nc2 = sp - bp, sw = ceWing1;
       mp = nc2 * lotSz; ml = (sw - nc2) * lotSz; be = [atm + nc2];
       nc = nc2 * lotSz; margin = sw * lotSz;
@@ -1883,7 +1935,7 @@ function calcMetrics(shape, smartPop) {{
       break;
     }}
     case 'bear_put_spread': {{
-      const bp = pe_atm || 150, sp = po1.ltp || 80;
+      const bp = pe_atm, sp = po1.ltp;
       const nd = bp - sp, sw = peWing1;
       mp = (sw - nd) * lotSz; ml = nd * lotSz; be = [atm - nd];
       nc = -nd * lotSz; margin = nd * lotSz;
@@ -1897,7 +1949,7 @@ function calcMetrics(shape, smartPop) {{
     }}
 
     case 'long_straddle': {{
-      const cp2 = ce_atm || 150, pp = pe_atm || 150, tp = cp2 + pp;
+      const cp2 = ce_atm, pp = pe_atm, tp = cp2 + pp;
       mp = 999999; ml = tp * lotSz; be = [atm - tp, atm + tp];
       nc = -tp * lotSz; margin = tp * lotSz;
       ltpParts = [
@@ -1908,7 +1960,7 @@ function calcMetrics(shape, smartPop) {{
       break;
     }}
     case 'short_straddle': {{
-      const cp2 = ce_atm || 150, pp = pe_atm || 150, tp = cp2 + pp;
+      const cp2 = ce_atm, pp = pe_atm, tp = cp2 + pp;
       mp = tp * lotSz; ml = 999999; be = [atm - tp, atm + tp];
       nc = tp * lotSz; margin = Math.round(0.155 * OC.spot * OC.lotSize); // SPAN straddle: both ATM naked ~15.5% notional
       ltpParts = [
@@ -1919,7 +1971,7 @@ function calcMetrics(shape, smartPop) {{
       break;
     }}
     case 'long_strangle': {{
-      const cp2 = co1.ltp || 100, pp = po1.ltp || 100, tp = cp2 + pp;
+      const cp2 = co1.ltp, pp = po1.ltp, tp = cp2 + pp;
       mp = 999999; ml = tp * lotSz;
       be = [po1.strike - tp, co1.strike + tp];
       nc = -tp * lotSz; margin = tp * lotSz;
@@ -1931,7 +1983,7 @@ function calcMetrics(shape, smartPop) {{
       break;
     }}
     case 'short_strangle': {{
-      const cp2 = co1.ltp || 100, pp = po1.ltp || 100, tp = cp2 + pp;
+      const cp2 = co1.ltp, pp = po1.ltp, tp = cp2 + pp;
       mp = tp * lotSz; ml = 999999;
       be = [po1.strike - tp, co1.strike + tp];
       nc = tp * lotSz; margin = Math.round((Math.max(0.117*OC.spot,0.075*co1.strike)*OC.lotSize > Math.max(0.117*OC.spot,0.075*po1.strike)*OC.lotSize ? Math.max(0.117*OC.spot,0.075*co1.strike)*OC.lotSize*0.85 + Math.max(0.117*OC.spot,0.075*po1.strike)*OC.lotSize*0.15 : Math.max(0.117*OC.spot,0.075*po1.strike)*OC.lotSize*0.85 + Math.max(0.117*OC.spot,0.075*co1.strike)*OC.lotSize*0.15)); // SPAN strangle: 85/15 netting
@@ -1944,8 +1996,8 @@ function calcMetrics(shape, smartPop) {{
     }}
 
     case 'short_iron_fly': {{
-      const cp2 = ce_atm || 150, pp = pe_atm || 150;
-      const wc = co1.ltp || 80, wp = po1.ltp || 80;
+      const cp2 = ce_atm, pp = pe_atm;
+      const wc = co1.ltp, wp = po1.ltp;
       const nc2 = cp2 + pp - wc - wp;
       mp = nc2 * lotSz; ml = (ceWing1 - nc2) * lotSz;
       be = [atm - nc2, atm + nc2];
@@ -1961,8 +2013,8 @@ function calcMetrics(shape, smartPop) {{
       break;
     }}
     case 'long_iron_fly': {{
-      const cp2 = ce_atm || 150, pp = pe_atm || 150;
-      const wc = co1.ltp || 80, wp = po1.ltp || 80;
+      const cp2 = ce_atm, pp = pe_atm;
+      const wc = co1.ltp, wp = po1.ltp;
       const nd = wc + wp - cp2 - pp;
       mp = (ceWing1 - Math.abs(nd)) * lotSz; ml = Math.abs(nd) * lotSz;
       be = [atm - Math.abs(nd), atm + Math.abs(nd)];
@@ -1978,8 +2030,8 @@ function calcMetrics(shape, smartPop) {{
       break;
     }}
     case 'short_iron_condor': {{
-      const sc = co1.ltp || 100, bc = co2.ltp || 50;
-      const sp = po1.ltp || 100, bp = po2.ltp || 50;
+      const sc = co1.ltp, bc = co2.ltp;
+      const sp = po1.ltp, bp = po2.ltp;
       const nc2 = sc - bc + sp - bp;
       mp = nc2 * lotSz; ml = (ceWing1 - nc2) * lotSz;
       be = [po1.strike - nc2, co1.strike + nc2];
@@ -1995,8 +2047,8 @@ function calcMetrics(shape, smartPop) {{
       break;
     }}
     case 'long_iron_condor': {{
-      const sc = co1.ltp || 100, bc = co2.ltp || 50;
-      const sp = po1.ltp || 100, bp = po2.ltp || 50;
+      const sc = co1.ltp, bc = co2.ltp;
+      const sp = po1.ltp, bp = po2.ltp;
       const nd = bc - sc + bp - sp;
       mp = (ceWing1 - Math.abs(nd)) * lotSz; ml = Math.abs(nd) * lotSz;
       be = [po1.strike - Math.abs(nd), co1.strike + Math.abs(nd)];
@@ -2014,7 +2066,7 @@ function calcMetrics(shape, smartPop) {{
 
     case 'call_butterfly':
     case 'bull_butterfly': {{
-      const lp = ce_atm || 150, mid = co1.ltp || 80, hp = co2.ltp || 40;
+      const lp = ce_atm, mid = co1.ltp, hp = co2.ltp;
       const nd = lp - 2 * mid + hp;
       mp = (ceWing1 - nd) * lotSz; ml = nd * lotSz;
       be = [atm + nd, co2.strike - nd];
@@ -2030,7 +2082,7 @@ function calcMetrics(shape, smartPop) {{
     }}
     case 'put_butterfly':
     case 'bear_butterfly': {{
-      const hp = pe_atm || 150, mid = po1.ltp || 80, lp = po2.ltp || 40;
+      const hp = pe_atm, mid = po1.ltp, lp = po2.ltp;
       const nd = hp - 2 * mid + lp;
       mp = (peWing1 - nd) * lotSz; ml = nd * lotSz;
       be = [po2.strike + nd, atm - nd];
@@ -2046,7 +2098,7 @@ function calcMetrics(shape, smartPop) {{
     }}
 
     case 'call_ratio_back': {{
-      const sp = ce_atm || 150, bp = co1.ltp || 80, nd = 2 * bp - sp;
+      const sp = ce_atm, bp = co1.ltp, nd = 2 * bp - sp;
       mp = 999999; ml = nd > 0 ? nd * lotSz : 0;
       be = [co1.strike + Math.abs(nd)];
       nc = -nd * lotSz; margin = Math.round((0.117 - 0.01) * OC.spot * OC.lotSize); // SPAN: naked(11.7%) - 1 BUY hedge(1%)
@@ -2058,7 +2110,7 @@ function calcMetrics(shape, smartPop) {{
       break;
     }}
     case 'put_ratio_back': {{
-      const sp = pe_atm || 150, bp = po1.ltp || 80, nd = 2 * bp - sp;
+      const sp = pe_atm, bp = po1.ltp, nd = 2 * bp - sp;
       mp = 999999; ml = nd > 0 ? nd * lotSz : 0;
       be = [po1.strike - Math.abs(nd)];
       nc = -nd * lotSz; margin = Math.round((0.117 - 0.01) * OC.spot * OC.lotSize); // SPAN: naked(11.7%) - 1 BUY hedge(1%)
@@ -2071,7 +2123,7 @@ function calcMetrics(shape, smartPop) {{
     }}
 
     case 'call_ratio_spread': {{
-      const bp = ce_atm || 150, sp = co1.ltp || 80;
+      const bp = ce_atm, sp = co1.ltp;
       const nc2 = 2 * sp - bp;
       const maxProfitPts = ceWing1 + nc2;
       mp = maxProfitPts * lotSz; ml = 999999;
@@ -2087,7 +2139,7 @@ function calcMetrics(shape, smartPop) {{
       break;
     }}
     case 'put_ratio_spread': {{
-      const bp = pe_atm || 150, sp = po1.ltp || 80;
+      const bp = pe_atm, sp = po1.ltp;
       const nc2 = 2 * sp - bp;
       const maxProfitPts = peWing1 + nc2;
       mp = maxProfitPts * lotSz; ml = 999999;
@@ -2104,7 +2156,7 @@ function calcMetrics(shape, smartPop) {{
     }}
 
     case 'long_synthetic': {{
-      const cp2 = ce_atm || 150, pp = pe_atm || 150, nd = cp2 - pp;
+      const cp2 = ce_atm, pp = pe_atm, nd = cp2 - pp;
       mp = 999999; ml = 999999;
       be = [atm + nd]; nc = -Math.abs(nd) * lotSz;
       margin = atm * lotSz * 0.30;
@@ -2116,7 +2168,7 @@ function calcMetrics(shape, smartPop) {{
       break;
     }}
     case 'short_synthetic': {{
-      const cp2 = ce_atm || 150, pp = pe_atm || 150, nc2 = cp2 - pp;
+      const cp2 = ce_atm, pp = pe_atm, nc2 = cp2 - pp;
       mp = 999999; ml = 999999;
       be = [atm + nc2]; nc = Math.abs(nc2) * lotSz;
       margin = atm * lotSz * 0.30;
@@ -2129,7 +2181,7 @@ function calcMetrics(shape, smartPop) {{
     }}
 
     case 'risk_reversal': {{
-      const bp = po1.ltp || 100, sc = co1.ltp || 100;
+      const bp = po1.ltp, sc = co1.ltp;
       const nd = bp - sc;
       mp = 999999; ml = 999999;
       be = [po1.strike - Math.abs(nd), co1.strike + Math.abs(nd)];
@@ -2142,7 +2194,7 @@ function calcMetrics(shape, smartPop) {{
       break;
     }}
     case 'range_forward': {{
-      const bc = co1.ltp || 100, sp = po1.ltp || 100;
+      const bc = co1.ltp, sp = po1.ltp;
       const nd = bc - sp;
       mp = 999999; ml = 999999;
       be = [po1.strike - Math.abs(nd), co1.strike + Math.abs(nd)];
@@ -2156,7 +2208,7 @@ function calcMetrics(shape, smartPop) {{
     }}
 
     case 'jade_lizard': {{
-      const pp = po1.ltp || 100, cs = co1.ltp || 80, cb = co2.ltp || 40;
+      const pp = po1.ltp, cs = co1.ltp, cb = co2.ltp;
       const nc2 = pp + cs - cb;
       mp = nc2 * lotSz; ml = (po1.strike - nc2) * lotSz;
       be = [po1.strike - nc2];
@@ -2170,7 +2222,7 @@ function calcMetrics(shape, smartPop) {{
       break;
     }}
     case 'reverse_jade': {{
-      const cp2 = co1.ltp || 100, ps = po1.ltp || 80, pb = po2.ltp || 40;
+      const cp2 = co1.ltp, ps = po1.ltp, pb = po2.ltp;
       const nc2 = cp2 + ps - pb;
       mp = nc2 * lotSz; ml = (po1.strike - nc2) * lotSz;
       be = [po1.strike - nc2];
@@ -2185,10 +2237,10 @@ function calcMetrics(shape, smartPop) {{
     }}
 
     case 'bull_condor': {{
-      const s1 = ce_atm || 150;
-      const s2 = co1.ltp || 100;
-      const s3 = co2.ltp || 60;
-      const s4 = co3.ltp || 30;
+      const s1 = ce_atm;
+      const s2 = co1.ltp;
+      const s3 = co2.ltp;
+      const s4 = co3.ltp;
       const nd = s1 - s2 - s3 + s4;
       mp = (ceWing1 - nd) * lotSz; ml = nd * lotSz;
       be = [atm + nd, co3.strike - nd];
@@ -2204,10 +2256,10 @@ function calcMetrics(shape, smartPop) {{
       break;
     }}
     case 'bear_condor': {{
-      const s1 = pe_atm || 150;
-      const s2 = po1.ltp || 100;
-      const s3 = po2.ltp || 60;
-      const s4 = po3.ltp || 30;
+      const s1 = pe_atm;
+      const s2 = po1.ltp;
+      const s3 = po2.ltp;
+      const s4 = po3.ltp;
       const nd = s1 - s2 - s3 + s4;
       mp = (peWing1 - nd) * lotSz; ml = nd * lotSz;
       be = [po3.strike + nd, atm - nd];
@@ -2224,7 +2276,7 @@ function calcMetrics(shape, smartPop) {{
     }}
 
     case 'batman': {{
-      const s1 = ce_atm || 150, s2 = co1.ltp || 80, s3 = co2.ltp || 40;
+      const s1 = ce_atm, s2 = co1.ltp, s3 = co2.ltp;
       const ndPerUnit = s1 - 2 * s2 + s3;
       const totalNd = 2 * ndPerUnit;
       mp = 2 * (ceWing1 - ndPerUnit) * lotSz; ml = totalNd * lotSz;
@@ -2240,82 +2292,82 @@ function calcMetrics(shape, smartPop) {{
     }}
 
     case 'double_fly': {{
-      const cNd = ce_atm - 2 * co1.ltp + (co2.ltp || 40);
-      const pNd = pe_atm - 2 * po1.ltp + (po2.ltp || 40);
+      const cNd = ce_atm - 2 * co1.ltp + co2.ltp;
+      const pNd = pe_atm - 2 * po1.ltp + po2.ltp;
       const totalNd = cNd + pNd;
       mp = ((ceWing1 - cNd) + (peWing1 - pNd)) * lotSz;
       ml = totalNd * lotSz;
       be = [atm - totalNd * 0.5, atm + totalNd * 0.5];
       nc = -totalNd * lotSz; margin = totalNd * lotSz;
       ltpParts = [
-        {{ l: 'CALL FLY: BUY/SELL/BUY CE', v: ce_atm || 150, c: '#00c8e0' }},
-        {{ l: 'PUT FLY:  BUY/SELL/BUY PE', v: pe_atm || 150, c: '#ff9090' }}
+        {{ l: 'CALL FLY: BUY/SELL/BUY CE', v: ce_atm, c: '#00c8e0' }},
+        {{ l: 'PUT FLY:  BUY/SELL/BUY PE', v: pe_atm, c: '#ff9090' }}
       ];
       netDelta=((gCeAtm.delta-2*gCo1.delta+gCo2.delta)+(gPeAtm.delta-2*gPo1.delta+gPo2.delta))*lotSz; netTheta=((gCeAtm.theta-2*gCo1.theta+gCo2.theta)+(gPeAtm.theta-2*gPo1.theta+gPo2.theta))*lotSz; netVega=((gCeAtm.vega-2*gCo1.vega+gCo2.vega)+(gPeAtm.vega-2*gPo1.vega+gPo2.vega))*lotSz;
       break;
     }}
 
     case 'double_condor': {{
-      const cNd = ce_atm - co1.ltp - co2.ltp + (co3.ltp || 30);
-      const pNd = pe_atm - po1.ltp - po2.ltp + (po3.ltp || 30);
+      const cNd = ce_atm - co1.ltp - co2.ltp + co3.ltp;
+      const pNd = pe_atm - po1.ltp - po2.ltp + po3.ltp;
       const totalNd = cNd + pNd;
       mp = ((ceWing1 - cNd) + (peWing1 - pNd)) * lotSz;
       ml = totalNd * lotSz;
       be = [atm - totalNd, atm + totalNd];
       nc = -totalNd * lotSz; margin = totalNd * lotSz;
       ltpParts = [
-        {{ l: 'CE CONDOR \u20b9' + atm.toLocaleString('en-IN') + ' \u2192 \u20b9' + co3.strike.toLocaleString('en-IN'), v: ce_atm || 150, c: '#00c8e0' }},
-        {{ l: 'PE CONDOR \u20b9' + atm.toLocaleString('en-IN') + ' \u2192 \u20b9' + po3.strike.toLocaleString('en-IN'), v: pe_atm || 150, c: '#ff9090' }}
+        {{ l: 'CE CONDOR \u20b9' + atm.toLocaleString('en-IN') + ' \u2192 \u20b9' + co3.strike.toLocaleString('en-IN'), v: ce_atm, c: '#00c8e0' }},
+        {{ l: 'PE CONDOR \u20b9' + atm.toLocaleString('en-IN') + ' \u2192 \u20b9' + po3.strike.toLocaleString('en-IN'), v: pe_atm, c: '#ff9090' }}
       ];
       netDelta=((gCeAtm.delta-gCo1.delta-gCo2.delta+gCo3.delta)+(gPeAtm.delta-gPo1.delta-gPo2.delta+gPo3.delta))*lotSz; netTheta=((gCeAtm.theta-gCo1.theta-gCo2.theta+gCo3.theta)+(gPeAtm.theta-gPo1.theta-gPo2.theta+gPo3.theta))*lotSz; netVega=((gCeAtm.vega-gCo1.vega-gCo2.vega+gCo3.vega)+(gPeAtm.vega-gPo1.vega-gPo2.vega+gPo3.vega))*lotSz;
       break;
     }}
 
     case 'call_calendar': {{
-      const farLTP  = ce_atm || 150;
-      const nearLTP = Math.round(farLTP * 0.55);
+      const farLTP  = ce_atm;
+      const nearLTP = nearCeLTP;   // real near-expiry ATM CE LTP from ALL_EXPIRY_DATA
       const nd = farLTP - nearLTP;
       mp = Math.round(nd * 0.80) * lotSz; ml = nd * lotSz;
       be = [atm - Math.round(nd * 0.6), atm + Math.round(nd * 0.6)];
       nc = -nd * lotSz; margin = nd * lotSz;
       ltpParts = [
-        {{ l: 'SELL NEAR CE \u20b9' + atm.toLocaleString('en-IN') + ' (~est)', v: nearLTP, c: '#00c896' }},
-        {{ l: 'BUY FAR CE \u20b9'   + atm.toLocaleString('en-IN'),             v: farLTP,  c: '#00c8e0' }}
+        {{ l: 'SELL NEAR CE \u20b9' + atm.toLocaleString('en-IN'), v: nearLTP, c: '#00c896' }},
+        {{ l: 'BUY FAR CE \u20b9'   + atm.toLocaleString('en-IN'), v: farLTP,  c: '#00c8e0' }}
       ];
       netDelta=gCeAtm.delta*0.1*lotSz; netTheta=Math.abs(gCeAtm.theta)*0.45*lotSz; netVega=gCeAtm.vega*0.3*lotSz;
       break;
     }}
     case 'put_calendar': {{
-      const farLTP  = pe_atm || 150;
-      const nearLTP = Math.round(farLTP * 0.55);
+      const farLTP  = pe_atm;
+      const nearLTP = nearPeLTP;   // real near-expiry ATM PE LTP from ALL_EXPIRY_DATA
       const nd = farLTP - nearLTP;
       mp = Math.round(nd * 0.80) * lotSz; ml = nd * lotSz;
       be = [atm - Math.round(nd * 0.6), atm + Math.round(nd * 0.6)];
       nc = -nd * lotSz; margin = nd * lotSz;
       ltpParts = [
-        {{ l: 'SELL NEAR PE \u20b9' + atm.toLocaleString('en-IN') + ' (~est)', v: nearLTP, c: '#00c896' }},
-        {{ l: 'BUY FAR PE \u20b9'   + atm.toLocaleString('en-IN'),             v: farLTP,  c: '#ff9090' }}
+        {{ l: 'SELL NEAR PE \u20b9' + atm.toLocaleString('en-IN'), v: nearLTP, c: '#00c896' }},
+        {{ l: 'BUY FAR PE \u20b9'   + atm.toLocaleString('en-IN'), v: farLTP,  c: '#ff9090' }}
       ];
       netDelta=gPeAtm.delta*0.1*lotSz; netTheta=Math.abs(gPeAtm.theta)*0.45*lotSz; netVega=gPeAtm.vega*0.3*lotSz;
       break;
     }}
     case 'diagonal_calendar': {{
-      const farLTP  = ce_atm || 150;
-      const nearLTP = Math.round((co1.ltp || 80) * 0.55);
+      const farLTP  = ce_atm;
+      const nearLTP = nearCo1LTP;  // real near-expiry OTM+1 CE LTP from ALL_EXPIRY_DATA
       const nd = farLTP - nearLTP;
       mp = Math.round(nd * 0.70) * lotSz; ml = nd * lotSz;
       be = [atm + Math.round(nd * 0.25), atm + Math.round(nd * 1.4)];
       nc = -nd * lotSz; margin = nd * lotSz;
       ltpParts = [
-        {{ l: 'SELL NEAR CE \u20b9' + co1.strike.toLocaleString('en-IN') + ' (~est)', v: nearLTP, c: '#00c896' }},
-        {{ l: 'BUY FAR CE \u20b9'   + atm.toLocaleString('en-IN'),                   v: farLTP,  c: '#00c8e0' }}
+        {{ l: 'SELL NEAR CE \u20b9' + co1.strike.toLocaleString('en-IN'), v: nearLTP, c: '#00c896' }},
+        {{ l: 'BUY FAR CE \u20b9'   + atm.toLocaleString('en-IN'),        v: farLTP,  c: '#00c8e0' }}
       ];
       netDelta=(gCeAtm.delta - gCo1.delta*0.5)*0.1*lotSz; netTheta=Math.abs(gCeAtm.theta)*0.35*lotSz; netVega=(gCeAtm.vega-gCo1.vega*0.5)*0.3*lotSz;
       break;
     }}
 
     default: {{
-      const p = ce_atm || 150;
+      const p = ce_atm;
       mp = p * lotSz * 0.5; ml = p * lotSz * 0.3;
       be = [atm]; nc = -p * 0.3 * lotSz;
       margin = p * lotSz; rrRatio = 1.5;
@@ -2442,67 +2494,67 @@ function buildIntradaySim(m) {{
     switch(shape) {{
       // ── Single legs ──
       case 'long_call':
-        pnl = (ceIntr(atm) - (ce_atm||150)) * lotSz; break;
+        pnl = (ceIntr(atm) - ce_atm) * lotSz; break;
       case 'short_call':
-        pnl = ((ce_atm||150) - ceIntr(atm)) * lotSz; break;
+        pnl = (ce_atm - ceIntr(atm)) * lotSz; break;
       case 'long_put':
-        pnl = (peIntr(atm) - (pe_atm||150)) * lotSz; break;
+        pnl = (peIntr(atm) - pe_atm) * lotSz; break;
       case 'short_put':
-        pnl = ((pe_atm||150) - peIntr(atm)) * lotSz; break;
+        pnl = (pe_atm - peIntr(atm)) * lotSz; break;
 
       // ── Bull / Bear spreads ──
       // bull_call_spread: BUY ATM CE + SELL OTM CE
       case 'bull_call_spread': {{
-        const debit = (ce_atm||150) - (co1.ltp||80);
+        const debit = ce_atm - co1.ltp;
         pnl = (ceIntr(atm) - ceIntr(co1.strike) - debit) * lotSz; break;
       }}
       // bear_call_spread: SELL ATM CE + BUY OTM CE
       case 'bear_call_spread': {{
-        const credit = (ce_atm||150) - (co1.ltp||80);
+        const credit = ce_atm - co1.ltp;
         pnl = (credit - ceIntr(atm) + ceIntr(co1.strike)) * lotSz; break;
       }}
       // bull_put_spread: SELL ATM PE + BUY OTM PE
       case 'bull_put_spread': {{
-        const credit = (pe_atm||150) - (po1.ltp||80);
+        const credit = pe_atm - po1.ltp;
         pnl = (credit - peIntr(atm) + peIntr(po1.strike)) * lotSz; break;
       }}
       // bear_put_spread: BUY ATM PE + SELL OTM PE
       case 'bear_put_spread': {{
-        const debit = (pe_atm||150) - (po1.ltp||80);
+        const debit = pe_atm - po1.ltp;
         pnl = (peIntr(atm) - peIntr(po1.strike) - debit) * lotSz; break;
       }}
 
       // ── Straddle / Strangle ──
       case 'long_straddle': {{
-        const tp = (ce_atm||150) + (pe_atm||150);
+        const tp = ce_atm + pe_atm;
         pnl = (ceIntr(atm) + peIntr(atm) - tp) * lotSz; break;
       }}
       case 'short_straddle': {{
-        const tp = (ce_atm||150) + (pe_atm||150);
+        const tp = ce_atm + pe_atm;
         pnl = (tp - ceIntr(atm) - peIntr(atm)) * lotSz; break;
       }}
       case 'long_strangle': {{
-        const tp = (co1.ltp||100) + (po1.ltp||100);
+        const tp = co1.ltp + po1.ltp;
         pnl = (ceIntr(co1.strike) + peIntr(po1.strike) - tp) * lotSz; break;
       }}
       case 'short_strangle': {{
-        const tp = (co1.ltp||100) + (po1.ltp||100);
+        const tp = co1.ltp + po1.ltp;
         pnl = (tp - ceIntr(co1.strike) - peIntr(po1.strike)) * lotSz; break;
       }}
 
       // ── Short Iron Fly: SELL ATM CE + SELL ATM PE + BUY OTM CE + BUY OTM PE ──
       case 'short_iron_fly': {{
-        const credit = (ce_atm||150) + (pe_atm||150) - (co1.ltp||80) - (po1.ltp||80);
+        const credit = ce_atm + pe_atm - co1.ltp - po1.ltp;
         pnl = (credit - ceIntr(atm) - peIntr(atm) + ceIntr(co1.strike) + peIntr(po1.strike)) * lotSz; break;
       }}
       // ── Long Iron Fly: BUY ATM CE + BUY ATM PE + SELL OTM CE + SELL OTM PE ──
       case 'long_iron_fly': {{
-        const debit = (ce_atm||150) + (pe_atm||150) - (co1.ltp||80) - (po1.ltp||80);
+        const debit = ce_atm + pe_atm - co1.ltp - po1.ltp;
         pnl = (-debit + ceIntr(atm) + peIntr(atm) - ceIntr(co1.strike) - peIntr(po1.strike)) * lotSz; break;
       }}
       // ── Short Iron Condor: SELL co1 CE + BUY co2 CE + SELL po1 PE + BUY po2 PE ──
       case 'short_iron_condor': {{
-        const sc = co1.ltp||100, bc = co2.ltp||50, sp2 = po1.ltp||100, bp2 = po2.ltp||50;
+        const sc = co1.ltp, bc = co2.ltp, sp2 = po1.ltp, bp2 = po2.ltp;
         const credit = sc - bc + sp2 - bp2;
         const callLoss = Math.max(0, ceIntr(co1.strike) - ceIntr(co2.strike));
         const putLoss  = Math.max(0, peIntr(po1.strike) - peIntr(po2.strike));
@@ -2510,7 +2562,7 @@ function buildIntradaySim(m) {{
       }}
       // ── Long Iron Condor: BUY co1 CE + SELL co2 CE + BUY po1 PE + SELL po2 PE ──
       case 'long_iron_condor': {{
-        const sc = co1.ltp||100, bc = co2.ltp||50, sp2 = po1.ltp||100, bp2 = po2.ltp||50;
+        const sc = co1.ltp, bc = co2.ltp, sp2 = po1.ltp, bp2 = po2.ltp;
         const debit = bc - sc + bp2 - sp2;
         const callProfit = Math.max(0, ceIntr(co1.strike) - ceIntr(co2.strike));
         const putProfit  = Math.max(0, peIntr(po1.strike) - peIntr(po2.strike));
@@ -2520,24 +2572,24 @@ function buildIntradaySim(m) {{
       // ── Butterfly: BUY low + SELL 2x mid + BUY high ──
       case 'call_butterfly':
       case 'bull_butterfly': {{
-        const debit = (ce_atm||150) - 2*(co1.ltp||80) + (co2.ltp||40);
+        const debit = ce_atm - 2*co1.ltp + co2.ltp;
         pnl = (ceIntr(atm) - 2*ceIntr(co1.strike) + ceIntr(co2.strike) - debit) * lotSz; break;
       }}
       case 'put_butterfly':
       case 'bear_butterfly': {{
-        const debit = (pe_atm||150) - 2*(po1.ltp||80) + (po2.ltp||40);
+        const debit = pe_atm - 2*po1.ltp + po2.ltp;
         pnl = (peIntr(atm) - 2*peIntr(po1.strike) + peIntr(po2.strike) - debit) * lotSz; break;
       }}
 
       // ── Ratio Back Spreads: SELL 1x ATM + BUY 2x OTM ──
       // Unlimited profit if big move, small loss/profit if near ATM
       case 'call_ratio_back': {{
-        const sp2 = ce_atm||150, bp2 = co1.ltp||80;
+        const sp2 = ce_atm, bp2 = co1.ltp;
         const nc2 = 2*bp2 - sp2; // net credit(+) or debit(-)
         pnl = (nc2 - ceIntr(atm) + 2*ceIntr(co1.strike)) * lotSz; break;
       }}
       case 'put_ratio_back': {{
-        const sp2 = pe_atm||150, bp2 = po1.ltp||80;
+        const sp2 = pe_atm, bp2 = po1.ltp;
         const nc2 = 2*bp2 - sp2;
         pnl = (nc2 - peIntr(atm) + 2*peIntr(po1.strike)) * lotSz; break;
       }}
@@ -2545,45 +2597,45 @@ function buildIntradaySim(m) {{
       // ── Ratio Spreads: BUY 1x ATM + SELL 2x OTM ──
       // Max profit at OTM strike, unlimited loss beyond
       case 'call_ratio_spread': {{
-        const bp2 = ce_atm||150, sp2 = co1.ltp||80;
+        const bp2 = ce_atm, sp2 = co1.ltp;
         const nc2 = 2*sp2 - bp2;
         pnl = (nc2 + ceIntr(atm) - 2*ceIntr(co1.strike)) * lotSz; break;
       }}
       case 'put_ratio_spread': {{
-        const bp2 = pe_atm||150, sp2 = po1.ltp||80;
+        const bp2 = pe_atm, sp2 = po1.ltp;
         const nc2 = 2*sp2 - bp2;
         pnl = (nc2 + peIntr(atm) - 2*peIntr(po1.strike)) * lotSz; break;
       }}
 
       // ── Jade Lizard: SELL OTM PE + SELL OTM CE + BUY further OTM CE ──
       case 'jade_lizard': {{
-        const pp = po1.ltp||100, cs = co1.ltp||80, cb = co2.ltp||40;
+        const pp = po1.ltp, cs = co1.ltp, cb = co2.ltp;
         const credit = pp + cs - cb;
         pnl = (credit - peIntr(po1.strike) - ceIntr(co1.strike) + ceIntr(co2.strike)) * lotSz; break;
       }}
       // ── Reverse Jade: SELL OTM CE + SELL OTM PE + BUY further OTM PE ──
       case 'reverse_jade': {{
-        const cp2 = co1.ltp||100, ps = po1.ltp||80, pb = po2.ltp||40;
+        const cp2 = co1.ltp, ps = po1.ltp, pb = po2.ltp;
         const credit = cp2 + ps - pb;
         pnl = (credit - ceIntr(co1.strike) - peIntr(po1.strike) + peIntr(po2.strike)) * lotSz; break;
       }}
 
       // ── Bull Condor: BUY ATM CE + SELL co1 + SELL co2 + BUY co3 ──
       case 'bull_condor': {{
-        const s1 = ce_atm||150, s2 = co1.ltp||100, s3 = co2.ltp||60, s4 = co3.ltp||30;
+        const s1 = ce_atm, s2 = co1.ltp, s3 = co2.ltp, s4 = co3.ltp;
         const debit = s1 - s2 - s3 + s4;
         pnl = (ceIntr(atm) - ceIntr(co1.strike) - ceIntr(co2.strike) + ceIntr(co3.strike) - debit) * lotSz; break;
       }}
       // ── Bear Condor: BUY ATM PE + SELL po1 + SELL po2 + BUY po3 ──
       case 'bear_condor': {{
-        const s1 = pe_atm||150, s2 = po1.ltp||100, s3 = po2.ltp||60, s4 = po3.ltp||30;
+        const s1 = pe_atm, s2 = po1.ltp, s3 = po2.ltp, s4 = po3.ltp;
         const debit = s1 - s2 - s3 + s4;
         pnl = (peIntr(atm) - peIntr(po1.strike) - peIntr(po2.strike) + peIntr(po3.strike) - debit) * lotSz; break;
       }}
 
       // ── Batman: 2x (BUY ATM + SELL 2x OTM + BUY far OTM) call butterfly ──
       case 'batman': {{
-        const s1 = ce_atm||150, s2 = co1.ltp||80, s3 = co2.ltp||40;
+        const s1 = ce_atm, s2 = co1.ltp, s3 = co2.ltp;
         const unitDebit = s1 - 2*s2 + s3;
         const unitPnl   = ceIntr(atm) - 2*ceIntr(co1.strike) + ceIntr(co2.strike) - unitDebit;
         pnl = 2 * unitPnl * lotSz; break;
@@ -2591,8 +2643,8 @@ function buildIntradaySim(m) {{
 
       // ── Double Fly: call butterfly + put butterfly ──
       case 'double_fly': {{
-        const cDebit = (ce_atm||150) - 2*(co1.ltp||80) + (co2.ltp||40);
-        const pDebit = (pe_atm||150) - 2*(po1.ltp||80) + (po2.ltp||40);
+        const cDebit = ce_atm - 2*co1.ltp + co2.ltp;
+        const pDebit = pe_atm - 2*po1.ltp + po2.ltp;
         const cPnl   = ceIntr(atm) - 2*ceIntr(co1.strike) + ceIntr(co2.strike) - cDebit;
         const pPnl   = peIntr(atm) - 2*peIntr(po1.strike) + peIntr(po2.strike) - pDebit;
         pnl = (cPnl + pPnl) * lotSz; break;
@@ -2600,8 +2652,8 @@ function buildIntradaySim(m) {{
 
       // ── Double Condor: call 4-leg condor + put 4-leg condor ──
       case 'double_condor': {{
-        const cDebit = (ce_atm||150) - (co1.ltp||100) - (co2.ltp||60) + (co3.ltp||30);
-        const pDebit = (pe_atm||150) - (po1.ltp||100) - (po2.ltp||60) + (po3.ltp||30);
+        const cDebit = ce_atm - co1.ltp - co2.ltp + co3.ltp;
+        const pDebit = pe_atm - po1.ltp - po2.ltp + po3.ltp;
         const cPnl   = ceIntr(atm) - ceIntr(co1.strike) - ceIntr(co2.strike) + ceIntr(co3.strike) - cDebit;
         const pPnl   = peIntr(atm) - peIntr(po1.strike) - peIntr(po2.strike) + peIntr(po3.strike) - pDebit;
         pnl = (cPnl + pPnl) * lotSz; break;
@@ -2609,21 +2661,21 @@ function buildIntradaySim(m) {{
 
       // ── Synthetics / Risk Reversal / Range Forward — unlimited P&L, delta approx is appropriate ──
       case 'long_synthetic': {{
-        const nc2 = (ce_atm||150) - (pe_atm||150);
+        const nc2 = ce_atm - pe_atm;
         pnl = (-nc2 + ceIntr(atm) - peIntr(atm)) * lotSz; break;
       }}
       case 'short_synthetic': {{
-        const nc2 = (ce_atm||150) - (pe_atm||150);
+        const nc2 = ce_atm - pe_atm;
         pnl = (nc2 - ceIntr(atm) + peIntr(atm)) * lotSz; break;
       }}
       case 'risk_reversal': {{
         // BUY OTM PE + SELL OTM CE
-        const nc2 = (po1.ltp||100) - (co1.ltp||100);
+        const nc2 = po1.ltp - co1.ltp;
         pnl = (-nc2 + peIntr(po1.strike) - ceIntr(co1.strike)) * lotSz; break;
       }}
       case 'range_forward': {{
         // BUY OTM CE + SELL OTM PE
-        const nc2 = (co1.ltp||100) - (po1.ltp||100);
+        const nc2 = co1.ltp - po1.ltp;
         pnl = (-nc2 + ceIntr(co1.strike) - peIntr(po1.strike)) * lotSz; break;
       }}
 
