@@ -103,8 +103,30 @@ def get_prev_trading_day(dt):
 # =================================================================
 
 class NSEOptionChain:
-    def __init__(self):
-        self.symbol = "BANKNIFTY"
+    # symbol: "BANKNIFTY" or "FINNIFTY"
+    # BankNifty: lot=30, expiry=last Tuesday of month
+    # FinNifty:  lot=40, expiry=last Tuesday of month (same cycle)
+    INSTRUMENT_CONFIG = {
+        "BANKNIFTY": {
+            "lot_size": 30,
+            "yf_ticker": "^NSEBANK",
+            "display_name": "BankNifty",
+            "expiry_type": "last_tuesday",   # last Tuesday of month
+        },
+        "FINNIFTY": {
+            "lot_size": 40,
+            "yf_ticker": "^CNXFIN",
+            "display_name": "FinNifty",
+            "expiry_type": "last_tuesday",   # last Tuesday of month
+        },
+    }
+
+    def __init__(self, symbol="BANKNIFTY"):
+        self.symbol = symbol
+        cfg = self.INSTRUMENT_CONFIG.get(symbol, self.INSTRUMENT_CONFIG["BANKNIFTY"])
+        self.lot_size    = cfg["lot_size"]
+        self.yf_ticker   = cfg["yf_ticker"]
+        self.display_name = cfg["display_name"]
 
     def _make_session(self):
         headers = {
@@ -168,7 +190,7 @@ class NSEOptionChain:
             expiry_date = candidate
 
         result = expiry_date.strftime("%d-%b-%Y")
-        print(f"  BankNifty computed expiry (last Tue of month, holiday-adjusted): {result}")
+        print(f"  {self.display_name} computed expiry (last Tue of month, holiday-adjusted): {result}")
         return result
 
     def _fetch_available_expiries(self, session, headers):
@@ -650,9 +672,9 @@ def analyze_option_chain(oc_data, vix=18.0):
 #  SECTION 3 -- TECHNICAL ANALYSIS
 # =================================================================
 
-def get_technical_data():
+def get_technical_data(yf_ticker="^NSEBANK"):
     try:
-        nifty = yf.Ticker("^NSEBANK")
+        nifty = yf.Ticker(yf_ticker)
         df    = nifty.history(period="1y")
         if df.empty:
             return None
@@ -1127,11 +1149,11 @@ def build_dual_gauge_hero(oc, tech, md, ts):
   </div>
   <div class="h-stats">
     <div class="h-stat-row">
-      <div class="h-stat"><div class="h-stat-lbl">BANKNIFTY SPOT</div><div class="h-stat-val" style="color:rgba(255,255,255,.85);">&#8377;{cp:,.2f}</div></div>
-      <div class="h-stat"><div class="h-stat-lbl">ATM STRIKE</div><div class="h-stat-val" style="color:#00c896;">&#8377;{atm:,}</div></div>
-      <div class="h-stat"><div class="h-stat-lbl">EXPIRY</div><div class="h-stat-val" style="color:#00c8e0;">{expiry}</div></div>
-      <div class="h-stat"><div class="h-stat-lbl">PCR (OI)</div><div class="h-stat-val" style="color:{pcr_col};">{pcr:.3f}</div></div>
-      <div class="h-stat"><div class="h-stat-lbl">MAX PAIN</div><div class="h-stat-val" style="color:#ffd166;">&#8377;{max_pain:,}</div></div>
+      <div class="h-stat"><div class="h-stat-lbl" data-stat="spot">{instrument} SPOT</div><div class="h-stat-val" data-stat="spot" style="color:rgba(255,255,255,.85);">&#8377;{cp:,.2f}</div></div>
+      <div class="h-stat"><div class="h-stat-lbl">ATM STRIKE</div><div class="h-stat-val" data-stat="atm" style="color:#00c896;">&#8377;{atm:,}</div></div>
+      <div class="h-stat"><div class="h-stat-lbl">EXPIRY</div><div class="h-stat-val" data-stat="expiry" style="color:#00c8e0;">{expiry}</div></div>
+      <div class="h-stat"><div class="h-stat-lbl">PCR (OI)</div><div class="h-stat-val" data-stat="pcr" style="color:{pcr_col};">{pcr:.3f}</div></div>
+      <div class="h-stat"><div class="h-stat-lbl">MAX PAIN</div><div class="h-stat-val" data-stat="maxpain" style="color:#ffd166;">&#8377;{max_pain:,}</div></div>
     </div>
     <div class="h-stat-bottom">
       <div class="h-bias-row">
@@ -1614,7 +1636,7 @@ const OC={{
   bullScore:   {bull_sc},
   bearScore:   {bear_sc},
   strikes:     {strikes_json},
-  lotSize:     30
+  lotSize:     {lot_size}
 }};
 
 const STRIKE_MAP={{}};
@@ -2939,6 +2961,12 @@ footer{padding:16px 32px;border-top:1px solid rgba(255,255,255,.06);background:r
 .greeks-tbl-row:hover{background:rgba(255,255,255,.03);}
 .greeks-tbl-strike{font-family:'DM Mono',monospace;font-size:17.4px;font-weight:700;color:rgba(255,255,255,.8);}
 .greeks-tbl-cell{font-family:'DM Mono',monospace;font-size:15.9px;font-weight:600;text-align:center;color:rgba(255,255,255,.65);}
+/* ── Instrument Switcher ─────────────────── */
+.instrument-switcher{display:flex;align-items:center;gap:6px;flex-shrink:0;}
+.inst-btn{padding:5px 14px;border-radius:20px;border:1px solid;cursor:pointer;
+  font-family:var(--fh);font-size:14.5px;font-weight:700;transition:all .2s;background:transparent;
+  letter-spacing:.5px;white-space:nowrap;}
+.inst-btn:hover{opacity:.85;}
 /* Hidden refresh iframe — zero footprint */
 #silentRefreshFrame{position:fixed;width:0;height:0;border:none;visibility:hidden;pointer-events:none;opacity:0;}
 @media(max-width:1024px){
@@ -3082,7 +3110,7 @@ ANIMATED_JS = """
 <script>
 // ── Logo rotator ────────────────────────────────────────────────
 (function() {
-  const NAMES = ['BANKNIFTYCRAFT','BankNifty Option Strategy Builder','OI Signal Dashboard','Options Analytics Hub','PCR & Max Pain Tracker'];
+  const NAMES = ['NIFTYLENS','Options Analytics Hub','OI Signal Dashboard','Smart PoP Engine','PCR & Max Pain Tracker'];
   const wrap = document.getElementById('logoWrap');
   if (!wrap) return;
   NAMES.forEach((name, i) => {
@@ -3333,7 +3361,7 @@ def build_greeks_script_html(oc_analysis):
 #  SECTION 10 -- HTML ASSEMBLER
 # =================================================================
 
-def generate_html(tech, oc, md, ts, vix_data=None, multi_expiry_analyzed=None, expiry_list=None):
+def generate_html(tech, oc, md, ts, vix_data=None, multi_expiry_analyzed=None, expiry_list=None, instrument="BANKNIFTY", lot_size=30, fn_oc=None, fn_md=None, fn_tech=None, fn_multi_expiry=None, fn_expiry_list=None):
     oi_html        = build_oi_html(oc)               if oc   else ""
     kl_html        = build_key_levels_html(tech, oc) if tech else ""
     strat_html     = build_strategies_html(oc, tech, md, multi_expiry_analyzed=multi_expiry_analyzed, expiry_list=expiry_list)
@@ -3349,12 +3377,96 @@ def generate_html(tech, oc, md, ts, vix_data=None, multi_expiry_analyzed=None, e
     bias  = md["bias"]; conf = md["confidence"]
     bull  = md["bull"]; bear  = md["bear"]; diff = md["diff"]
 
+    # ── BankNifty data for JS INSTRUMENT_DATA blob ──
+    bn_oc = oc; bn_md = md; bn_tech = tech
+    lot_size_bn = lot_size
+    bn_spot   = oc["underlying"]    if oc else 0
+    bn_atm    = oc["atm_strike"]    if oc else 0
+    bn_pcr    = oc["pcr_oi"]        if oc else 1.0
+    bn_maxpain= oc["max_pain"]      if oc else 0
+    bn_max_ce = oc["max_ce_strike"] if oc else 0
+    bn_max_pe = oc["max_pe_strike"] if oc else 0
+    bn_sup    = tech["support"]     if tech else bn_spot - 150
+    bn_res    = tech["resistance"]  if tech else bn_spot + 150
+    bn_ssup   = tech["strong_sup"]  if tech else bn_spot - 300
+    bn_sres   = tech["strong_res"]  if tech else bn_spot + 300
+    bn_bias   = md["bias"]
+    bn_conf   = md["confidence"]
+    bn_bull   = md["bull"]
+    bn_bear   = md["bear"]
+    bn_oi_dir = oc["raw_oi_dir"]    if oc else "UNKNOWN"
+    bn_oi_sig = oc["raw_oi_sig"]    if oc else ""
+    bn_pcr_cls= oc["raw_oi_cls"]    if oc else "neutral"
+    bn_expiry = oc["expiry"]        if oc else "N/A"
+    bn_strikes_json = json.dumps(oc.get("strikes_data", [])) if oc else "[]"
+    # Build BN all_expiry dict for JS
+    _bn_all_exp = {}
+    if multi_expiry_analyzed and expiry_list:
+        for _exp in expiry_list:
+            _oc_e = multi_expiry_analyzed.get(_exp)
+            if not _oc_e: continue
+            _bn_all_exp[_exp] = {
+                "spot": round(_oc_e["underlying"], 2),
+                "atm": _oc_e["atm_strike"],
+                "pcr": round(_oc_e["pcr_oi"], 3),
+                "maxCeStrike": _oc_e["max_ce_strike"],
+                "maxPeStrike": _oc_e["max_pe_strike"],
+                "support": round(tech["support"], 2) if tech else bn_spot - 150,
+                "resistance": round(tech["resistance"], 2) if tech else bn_spot + 150,
+                "strongSup": round(tech["strong_sup"], 2) if tech else bn_spot - 300,
+                "strongRes": round(tech["strong_res"], 2) if tech else bn_spot + 300,
+                "strikes": _oc_e.get("strikes_data", []),
+            }
+    bn_all_expiry_json = json.dumps(_bn_all_exp)
+
+    # ── FinNifty data for JS INSTRUMENT_DATA blob ──
+    lot_size_fn = 40
+    fn_spot    = fn_oc["underlying"]    if fn_oc else 0
+    fn_atm     = fn_oc["atm_strike"]    if fn_oc else 0
+    fn_pcr_val = fn_oc["pcr_oi"]        if fn_oc else 1.0
+    fn_maxpain_val = fn_oc["max_pain"]  if fn_oc else 0
+    fn_max_ce  = fn_oc["max_ce_strike"] if fn_oc else 0
+    fn_max_pe  = fn_oc["max_pe_strike"] if fn_oc else 0
+    fn_sup     = fn_tech["support"]     if fn_tech else fn_spot - 150
+    fn_res     = fn_tech["resistance"]  if fn_tech else fn_spot + 150
+    fn_ssup    = fn_tech["strong_sup"]  if fn_tech else fn_spot - 300
+    fn_sres    = fn_tech["strong_res"]  if fn_tech else fn_spot + 300
+    fn_bias_v  = fn_md["bias"]          if fn_md else "SIDEWAYS"
+    fn_conf_v  = fn_md["confidence"]    if fn_md else "LOW"
+    fn_bull_v  = fn_md["bull"]          if fn_md else 4
+    fn_bear_v  = fn_md["bear"]          if fn_md else 4
+    fn_oi_dir  = fn_oc["raw_oi_dir"]    if fn_oc else "UNKNOWN"
+    fn_oi_sig  = fn_oc["raw_oi_sig"]    if fn_oc else "FinNifty data unavailable"
+    fn_pcr_cls = fn_oc["raw_oi_cls"]    if fn_oc else "neutral"
+    fn_expiry_v= fn_oc["expiry"]        if fn_oc else "N/A"
+    fn_strikes_json = json.dumps(fn_oc.get("strikes_data", [])) if fn_oc else "[]"
+    # Build FN all_expiry dict for JS
+    _fn_all_exp = {}
+    if fn_multi_expiry and fn_expiry_list:
+        for _exp in fn_expiry_list:
+            _oc_e = fn_multi_expiry.get(_exp)
+            if not _oc_e: continue
+            _fn_all_exp[_exp] = {
+                "spot": round(_oc_e["underlying"], 2),
+                "atm": _oc_e["atm_strike"],
+                "pcr": round(_oc_e["pcr_oi"], 3),
+                "maxCeStrike": _oc_e["max_ce_strike"],
+                "maxPeStrike": _oc_e["max_pe_strike"],
+                "support": round(fn_tech["support"], 2) if fn_tech else fn_spot - 150,
+                "resistance": round(fn_tech["resistance"], 2) if fn_tech else fn_spot + 150,
+                "strongSup": round(fn_tech["strong_sup"], 2) if fn_tech else fn_spot - 300,
+                "strongRes": round(fn_tech["strong_res"], 2) if fn_tech else fn_spot + 300,
+                "strikes": _oc_e.get("strikes_data", []),
+            }
+    fn_all_expiry_json = json.dumps(_fn_all_exp)
+    default_instrument = instrument
+
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>BankNifty Options Dashboard v18.4</title>
+<title>{instrument} Options Dashboard v20.0</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Sora:wght@300;400;600;700&family=DM+Mono:wght@300;400;500&display=swap" rel="stylesheet">
 <style>{CSS}</style>
@@ -3365,7 +3477,12 @@ def generate_html(tech, oc, md, ts, vix_data=None, multi_expiry_analyzed=None, e
   <div class="logo-wrap" id="logoWrap"></div>
   <div class="hdr-meta">
     <div class="live-dot"></div>
-    <span>NSE BankNifty Options Dashboard</span>
+    <span>NSE <span id="hdrInstrumentName">{instrument}</span> Options Dashboard</span>
+    <span style="color:rgba(255,255,255,.15);">|</span>
+    <div class="instrument-switcher">
+      <button class="inst-btn" id="instBtnBN" onclick="switchInstrument('BANKNIFTY')" style="border-color:rgba(0,200,150,.6);color:#00c896;background:rgba(0,200,150,.14);">&#9670; BankNifty</button>
+      <button class="inst-btn" id="instBtnFN" onclick="switchInstrument('FINNIFTY')" style="border-color:rgba(255,255,255,.15);color:rgba(255,255,255,.5);">&#9671; FinNifty</button>
+    </div>
     <span style="color:rgba(255,255,255,.15);">|</span>
     <span style="color:rgba(255,255,255,.75);">Last report generated:&nbsp;<span style="color:#00c896;font-weight:600;">{ts}</span></span>
     <span style="color:rgba(255,255,255,.15);">|</span>
@@ -3437,7 +3554,7 @@ def generate_html(tech, oc, md, ts, vix_data=None, multi_expiry_analyzed=None, e
   </main>
 </div>
 <footer>
-  <span>BankNiftyCraft &middot; v19.1 &middot; Holiday-Aware Expiry (Last Tue of Month) + Intraday P&amp;L Simulator</span>
+  <span>NiftyCraft &middot; v20.0 &middot; {instrument} &middot; Holiday-Aware Expiry + Intraday P&amp;L Simulator</span>
   <span>S/R + OI Walls + Bias + PCR &middot; Educational Only &middot; &copy; 2025</span>
 </footer>
 </div>
@@ -3504,6 +3621,157 @@ document.addEventListener("click",function(e){{
   }}
 }});
 </script>
+
+// ── Instrument Switcher Data & Logic ─────────────────────────────
+const INSTRUMENT_DATA = {{
+  BANKNIFTY: {{
+    name: "BankNifty",
+    lotSize: {lot_size_bn},
+    spot: {bn_spot:.2f},
+    atm: {bn_atm},
+    pcr: {bn_pcr:.3f},
+    maxPain: {bn_maxpain},
+    maxCeStrike: {bn_max_ce},
+    maxPeStrike: {bn_max_pe},
+    support: {bn_sup:.2f},
+    resistance: {bn_res:.2f},
+    strongSup: {bn_ssup:.2f},
+    strongRes: {bn_sres:.2f},
+    bias: "{bn_bias}",
+    biasConf: "{bn_conf}",
+    bullScore: {bn_bull},
+    bearScore: {bn_bear},
+    oiDir: "{bn_oi_dir}",
+    oiSig: "{bn_oi_sig}",
+    pcr_col_cls: "{bn_pcr_cls}",
+    expiry: "{bn_expiry}",
+    strikes: {bn_strikes_json},
+    allExpiry: {bn_all_expiry_json}
+  }},
+  FINNIFTY: {{
+    name: "FinNifty",
+    lotSize: {lot_size_fn},
+    spot: {fn_spot:.2f},
+    atm: {fn_atm},
+    pcr: {fn_pcr:.3f},
+    maxPain: {fn_maxpain},
+    maxCeStrike: {fn_max_ce},
+    maxPeStrike: {fn_max_pe},
+    support: {fn_sup:.2f},
+    resistance: {fn_res:.2f},
+    strongSup: {fn_ssup:.2f},
+    strongRes: {fn_sres:.2f},
+    bias: "{fn_bias}",
+    biasConf: "{fn_conf}",
+    bullScore: {fn_bull},
+    bearScore: {fn_bear},
+    oiDir: "{fn_oi_dir}",
+    oiSig: "{fn_oi_sig}",
+    pcr_col_cls: "{fn_pcr_cls}",
+    expiry: "{fn_expiry}",
+    strikes: {fn_strikes_json},
+    allExpiry: {fn_all_expiry_json}
+  }}
+}};
+
+let _activeInstrument = "{default_instrument}";
+
+function switchInstrument(sym) {{
+  if (sym === _activeInstrument) return;
+  _activeInstrument = sym;
+  const d = INSTRUMENT_DATA[sym];
+  if (!d) return;
+
+  // ── Update header buttons ──
+  const bnBtn = document.getElementById('instBtnBN');
+  const fnBtn = document.getElementById('instBtnFN');
+  if (bnBtn) {{
+    if (sym === 'BANKNIFTY') {{
+      bnBtn.style.borderColor='rgba(0,200,150,.6)'; bnBtn.style.color='#00c896'; bnBtn.style.background='rgba(0,200,150,.14)';
+      fnBtn.style.borderColor='rgba(255,255,255,.15)'; fnBtn.style.color='rgba(255,255,255,.5)'; fnBtn.style.background='transparent';
+    }} else {{
+      fnBtn.style.borderColor='rgba(100,128,255,.6)'; fnBtn.style.color='#8aa0ff'; fnBtn.style.background='rgba(100,128,255,.14)';
+      bnBtn.style.borderColor='rgba(255,255,255,.15)'; bnBtn.style.color='rgba(255,255,255,.5)'; bnBtn.style.background='transparent';
+    }}
+  }}
+  const hdrName = document.getElementById('hdrInstrumentName');
+  if (hdrName) hdrName.textContent = d.name;
+
+  // ── Update OC global object used by strategy cards ──
+  OC.spot        = d.spot;
+  OC.atm         = d.atm;
+  OC.pcr         = d.pcr;
+  OC.maxPain     = d.maxPain;
+  OC.maxCeStrike = d.maxCeStrike;
+  OC.maxPeStrike = d.maxPeStrike;
+  OC.support     = d.support;
+  OC.resistance  = d.resistance;
+  OC.strongSup   = d.strongSup;
+  OC.strongRes   = d.strongRes;
+  OC.bias        = d.bias;
+  OC.biasConf    = d.biasConf;
+  OC.bullScore   = d.bullScore;
+  OC.bearScore   = d.bearScore;
+  OC.lotSize     = d.lotSize;
+  OC.strikes     = d.strikes;
+
+  // Rebuild STRIKE_MAP
+  Object.keys(STRIKE_MAP).forEach(k => delete STRIKE_MAP[k]);
+  OC.strikes.forEach(s => {{ STRIKE_MAP[s.strike] = s; }});
+
+  // ── Swap ALL_EXPIRY_DATA for the expiry dropdown ──
+  Object.keys(ALL_EXPIRY_DATA).forEach(k => delete ALL_EXPIRY_DATA[k]);
+  if (d.allExpiry) Object.assign(ALL_EXPIRY_DATA, d.allExpiry);
+
+  // ── Update hero widget values ──
+  _updateHeroForInstrument(d);
+
+  // ── Update expiry dropdown ──
+  const expSel = document.getElementById('expiryDropdown');
+  if (expSel) {{
+    expSel.innerHTML = '';
+    const expKeys = Object.keys(d.allExpiry || {{}});
+    expKeys.forEach((exp, i) => {{
+      const opt = document.createElement('option');
+      opt.value = exp; opt.textContent = exp;
+      if (i === 0) opt.selected = true;
+      expSel.appendChild(opt);
+    }});
+  }}
+
+  // ── Collapse expanded strategy cards and recalculate ──
+  document.querySelectorAll('.sc-card.expanded').forEach(c => c.classList.remove('expanded'));
+  document.querySelectorAll('.sc-metrics-live').forEach(m => {{
+    m.innerHTML = '<div class="sc-loading">&#9685; Calculating metrics...</div>';
+  }});
+  initAllCards();
+  ['bullish','bearish','nondirectional'].forEach(sortGridByPoP);
+
+  // ── Flash the instrument name ──
+  if (hdrName) {{
+    hdrName.style.transition='color .3s';
+    hdrName.style.color = sym === 'BANKNIFTY' ? '#00c896' : '#8aa0ff';
+    setTimeout(() => {{ hdrName.style.color = ''; }}, 1200);
+  }}
+}}
+
+function _updateHeroForInstrument(d) {{
+  // Update hero stat values if the hero DOM elements exist
+  const spotEls = document.querySelectorAll('.h-stat-val[data-stat="spot"]');
+  spotEls.forEach(el => {{ el.textContent = '₹' + d.spot.toLocaleString('en-IN', {{minimumFractionDigits:2}}); }});
+  const atmEls = document.querySelectorAll('.h-stat-val[data-stat="atm"]');
+  atmEls.forEach(el => {{ el.textContent = '₹' + d.atm.toLocaleString('en-IN'); }});
+  const expiryEls = document.querySelectorAll('.h-stat-val[data-stat="expiry"]');
+  expiryEls.forEach(el => {{ el.textContent = d.expiry; }});
+  const pcrEls = document.querySelectorAll('.h-stat-val[data-stat="pcr"]');
+  pcrEls.forEach(el => {{ el.textContent = d.pcr.toFixed(3); }});
+  const mpEls = document.querySelectorAll('.h-stat-val[data-stat="maxpain"]');
+  mpEls.forEach(el => {{ el.textContent = '₹' + d.maxPain.toLocaleString('en-IN'); }});
+  // instrument label
+  const instLbls = document.querySelectorAll('.h-stat-lbl[data-stat="spot"]');
+  instLbls.forEach(el => {{ el.textContent = d.name + ' SPOT'; }});
+}}
+
 {greeks_script}
 {ANIMATED_JS}
 </body>
@@ -3517,14 +3785,12 @@ document.addEventListener("click",function(e){{
 def main():
     ts = ist_timestamp_str()
     print("=" * 65)
-    print("  BANKNIFTY OPTIONS DASHBOARD — v18.4 · Holiday-Aware Expiry")
+    print("  NSE OPTIONS DASHBOARD — v20.0 · BankNifty + FinNifty")
     print("  Expiry: LAST TUESDAY OF THE MONTH (monthly cycle)")
     print(f"  {ts}")
     print(f"  IST Date: {today_ist()}  IST Weekday: {ist_weekday()}")
     print("=" * 65)
 
-    # ── Print holiday check for BankNifty last-Tuesday-of-month ──
-    print("\n[0/4] Holiday Awareness Check (BankNifty — last Tuesday of month)...")
     import calendar as _cal
     from datetime import date as _date2
     today = today_ist()
@@ -3542,58 +3808,103 @@ def main():
         ny = today.year if today.month < 12 else today.year + 1
         this_last_tue = _last_tue(ny, nm)
 
+    print("\n[0/6] Holiday Awareness Check...")
     if is_nse_holiday(this_last_tue):
         reason = NSE_HOLIDAYS_2026.get(this_last_tue.strftime("%d-%b-%Y"), "Holiday")
         prev_td = get_prev_trading_day(this_last_tue)
         print(f"  ⚠ {this_last_tue.strftime('%d-%b-%Y')} (Last Tue) = {reason}")
-        print(f"  ✓ BankNifty expiry shifted to {prev_td.strftime('%d-%b-%Y')} ({prev_td.strftime('%A')})")
+        print(f"  ✓ Expiry shifted to {prev_td.strftime('%d-%b-%Y')} ({prev_td.strftime('%A')})")
     else:
         print(f"  ✓ {this_last_tue.strftime('%d-%b-%Y')} (Last Tue of month) is a normal trading day.")
 
-    print("\n[1/4] Fetching NSE Option Chain...")
-    nse = NSEOptionChain()
-    oc_raw, nse_session, nse_headers = nse.fetch()
+    # ═══════════════════════════════════════════════
+    # STEP 1 — BANKNIFTY
+    # ═══════════════════════════════════════════════
+    print("\n[1/6] Fetching BankNifty Option Chain...")
+    nse_bn = NSEOptionChain(symbol="BANKNIFTY")
+    bn_oc_raw, nse_session, nse_headers = nse_bn.fetch()
 
-    print("\n[2/4] Fetching India VIX...")
+    print("\n[2/6] Fetching India VIX...")
     vix_data = fetch_india_vix(nse_session, nse_headers)
     live_vix = vix_data["value"] if vix_data else 18.0
-    # Fetch all 7 expiries for dropdown
-    print("\n  Fetching next 7 expiries for dropdown...")
-    time.sleep(1.5)   # small gap so NSE doesn't block
-    multi_expiry_raw, expiry_list = nse.fetch_multiple_expiries(nse_session, nse_headers, n=15)
-    print(f"  Expiry dropdown will show: {expiry_list}")
 
-    # Pre-analyze all expiry data
-    multi_expiry_analyzed = {}
-    for exp, raw in multi_expiry_raw.items():
+    print("\n  Fetching BankNifty multi-expiry data...")
+    time.sleep(1.5)
+    bn_multi_raw, bn_expiry_list = nse_bn.fetch_multiple_expiries(nse_session, nse_headers, n=15)
+    print(f"  BN Expiry list: {bn_expiry_list}")
+
+    bn_multi_analyzed = {}
+    for exp, raw in bn_multi_raw.items():
         analyzed = analyze_option_chain(raw, vix=live_vix)
         if analyzed:
-            multi_expiry_analyzed[exp] = analyzed
-            print(f"    Analyzed {exp}: ATM={analyzed['atm_strike']} PCR={analyzed['pcr_oi']:.3f}")
+            bn_multi_analyzed[exp] = analyzed
+            print(f"    BN {exp}: ATM={analyzed['atm_strike']} PCR={analyzed['pcr_oi']:.3f}")
 
-    oc_analysis = analyze_option_chain(oc_raw, vix=live_vix) if oc_raw else None
-    if oc_analysis:
-        print(f"\n  OK  Spot={oc_analysis['underlying']:.2f}  ATM={oc_analysis['atm_strike']}")
-        print(f"      MaxCE={oc_analysis['max_ce_strike']}  MaxPE={oc_analysis['max_pe_strike']}")
-        print(f"      Expiry={oc_analysis['expiry']}  PCR={oc_analysis['pcr_oi']:.3f}")
-        print(f"      CE CHG={oc_analysis['ce_chg']:+,}  PE CHG={oc_analysis['pe_chg']:+,}")
-        print(f"      CHG Bull Force={oc_analysis['chg_bull_force']:,}  CHG Bear Force={oc_analysis['chg_bear_force']:,}")
-        print(f"      CHG Bull%={oc_analysis['chg_bull_pct']}%  CHG Bear%={oc_analysis['chg_bear_pct']}%")
+    bn_analysis = analyze_option_chain(bn_oc_raw, vix=live_vix) if bn_oc_raw else None
+    if bn_analysis:
+        print(f"  BN OK Spot={bn_analysis['underlying']:.2f} ATM={bn_analysis['atm_strike']} PCR={bn_analysis['pcr_oi']:.3f}")
 
-    print("\n[3/4] Fetching Technical Indicators (S/R levels)...")
-    tech = get_technical_data()
-    if tech:
-        print(f"  Support={tech['support']:.0f}  Resistance={tech['resistance']:.0f}")
-        print(f"  StrongSup={tech['strong_sup']:.0f}  StrongRes={tech['strong_res']:.0f}")
+    print("\n[3/6] BankNifty Technical Indicators...")
+    bn_tech = get_technical_data(yf_ticker="^NSEBANK")
+    if bn_tech:
+        print(f"  BN Support={bn_tech['support']:.0f}  Resistance={bn_tech['resistance']:.0f}")
 
-    print("\n[4/4] Scoring Market Direction...")
-    md = compute_market_direction(tech, oc_analysis)
-    print(f"  Bias={md['bias']}  Conf={md['confidence']}  Bull={md['bull']}  Bear={md['bear']}")
+    print("\n[4/6] BankNifty Market Direction...")
+    bn_md = compute_market_direction(bn_tech, bn_analysis)
+    print(f"  BN Bias={bn_md['bias']}  Conf={bn_md['confidence']}  Bull={bn_md['bull']}  Bear={bn_md['bear']}")
 
-    print("\nGenerating BankNifty Holiday-Aware Dashboard...")
-    html = generate_html(tech, oc_analysis, md, ts, vix_data=vix_data,
-                     multi_expiry_analyzed=multi_expiry_analyzed,
-                     expiry_list=expiry_list)
+    # ═══════════════════════════════════════════════
+    # STEP 2 — FINNIFTY
+    # ═══════════════════════════════════════════════
+    print("\n[5/6] Fetching FinNifty Option Chain...")
+    fn_analysis = None
+    fn_tech = None
+    fn_md = None
+    fn_multi_analyzed = {}
+    fn_expiry_list = []
+    try:
+        nse_fn = NSEOptionChain(symbol="FINNIFTY")
+        fn_oc_raw, _, _ = nse_fn.fetch()
+        time.sleep(1.5)
+        fn_multi_raw, fn_expiry_list = nse_fn.fetch_multiple_expiries(nse_session, nse_headers, n=15)
+        print(f"  FN Expiry list: {fn_expiry_list}")
+        for exp, raw in fn_multi_raw.items():
+            analyzed = analyze_option_chain(raw, vix=live_vix)
+            if analyzed:
+                fn_multi_analyzed[exp] = analyzed
+                print(f"    FN {exp}: ATM={analyzed['atm_strike']} PCR={analyzed['pcr_oi']:.3f}")
+        fn_analysis = analyze_option_chain(fn_oc_raw, vix=live_vix) if fn_oc_raw else None
+        if fn_analysis:
+            print(f"  FN OK Spot={fn_analysis['underlying']:.2f} ATM={fn_analysis['atm_strike']} PCR={fn_analysis['pcr_oi']:.3f}")
+        fn_tech = get_technical_data(yf_ticker="^CNXFIN")
+        if fn_tech:
+            print(f"  FN Support={fn_tech['support']:.0f}  Resistance={fn_tech['resistance']:.0f}")
+        fn_md = compute_market_direction(fn_tech, fn_analysis)
+        print(f"  FN Bias={fn_md['bias']}  Conf={fn_md['confidence']}  Bull={fn_md['bull']}  Bear={fn_md['bear']}")
+    except Exception as e:
+        print(f"  WARNING FinNifty fetch failed: {e}. Dashboard will still show BankNifty data.")
+
+    # Use BN as primary for OI dashboard / charts / hero widget
+    tech       = bn_tech
+    oc_analysis= bn_analysis
+    md         = bn_md
+    multi_expiry_analyzed = bn_multi_analyzed
+    expiry_list = bn_expiry_list
+
+    print("\n[6/6] Generating Dual-Instrument Dashboard...")
+    html = generate_html(
+        tech, oc_analysis, md, ts,
+        vix_data=vix_data,
+        multi_expiry_analyzed=multi_expiry_analyzed,
+        expiry_list=expiry_list,
+        instrument="BANKNIFTY",
+        lot_size=30,
+        fn_oc=fn_analysis,
+        fn_md=fn_md,
+        fn_tech=fn_tech,
+        fn_multi_expiry=fn_multi_analyzed,
+        fn_expiry_list=fn_expiry_list,
+    )
 
     os.makedirs("docs", exist_ok=True)
     out = os.path.join("docs", "index.html")
@@ -3606,35 +3917,29 @@ def main():
         "generated_at":    int(time.time()),
         "ist_date":        str(today_ist()),
         "ist_weekday":     ist_weekday(),
-        "bias":            md["bias"],
-        "confidence":      md["confidence"],
-        "bull":            md["bull"],
-        "bear":            md["bear"],
-        "diff":            md["diff"],
-        "price":           round(tech["price"], 2)         if tech        else None,
-        "expiry":          oc_analysis["expiry"]           if oc_analysis else None,
-        "pcr":             oc_analysis["pcr_oi"]           if oc_analysis else None,
-        "oi_dir":          oc_analysis["oi_dir"]           if oc_analysis else None,
-        "raw_oi_dir":      oc_analysis["raw_oi_dir"]       if oc_analysis else None,
-        "india_vix":       vix_data["value"]               if vix_data    else None,
-        "atm_strike":      oc_analysis["atm_strike"]       if oc_analysis else None,
-        "max_ce":          oc_analysis["max_ce_strike"]    if oc_analysis else None,
-        "max_pe":          oc_analysis["max_pe_strike"]    if oc_analysis else None,
-        "support":         round(tech["support"], 0)       if tech        else None,
-        "resistance":      round(tech["resistance"], 0)    if tech        else None,
-        "ce_chg":          oc_analysis["ce_chg"]           if oc_analysis else None,
-        "pe_chg":          oc_analysis["pe_chg"]           if oc_analysis else None,
-        "chg_bull_force":  oc_analysis["chg_bull_force"]   if oc_analysis else None,
-        "chg_bear_force":  oc_analysis["chg_bear_force"]   if oc_analysis else None,
-        "chg_bull_pct":    oc_analysis["chg_bull_pct"]     if oc_analysis else None,
-        "chg_bear_pct":    oc_analysis["chg_bear_pct"]     if oc_analysis else None,
+        # BankNifty
+        "bn_bias":         bn_md["bias"],
+        "bn_confidence":   bn_md["confidence"],
+        "bn_price":        round(bn_tech["price"], 2)          if bn_tech     else None,
+        "bn_expiry":       bn_analysis["expiry"]               if bn_analysis else None,
+        "bn_pcr":          bn_analysis["pcr_oi"]               if bn_analysis else None,
+        "bn_atm_strike":   bn_analysis["atm_strike"]           if bn_analysis else None,
+        # FinNifty
+        "fn_bias":         fn_md["bias"]                       if fn_md       else None,
+        "fn_confidence":   fn_md["confidence"]                 if fn_md       else None,
+        "fn_price":        round(fn_tech["price"], 2)          if fn_tech     else None,
+        "fn_expiry":       fn_analysis["expiry"]               if fn_analysis else None,
+        "fn_pcr":          fn_analysis["pcr_oi"]               if fn_analysis else None,
+        "fn_atm_strike":   fn_analysis["atm_strike"]           if fn_analysis else None,
+        # Shared
+        "india_vix":       vix_data["value"]                   if vix_data    else None,
     }
     with open(os.path.join("docs", "latest.json"), "w") as f:
         json.dump(meta, f, indent=2)
     print("  Saved: docs/latest.json")
     print("\n" + "=" * 65)
-    print(f"  DONE  |  v18.4 · BankNifty · Holiday-Aware Last-Tue-of-Month Expiry")
-    print(f"  Bias: {md['bias']}  |  Confidence: {md['confidence']}")
+    print(f"  DONE  |  v20.0 · BankNifty + FinNifty · Holiday-Aware Expiry")
+    print(f"  BN Bias: {bn_md['bias']}  |  FN Bias: {fn_md['bias'] if fn_md else 'N/A'}")
     print("  Holiday list: 2026 NSE official holidays pre-loaded")
     print("  Logic: Last Tuesday holiday → Monday → Friday (fallback)")
     print("=" * 65 + "\n")
