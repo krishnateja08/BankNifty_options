@@ -2581,19 +2581,21 @@ function popBadgeStyle(pop) {{
 }}
 
 function initAllCards() {{
+  const gridId = _activeInstrument === 'FINNIFTY' ? 'sc-grid-fn' : 'sc-grid';
+  const legendSuffix = _activeInstrument === 'FINNIFTY' ? 'FN' : '';
   let topPop=0, topName='', topCat='';
   const bullEx = smartPoP('bull_put_spread','bullish');
-  const el_b = document.getElementById('legendBiasVal');
+  const el_b = document.getElementById('legendBiasVal'+legendSuffix);
   if(el_b) {{ el_b.textContent=OC.bias+' ('+OC.biasConf+')'; el_b.style.color=OC.bias==='BULLISH'?'#00c896':OC.bias==='BEARISH'?'#ff6b6b':'#6480ff'; }}
   const srPts = bullEx.srAdj;
-  const el_sr = document.getElementById('legendSRVal');
+  const el_sr = document.getElementById('legendSRVal'+legendSuffix);
   if(el_sr) {{ const srLabel = srPts>5?'Near Support ✓':srPts<-5?'Near Resistance ✗':'Mid Range'; el_sr.textContent=srLabel+' ('+(srPts>=0?'+':'')+srPts+')'; el_sr.style.color=srPts>=0?'#00c896':'#ff6b6b'; }}
   const oiPts = bullEx.oiAdj;
-  const el_oi = document.getElementById('legendOIVal');
+  const el_oi = document.getElementById('legendOIVal'+legendSuffix);
   if(el_oi) {{ const oiLabel = OC.spot>OC.maxPeStrike?'Above PE Wall ✓':'Below PE Wall ✗'; el_oi.textContent=oiLabel+' ('+(oiPts>=0?'+':'')+oiPts+')'; el_oi.style.color=oiPts>=0?'#00c896':'#ff6b6b'; }}
-  const el_pcr = document.getElementById('legendPCRVal');
+  const el_pcr = document.getElementById('legendPCRVal'+legendSuffix);
   if(el_pcr) {{ const pcrLabel = OC.pcr>1.2?'Bullish PCR ':OC.pcr<0.8?'Bearish PCR ':'Neutral PCR '; el_pcr.textContent=pcrLabel+OC.pcr.toFixed(3); el_pcr.style.color=OC.pcr>1.2?'#00c896':OC.pcr<0.8?'#ff6b6b':'#6480ff'; }}
-  document.querySelectorAll('.sc-card').forEach(card=>{{
+  document.getElementById(gridId).querySelectorAll('.sc-card').forEach(card=>{{
     const shape=card.dataset.shape, cat=card.dataset.cat;
     const badge=document.getElementById('pop_'+card.id);
     try {{
@@ -2605,7 +2607,7 @@ function initAllCards() {{
       if(result.pop>topPop) {{ topPop=result.pop; topName=card.dataset.name; topCat=cat; }}
     }}catch(e){{card.dataset.pop=0;if(badge)badge.textContent='—%';}}
   }});
-  const el_rec = document.getElementById('legendRecVal');
+  const el_rec = document.getElementById('legendRecVal'+legendSuffix);
   if(el_rec && topName) {{
     const recCol = topCat==='bullish'?'#00c896':topCat==='bearish'?'#ff6b6b':'#6480ff';
     el_rec.innerHTML=`<span style="color:${{recCol}};">${{topName}}</span> <span style="color:rgba(255,255,255,.75);font-size:13px;">${{topPop}}% PoP</span>`;
@@ -2613,7 +2615,8 @@ function initAllCards() {{
 }}
 
 function sortGridByPoP(cat) {{
-  const grid=document.getElementById('sc-grid'); if(!grid)return;
+  const gridId2 = _activeInstrument === 'FINNIFTY' ? 'sc-grid-fn' : 'sc-grid';
+  const grid=document.getElementById(gridId2); if(!grid)return;
   const cards=Array.from(grid.querySelectorAll(`.sc-card[data-cat="${{cat}}"]`));
   cards.sort((a,b)=>parseInt(b.dataset.pop||0)-parseInt(a.dataset.pop||0));
   cards.forEach(c=>grid.appendChild(c));
@@ -3371,13 +3374,33 @@ def generate_html(tech, oc, md, ts, vix_data=None, multi_expiry_analyzed=None, e
     oi_html        = build_oi_html(oc)               if oc   else ""
     kl_html        = build_key_levels_html(tech, oc) if tech else ""
     strat_html     = build_strategies_html(oc, tech, md, multi_expiry_analyzed=multi_expiry_analyzed, expiry_list=expiry_list, lot_size=lot_size, emit_script=True)
-    fn_strat_html  = build_strategies_html(fn_oc, fn_tech, fn_md, multi_expiry_analyzed=fn_multi_expiry, expiry_list=fn_expiry_list, lot_size=60, emit_script=False) if fn_oc else ""
+    _fn_strat_raw  = build_strategies_html(fn_oc, fn_tech, fn_md, multi_expiry_analyzed=fn_multi_expiry, expiry_list=fn_expiry_list, lot_size=60, emit_script=False) if fn_oc else ""
+    # Rename IDs in FN strat HTML to avoid conflicts with BN section
+    fn_strat_html  = (_fn_strat_raw
+        .replace('id="sc-grid"', 'id="sc-grid-fn"')
+        .replace('id="smartPopLegend"', 'id="smartPopLegendFN"')
+        .replace('id="legendBiasVal"', 'id="legendBiasValFN"')
+        .replace('id="legendSRVal"', 'id="legendSRValFN"')
+        .replace('id="legendOIVal"', 'id="legendOIValFN"')
+        .replace('id="legendPCRVal"', 'id="legendPCRValFN"')
+        .replace('id="legendRecVal"', 'id="legendRecValFN"')
+        .replace('id="sc_', 'id="fn_sc_')
+        .replace('id="pop_sc_', 'id="pop_fn_sc_')
+    ) if _fn_strat_raw else ""
     strikes_html   = build_strikes_html(oc)
     ticker_html    = build_ticker_bar(tech, oc, vix_data)
     gauge_html     = build_dual_gauge_hero(oc, tech, md, ts, instrument=instrument)
     greeks_sidebar = build_greeks_sidebar_html(oc)
     greeks_script  = build_greeks_script_html(oc)
     greeks_table   = build_greeks_table_html(oc)
+    # ── FinNifty versions of all swappable sections ──
+    fn_oi_html        = build_oi_html(fn_oc)                  if fn_oc   else "<p style='color:rgba(255,255,255,.4);padding:20px'>FinNifty OI data unavailable</p>"
+    fn_kl_html        = build_key_levels_html(fn_tech, fn_oc) if fn_tech else "<p style='color:rgba(255,255,255,.4);padding:20px'>FinNifty key levels unavailable</p>"
+    fn_strikes_html   = build_strikes_html(fn_oc)             if fn_oc   else ""
+    fn_ticker_html    = build_ticker_bar(fn_tech, fn_oc, vix_data) if fn_oc else ""
+    fn_gauge_html     = build_dual_gauge_hero(fn_oc, fn_tech, fn_md, ts, instrument="FINNIFTY") if fn_oc else ""
+    fn_greeks_sidebar = build_greeks_sidebar_html(fn_oc)      if fn_oc   else ""
+    fn_greeks_table   = build_greeks_table_html(fn_oc)        if fn_oc   else ""
 
     C = 2 * 3.14159 * 7
     cp    = tech["price"] if tech else 0
@@ -3514,12 +3537,15 @@ def generate_html(tech, oc, md, ts, vix_data=None, multi_expiry_analyzed=None, e
     </div>
   </div>
 </header>
-{ticker_html}
-{gauge_html}
+<div id="tickerBN">{ticker_html}</div>
+<div id="tickerFN" style="display:none">{fn_ticker_html}</div>
+<div id="gaugeBN">{gauge_html}</div>
+<div id="gaugeFN" style="display:none">{fn_gauge_html}</div>
 <div class="main">
   <aside class="sidebar">
     <div class="sidebar-sticky-top">
-      <div id="greeksPanel">{greeks_sidebar}</div>
+      <div id="greeksPanelBN">{greeks_sidebar}</div>
+      <div id="greeksPanelFN" style="display:none">{fn_greeks_sidebar}</div>
     </div>
     <div class="sidebar-scroll">
     <div class="sb-sec">
@@ -3546,10 +3572,16 @@ def generate_html(tech, oc, md, ts, vix_data=None, multi_expiry_analyzed=None, e
       <button class="main-tab" id="mainTabStrat" onclick="switchMainTab('strat')">&#128203; Option Strategies Reference</button>
     </div>
     <div id="mainPanelOI">
-      <div id="oi">{oi_html}</div>
+      <div id="oiBN"><div id="oi">{oi_html}</div>
       <div id="kl">{kl_html}</div>
-      {greeks_table}
-      <div id="strikes">{strikes_html}</div>
+      <div id="greeksTableBN">{greeks_table}</div>
+      <div id="strikes">{strikes_html}</div></div>
+      <div id="oiFN" style="display:none">
+        <div id="oiFN_inner">{fn_oi_html}</div>
+        <div id="klFN">{fn_kl_html}</div>
+        <div id="greeksTableFN">{fn_greeks_table}</div>
+        <div id="strikesFN">{fn_strikes_html}</div>
+      </div>
       <div class="section">
         <div style="background:rgba(100,128,255,.06);border:1px solid rgba(100,128,255,.18);
                     border-left:3px solid #6480ff;border-radius:12px;padding:16px 18px;
@@ -3664,10 +3696,18 @@ function switchInstrument(sym) {{
     return;
   }}
   _activeInstrument = sym;
-  const sBN = document.getElementById('stratBN');
-  const sFN = document.getElementById('stratFN');
-  if (sBN) sBN.style.display = sym==='BANKNIFTY' ? '' : 'none';
-  if (sFN) sFN.style.display = sym==='FINNIFTY'  ? '' : 'none';
+  const isBN = sym === 'BANKNIFTY';
+  // Swap ALL instrument-specific panels
+  const panelPairs = [
+    ['stratBN','stratFN'],['oiBN','oiFN'],['tickerBN','tickerFN'],
+    ['gaugeBN','gaugeFN'],['greeksPanelBN','greeksPanelFN']
+  ];
+  panelPairs.forEach(([bn,fn]) => {{
+    const elBN = document.getElementById(bn);
+    const elFN = document.getElementById(fn);
+    if (elBN) elBN.style.display = isBN ? '' : 'none';
+    if (elFN) elFN.style.display = isBN ? 'none' : '';
+  }});
   const bnBtn = document.getElementById('instBtnBN');
   const fnBtn = document.getElementById('instBtnFN');
   if (bnBtn && fnBtn) {{
