@@ -1461,7 +1461,7 @@ STRATEGIES_DATA = {
 }
 
 
-def build_strategies_html(oc_analysis, tech=None, md=None, multi_expiry_analyzed=None, expiry_list=None, lot_size=30, emit_script=True):
+def build_strategies_html(oc_analysis, tech=None, md=None, multi_expiry_analyzed=None, expiry_list=None, lot_size=30, emit_script=True, instrument_prefix="bn"):
     spot       = oc_analysis["underlying"]   if oc_analysis else 23000
     atm        = oc_analysis["atm_strike"]   if oc_analysis else 23000
     pcr        = oc_analysis["pcr_oi"]       if oc_analysis else 1.0
@@ -1522,7 +1522,7 @@ def build_strategies_html(oc_analysis, tech=None, md=None, multi_expiry_analyzed
             svg  = make_payoff_svg(s["shape"])
             rc   = "#00c896" if s["risk"]   in ("Limited","Low") else ("#ff6b6b" if s["risk"] in ("Unlimited","High") else "#6480ff")
             rwc  = "#00c896" if s["reward"] == "Unlimited" else "#6480ff"
-            cid  = f"sc_{cat}_{idx}"
+            cid  = f"sc_{instrument_prefix}_{cat}_{idx}"
             cards += (
                 f'<div class="sc-card" data-cat="{cat}" data-shape="{s["shape"]}" '
                 f'data-name="{s["name"]}" data-legs="{s["legs"]}" '
@@ -2581,19 +2581,27 @@ function popBadgeStyle(pop) {{
 }}
 
 function initAllCards() {{
+  // Only process cards in the currently visible strategy panel
+  const activePanelId = (typeof _activeInstrument !== 'undefined' && _activeInstrument === 'FINNIFTY') ? 'stratFN' : 'stratBN';
+  const activePanel = document.getElementById(activePanelId) || document;
   let topPop=0, topName='', topCat='';
   const bullEx = smartPoP('bull_put_spread','bullish');
-  const el_b = document.getElementById('legendBiasVal');
+  // Legend: A · BIAS
+  const el_b = activePanel.querySelector('#legendBiasVal') || document.getElementById('legendBiasVal');
   if(el_b) {{ el_b.textContent=OC.bias+' ('+OC.biasConf+')'; el_b.style.color=OC.bias==='BULLISH'?'#00c896':OC.bias==='BEARISH'?'#ff6b6b':'#6480ff'; }}
+  // Legend: B · S/R ZONE
   const srPts = bullEx.srAdj;
-  const el_sr = document.getElementById('legendSRVal');
+  const el_sr = activePanel.querySelector('#legendSRVal') || document.getElementById('legendSRVal');
   if(el_sr) {{ const srLabel = srPts>5?'Near Support ✓':srPts<-5?'Near Resistance ✗':'Mid Range'; el_sr.textContent=srLabel+' ('+(srPts>=0?'+':'')+srPts+')'; el_sr.style.color=srPts>=0?'#00c896':'#ff6b6b'; }}
+  // Legend: C · OI WALLS
   const oiPts = bullEx.oiAdj;
-  const el_oi = document.getElementById('legendOIVal');
+  const el_oi = activePanel.querySelector('#legendOIVal') || document.getElementById('legendOIVal');
   if(el_oi) {{ const oiLabel = OC.spot>OC.maxPeStrike?'Above PE Wall ✓':'Below PE Wall ✗'; el_oi.textContent=oiLabel+' ('+(oiPts>=0?'+':'')+oiPts+')'; el_oi.style.color=oiPts>=0?'#00c896':'#ff6b6b'; }}
-  const el_pcr = document.getElementById('legendPCRVal');
+  // Legend: D · PCR
+  const el_pcr = activePanel.querySelector('#legendPCRVal') || document.getElementById('legendPCRVal');
   if(el_pcr) {{ const pcrLabel = OC.pcr>1.2?'Bullish PCR ':OC.pcr<0.8?'Bearish PCR ':'Neutral PCR '; el_pcr.textContent=pcrLabel+OC.pcr.toFixed(3); el_pcr.style.color=OC.pcr>1.2?'#00c896':OC.pcr<0.8?'#ff6b6b':'#6480ff'; }}
-  document.querySelectorAll('.sc-card').forEach(card=>{{
+  // Cards — only process cards in active panel
+  activePanel.querySelectorAll('.sc-card').forEach(card=>{{
     const shape=card.dataset.shape, cat=card.dataset.cat;
     const badge=document.getElementById('pop_'+card.id);
     try {{
@@ -2601,11 +2609,12 @@ function initAllCards() {{
       const m=calcMetrics(shape, result.pop);
       card.dataset.pop=result.pop;
       card.dataset.scoreBreakdown=JSON.stringify(result);
-      if(badge) {{ badge.textContent=result.pop+'%'; badge.setAttribute('style', badge.getAttribute('style')||''); badge.setAttribute('style', popBadgeStyle(result.pop)); }}
+      if(badge) {{ badge.textContent=result.pop+'%'; badge.setAttribute('style', popBadgeStyle(result.pop)); }}
       if(result.pop>topPop) {{ topPop=result.pop; topName=card.dataset.name; topCat=cat; }}
     }}catch(e){{card.dataset.pop=0;if(badge)badge.textContent='—%';}}
   }});
-  const el_rec = document.getElementById('legendRecVal');
+  // Legend: ★ TOP STRATEGY
+  const el_rec = activePanel.querySelector('#legendRecVal') || document.getElementById('legendRecVal');
   if(el_rec && topName) {{
     const recCol = topCat==='bullish'?'#00c896':topCat==='bearish'?'#ff6b6b':'#6480ff';
     el_rec.innerHTML=`<span style="color:${{recCol}};">${{topName}}</span> <span style="color:rgba(255,255,255,.75);font-size:13px;">${{topPop}}% PoP</span>`;
@@ -2613,7 +2622,10 @@ function initAllCards() {{
 }}
 
 function sortGridByPoP(cat) {{
-  const grid=document.getElementById('sc-grid'); if(!grid)return;
+  const activePanelId = (typeof _activeInstrument !== 'undefined' && _activeInstrument === 'FINNIFTY') ? 'stratFN' : 'stratBN';
+  const activePanel = document.getElementById(activePanelId) || document;
+  const grid = activePanel.querySelector('.sc-grid') || document.getElementById('sc-grid');
+  if(!grid)return;
   const cards=Array.from(grid.querySelectorAll(`.sc-card[data-cat="${{cat}}"]`));
   cards.sort((a,b)=>parseInt(b.dataset.pop||0)-parseInt(a.dataset.pop||0));
   cards.forEach(c=>grid.appendChild(c));
@@ -3370,8 +3382,8 @@ def build_greeks_script_html(oc_analysis):
 def generate_html(tech, oc, md, ts, vix_data=None, multi_expiry_analyzed=None, expiry_list=None, instrument="BANKNIFTY", lot_size=30, fn_oc=None, fn_md=None, fn_tech=None, fn_multi_expiry=None, fn_expiry_list=None):
     oi_html        = build_oi_html(oc)               if oc   else ""
     kl_html        = build_key_levels_html(tech, oc) if tech else ""
-    strat_html     = build_strategies_html(oc, tech, md, multi_expiry_analyzed=multi_expiry_analyzed, expiry_list=expiry_list, lot_size=lot_size, emit_script=True)
-    fn_strat_html  = build_strategies_html(fn_oc, fn_tech, fn_md, multi_expiry_analyzed=fn_multi_expiry, expiry_list=fn_expiry_list, lot_size=60, emit_script=False) if fn_oc else ""
+    strat_html     = build_strategies_html(oc, tech, md, multi_expiry_analyzed=multi_expiry_analyzed, expiry_list=expiry_list, lot_size=lot_size, emit_script=True,  instrument_prefix="bn")
+    fn_strat_html  = build_strategies_html(fn_oc, fn_tech, fn_md, multi_expiry_analyzed=fn_multi_expiry, expiry_list=fn_expiry_list, lot_size=60, emit_script=False, instrument_prefix="fn") if fn_oc else ""
     strikes_html   = build_strikes_html(oc)
     ticker_html    = build_ticker_bar(tech, oc, vix_data)
     gauge_html     = build_dual_gauge_hero(oc, tech, md, ts, instrument=instrument)
@@ -3643,7 +3655,9 @@ function switchMainTab(tab) {{
   document.getElementById('mainTabStrat').classList.toggle('active', tab === 'strat');
 }}
 function filterStrat(cat,btn){{
-  document.querySelectorAll(".sc-card").forEach(c=>{{c.classList.toggle("hidden",c.dataset.cat!==cat);}});
+  const activePanelId = (typeof _activeInstrument !== 'undefined' && _activeInstrument === 'FINNIFTY') ? 'stratFN' : 'stratBN';
+  const activePanel = document.getElementById(activePanelId) || document;
+  activePanel.querySelectorAll(".sc-card").forEach(c=>{{c.classList.toggle("hidden",c.dataset.cat!==cat);}});
   const colors={{bullish:"#00c896",bearish:"#ff6b6b",nondirectional:"#6480ff"}};
   const col=colors[cat]||"#00c896";
   document.querySelectorAll(".sc-tab").forEach(t=>{{t.style.borderColor="rgba(255,255,255,.15)";t.style.color="rgba(255,255,255,.5)";t.style.background="transparent";}});
@@ -3656,8 +3670,10 @@ function filterStrat(cat,btn){{
 document.addEventListener("click",function(e){{
   const card=e.target.closest(".sc-card");
   if(card){{
+    const activePanelId = (typeof _activeInstrument !== 'undefined' && _activeInstrument === 'FINNIFTY') ? 'stratFN' : 'stratBN';
+    const activePanel = document.getElementById(activePanelId) || document;
     const was=card.classList.contains("expanded");
-    document.querySelectorAll(".sc-card.expanded").forEach(c=>c.classList.remove("expanded"));
+    activePanel.querySelectorAll(".sc-card.expanded").forEach(c=>c.classList.remove("expanded"));
     if(!was){{
       card.classList.add("expanded");
       const mel=card.querySelector('.sc-metrics-live');
