@@ -1468,6 +1468,9 @@ def build_strategies_html(oc_analysis, tech=None, md=None, multi_expiry_analyzed
     max_ce_s   = oc_analysis["max_ce_strike"] if oc_analysis else atm + 200
     max_pe_s   = oc_analysis["max_pe_strike"] if oc_analysis else atm - 200
     strikes_json = json.dumps(oc_analysis.get("strikes_data", [])) if oc_analysis else "[]"
+    expiry_label = oc_analysis["expiry"] if oc_analysis else "N/A"
+    # Use lot_size to distinguish BN vs FN dropdown IDs (60 = FN)
+    expiry_dd_id = "expiryDropdown" if lot_size != 60 else "expiryDropdownFN"
 
     # Build multi-expiry data for dropdown
     all_expiry_js = {}
@@ -1604,7 +1607,7 @@ def build_strategies_html(oc_analysis, tech=None, md=None, multi_expiry_analyzed
     <div style="margin-left:auto;display:flex;align-items:center;gap:8px;">
       <span style="font-size:13px;font-weight:700;letter-spacing:1.5px;text-transform:uppercase;
                    color:rgba(255,209,102,.7);">&#128197; EXPIRY DATE</span>
-      <select id="expiryDropdown" onchange="switchExpiry(this.value)"
+      <select id="{expiry_dd_id}" onchange="switchExpiry(this.value, '{expiry_dd_id}')"
         style="appearance:none;-webkit-appearance:none;
                background:linear-gradient(135deg,rgba(245,197,24,.12),rgba(200,155,10,.06));
                border:1px solid rgba(245,197,24,.45);border-radius:8px;
@@ -1636,7 +1639,8 @@ const OC={{
   bullScore:   {bull_sc},
   bearScore:   {bear_sc},
   strikes:     {strikes_json},
-  lotSize:     {lot_size}
+  lotSize:     {lot_size},
+  expiry:      "{expiry_label}"
 }};
 
 const STRIKE_MAP={{}};
@@ -2624,19 +2628,23 @@ window.addEventListener('load',function(){{
 // ── Multi-Expiry Switcher ─────────────────────────────────────
 const ALL_EXPIRY_DATA = {all_expiry_json};
 
-window.switchExpiry = function(exp) {{
-  let d = ALL_EXPIRY_DATA[exp];
+window.switchExpiry = function(exp, ddId) {{
+  const ddElemId = ddId || (_activeInstrument === 'FINNIFTY' ? 'expiryDropdownFN' : 'expiryDropdown');
+  const activeExpData = (typeof INSTRUMENT_DATA !== 'undefined' && _activeInstrument)
+    ? (INSTRUMENT_DATA[_activeInstrument] && INSTRUMENT_DATA[_activeInstrument].allExpiry) || ALL_EXPIRY_DATA
+    : ALL_EXPIRY_DATA;
+  let d = activeExpData[exp];
   if (!d) {{
-    const sel = document.getElementById('expiryDropdown');
+    const sel = document.getElementById(ddElemId);
     if (sel) {{
       const opts = Array.from(sel.options);
       const curIdx = opts.findIndex(o => o.value === exp);
       for (let i = curIdx + 1; i < opts.length; i++) {{
         const nextExp = opts[i].value;
-        if (ALL_EXPIRY_DATA[nextExp]) {{
+        if (activeExpData[nextExp]) {{
           sel.value = nextExp;
           exp = nextExp;
-          d = ALL_EXPIRY_DATA[nextExp];
+          d = activeExpData[nextExp];
           break;
         }}
       }}
@@ -2667,7 +2675,7 @@ window.switchExpiry = function(exp) {{
   initAllCards();
   ['bullish','bearish','nondirectional'].forEach(sortGridByPoP);
   // Flash indicator
-  const sel = document.getElementById('expiryDropdown');
+  const sel = document.getElementById(ddElemId);
   if (sel) {{
     sel.style.borderColor = '#00c896';
     sel.style.boxShadow = '0 0 10px rgba(0,200,150,.3)';
@@ -3009,7 +3017,7 @@ footer{padding:16px 32px;border-top:1px solid rgba(255,255,255,.06);background:r
   .greeks-table-section{padding:16px 14px;}
   .sc-tabs{flex-direction:column;gap:8px;}
   .sc-tabs>div[style]{margin-left:0!important;width:100%;}
-  #expiryDropdown{width:100%;font-size:14px;}
+  #expiryDropdown,#expiryDropdownFN{width:100%;font-size:14px;}
 }
 @media(max-width:640px){
   header{padding:10px 12px}
@@ -3035,7 +3043,7 @@ footer{padding:16px 32px;border-top:1px solid rgba(255,255,255,.06);background:r
   .h-stat-lbl{font-size:9px;letter-spacing:1px;}
   .sc-tabs{gap:6px;margin-bottom:14px;flex-direction:column;}
   .sc-tabs>div[style]{margin-left:0!important;width:100%!important;}
-  #expiryDropdown{width:100%!important;font-size:13px;padding:6px 10px;}
+  #expiryDropdown,#expiryDropdownFN{width:100%!important;font-size:13px;padding:6px 10px;}
   .sc-tab{padding:6px 14px;font-size:15px;}
   .sc-name{font-size:15px;}
   .sb-btn{font-size:15px;padding:7px 10px;}
@@ -3365,6 +3373,7 @@ def generate_html(tech, oc, md, ts, vix_data=None, multi_expiry_analyzed=None, e
     oi_html        = build_oi_html(oc)               if oc   else ""
     kl_html        = build_key_levels_html(tech, oc) if tech else ""
     strat_html     = build_strategies_html(oc, tech, md, multi_expiry_analyzed=multi_expiry_analyzed, expiry_list=expiry_list, lot_size=lot_size)
+    fn_strat_html  = build_strategies_html(fn_oc, fn_tech, fn_md, multi_expiry_analyzed=fn_multi_expiry, expiry_list=fn_expiry_list, lot_size=60) if fn_oc else ""
     strikes_html   = build_strikes_html(oc)
     ticker_html    = build_ticker_bar(tech, oc, vix_data)
     gauge_html     = build_dual_gauge_hero(oc, tech, md, ts, instrument=instrument)
@@ -3553,7 +3562,12 @@ def generate_html(tech, oc, md, ts, vix_data=None, multi_expiry_analyzed=None, e
       </div>
     </div>
     <div id="mainPanelStrat" style="display:none;">
+      <div id="stratBN">
       {strat_html}
+      </div>
+      <div id="stratFN" style="display:none;">
+      {fn_strat_html}
+      </div>
     </div>
   </main>
 </div>
@@ -3690,6 +3704,14 @@ function switchInstrument(sym) {{
   }}
   _activeInstrument = sym;
 
+  // ── Swap strategy section (pre-built HTML for each instrument) ──
+  const stratBN = document.getElementById('stratBN');
+  const stratFN = document.getElementById('stratFN');
+  if (stratBN && stratFN) {{
+    stratBN.style.display = sym === 'BANKNIFTY' ? '' : 'none';
+    stratFN.style.display = sym === 'FINNIFTY'  ? '' : 'none';
+  }}
+
   // ── Update header buttons ──
   const bnBtn = document.getElementById('instBtnBN');
   const fnBtn = document.getElementById('instBtnFN');
@@ -3722,6 +3744,7 @@ function switchInstrument(sym) {{
   OC.bearScore   = d.bearScore;
   OC.lotSize     = d.lotSize;
   OC.strikes     = d.strikes;
+  OC.expiry      = d.expiry;
 
   // Rebuild STRIKE_MAP
   Object.keys(STRIKE_MAP).forEach(k => delete STRIKE_MAP[k]);
@@ -3735,7 +3758,8 @@ function switchInstrument(sym) {{
   _updateHeroForInstrument(d);
 
   // ── Update expiry dropdown ──
-  const expSel = document.getElementById('expiryDropdown');
+  const expDdId = sym === 'FINNIFTY' ? 'expiryDropdownFN' : 'expiryDropdown';
+  const expSel = document.getElementById(expDdId);
   if (expSel) {{
     expSel.innerHTML = '';
     const expKeys = Object.keys(d.allExpiry || {{}});
