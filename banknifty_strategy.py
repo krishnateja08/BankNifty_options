@@ -3439,18 +3439,105 @@ ANIMATED_JS = """
 
   function microDiff(newDoc) {
     let changed = false;
+
+    // ── 1. Capture ALL scroll positions BEFORE touching DOM ──────
+    const winScrollY   = window.scrollY || window.pageYOffset || 0;
+    const winScrollX   = window.scrollX || window.pageXOffset || 0;
+    const contentEl    = document.querySelector('.content');
+    const sidebarEl    = document.querySelector('.sidebar-scroll') || document.querySelector('.sidebar');
+    const bodyEl       = document.documentElement;
+    const contentST    = contentEl  ? contentEl.scrollTop  : 0;
+    const contentSL    = contentEl  ? contentEl.scrollLeft : 0;
+    const sidebarST    = sidebarEl  ? sidebarEl.scrollTop  : 0;
+
+    function restoreScroll() {
+      if (contentEl)  { contentEl.scrollTop  = contentST; contentEl.scrollLeft = contentSL; }
+      if (sidebarEl)  { sidebarEl.scrollTop  = sidebarST; }
+      try { window.scrollTo({ left: winScrollX, top: winScrollY, behavior: 'instant' }); } catch(e) {
+        try { window.scrollTo(winScrollX, winScrollY); } catch(e2) {}
+      }
+      if (bodyEl) { bodyEl.scrollTop = winScrollY; }
+    }
+
+    // ── 2. Capture UI state BEFORE patching ─────────────────────
+    const expandedCard = document.querySelector('.sc-card.expanded');
+    const expandedId   = expandedCard ? expandedCard.id : null;
+
+    // Read active filter from button state (not innerHTML — survives patch)
+    const activeFilter = (function() {
+      const tabs = document.querySelectorAll('.sc-tab');
+      for (let i = 0; i < tabs.length; i++) {
+        const bc = tabs[i].style.borderColor;
+        if (bc && bc !== 'rgba(255, 255, 255, 0.15)' && bc !== 'transparent' && bc !== '') {
+          const txt = tabs[i].textContent.toUpperCase();
+          if (txt.includes('BEAR')) return 'bearish';
+          if (txt.includes('NON'))  return 'nondirectional';
+          return 'bullish';
+        }
+      }
+      return 'bullish';
+    })();
+
+    // Read main tab from button active class (buttons not patched)
+    const mainTab = (function() {
+      const btn = document.getElementById('mainTabStrat');
+      return (btn && btn.classList.contains('active')) ? 'strat' : 'oi';
+    })();
+
+    const greeksSelEl  = document.getElementById('greeksStrikeSelect');
+    const greeksSelVal = greeksSelEl ? greeksSelEl.value : null;
+    const activeInstr  = (typeof _activeInstrument !== 'undefined') ? _activeInstrument : 'BANKNIFTY';
+
+    // ── 3. Patch sections — SKIP mainPanelStrat if card is open ──
     PATCH_IDS.forEach(function(id) {
+      if (id === 'mainPanelStrat' && expandedId) return;
       const curEl = document.getElementById(id);
       const newEl = newDoc.getElementById(id);
       if (!curEl || !newEl) return;
       if (curEl.innerHTML !== newEl.innerHTML) {
-        const content = document.querySelector('.content');
-        const scrollTop = content ? content.scrollTop : 0;
         curEl.innerHTML = newEl.innerHTML;
-        if (content) content.scrollTop = scrollTop;
         changed = true;
       }
     });
+
+    // ── 4. Restore scroll IMMEDIATELY after patch ────────────────
+    restoreScroll();
+
+    // ── 5. Restore UI state (badges, filter, greeks) ─────────────
+    if (changed) {
+      setTimeout(function() {
+        try {
+          // Re-compute PoP badges (safe — no DOM reorder)
+          if (typeof initAllCards === 'function') initAllCards();
+
+          // Restore filter tab highlight only (no sortGridByPoP — avoids DOM reorder)
+          if (typeof filterStrat === 'function') filterStrat(activeFilter, null);
+
+          // Restore greeks dropdown
+          if (greeksSelVal) {
+            const sel2 = document.getElementById('greeksStrikeSelect');
+            if (sel2) {
+              sel2.value = greeksSelVal;
+              if (activeInstr === 'FINNIFTY' && typeof _fnGreeksUpdate === 'function') _fnGreeksUpdate(greeksSelVal);
+              else if (typeof greeksUpdateStrike === 'function') greeksUpdateStrike(greeksSelVal);
+            }
+          }
+
+          // Restore main tab visibility
+          if (typeof switchMainTab === 'function') switchMainTab(mainTab);
+
+        } catch(e) {}
+
+        // Scroll restore after JS state changes
+        restoreScroll();
+
+      }, 60);
+
+      // Final scroll guarantee after layout reflow
+      setTimeout(restoreScroll, 180);
+      setTimeout(restoreScroll, 400);
+    }
+
     return changed;
   }
 
@@ -3489,23 +3576,7 @@ ANIMATED_JS = """
       _lastTimestamp = newTs;
       const changed = microDiff(newDoc);
       showSpinner(false); _refreshing = false;
-      if (changed) {
-        flashUpdated();
-        setTimeout(function() {
-          try {
-            if (typeof initAllCards === 'function') {
-              initAllCards();
-              ['bullish','bearish','nondirectional'].forEach(function(c) {
-                if (typeof sortGridByPoP === 'function') sortGridByPoP(c);
-              });
-            }
-            if (typeof greeksUpdateStrike === 'function') {
-              var sel = document.getElementById('greeksStrikeSelect');
-              if (sel) greeksUpdateStrike(sel.value);
-            }
-          } catch(e) {}
-        }, 60);
-      }
+      if (changed) flashUpdated();
     } catch(e) {
       showSpinner(false); _refreshing = false;
     }
