@@ -1640,7 +1640,8 @@ const OC={{
   bullScore:   {bull_sc},
   bearScore:   {bear_sc},
   strikes:     {strikes_json},
-  lotSize:     {lot_size}
+  lotSize:     {lot_size},
+  strikeStep:  100
 }};
 
 const STRIKE_MAP={{}};
@@ -1714,7 +1715,8 @@ function getATMLTP(type) {{
   return type==='ce'?row.ce_ltp:row.pe_ltp;
 }}
 function getOTM(type,offset) {{
-  const t=type==='ce'?OC.atm+offset*100:OC.atm-offset*100;
+  const step = OC.strikeStep || 100;
+  const t=type==='ce'?OC.atm+offset*step:OC.atm-offset*step;
   const row=STRIKE_MAP[t]||OC.strikes.reduce((b,s)=>Math.abs(s.strike-t)<Math.abs(b.strike-t)?s:b,OC.strikes[0]||{{strike:OC.atm,ce_ltp:0,pe_ltp:0,ce_iv:15,pe_iv:15}});
   return {{strike:row.strike||t,ltp:type==='ce'?row.ce_ltp:row.pe_ltp,iv:type==='ce'?row.ce_iv:row.pe_iv}};
 }}
@@ -3934,7 +3936,7 @@ const INSTRUMENT_PANELS = {{
 }};
 const INSTRUMENT_DATA = {{
   BANKNIFTY: {{
-    name:"BankNifty", lotSize:{lot_size_bn},
+    name:"BankNifty", lotSize:{lot_size_bn}, strikeStep:100,
     spot:{bn_spot:.2f}, atm:{bn_atm}, pcr:{bn_pcr:.3f},
     maxPain:{bn_maxpain}, maxCeStrike:{bn_max_ce}, maxPeStrike:{bn_max_pe},
     support:{bn_sup:.2f}, resistance:{bn_res:.2f}, strongSup:{bn_ssup:.2f}, strongRes:{bn_sres:.2f},
@@ -3947,7 +3949,7 @@ const INSTRUMENT_DATA = {{
     expiry:"{bn_expiry}", strikes:{bn_strikes_json}, allExpiry:{bn_all_expiry_json}
   }},
   FINNIFTY: {{
-    name:"FinNifty", lotSize:{lot_size_fn},
+    name:"FinNifty", lotSize:{lot_size_fn}, strikeStep:50,
     spot:{fn_spot_js}, atm:{fn_atm_js}, pcr:{fn_pcr:.3f},
     maxPain:{fn_maxpain}, maxCeStrike:{fn_max_ce}, maxPeStrike:{fn_max_pe},
     support:{fn_sup:.2f}, resistance:{fn_res:.2f}, strongSup:{fn_ssup:.2f}, strongRes:{fn_sres:.2f},
@@ -4100,7 +4102,7 @@ function switchInstrument(sym) {{
   OC.strongSup=d.strongSup; OC.strongRes=d.strongRes;
   OC.bias=d.bias; OC.biasConf=d.biasConf;
   OC.bullScore=d.bullScore; OC.bearScore=d.bearScore;
-  OC.lotSize=d.lotSize; OC.strikes=d.strikes; OC.expiry=d.expiry;
+  OC.lotSize=d.lotSize; OC.strikeStep=d.strikeStep; OC.strikes=d.strikes; OC.expiry=d.expiry;
   Object.keys(STRIKE_MAP).forEach(k=>delete STRIKE_MAP[k]);
   OC.strikes.forEach(s=>{{ STRIKE_MAP[s.strike]=s; }});
   Object.keys(ALL_EXPIRY_DATA).forEach(k=>delete ALL_EXPIRY_DATA[k]);
