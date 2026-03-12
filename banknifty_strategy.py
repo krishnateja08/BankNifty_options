@@ -2401,25 +2401,25 @@ function buildIntradaySim(m) {{
         pnl = ((pe_atm||150) - peIntr(atm)) * lotSz; break;
 
       // ── Bull / Bear spreads ──
+      // bull_call_spread: BUY ATM CE + SELL OTM CE
       case 'bull_call_spread': {{
-        const sp2 = co1.ltp||80, bp2 = ce_atm||150;
-        const nc2 = bp2 - sp2;
-        pnl = (ceIntr(atm) - ceIntr(co1.strike) - nc2) * lotSz; break;
+        const debit = (ce_atm||150) - (co1.ltp||80);
+        pnl = (ceIntr(atm) - ceIntr(co1.strike) - debit) * lotSz; break;
       }}
+      // bear_call_spread: SELL ATM CE + BUY OTM CE
       case 'bear_call_spread': {{
-        const sp2 = ce_atm||150, bp2 = co1.ltp||80;
-        const cr  = sp2 - bp2;
-        pnl = (cr - ceIntr(atm) + ceIntr(co1.strike)) * lotSz; break;
+        const credit = (ce_atm||150) - (co1.ltp||80);
+        pnl = (credit - ceIntr(atm) + ceIntr(co1.strike)) * lotSz; break;
       }}
+      // bull_put_spread: SELL ATM PE + BUY OTM PE
       case 'bull_put_spread': {{
-        const sp2 = pe_atm||150, bp2 = po1.ltp||80;
-        const cr  = sp2 - bp2;
-        pnl = (cr - peIntr(atm) + peIntr(po1.strike)) * lotSz; break;
+        const credit = (pe_atm||150) - (po1.ltp||80);
+        pnl = (credit - peIntr(atm) + peIntr(po1.strike)) * lotSz; break;
       }}
+      // bear_put_spread: BUY ATM PE + SELL OTM PE
       case 'bear_put_spread': {{
-        const bp2 = pe_atm||150, sp2 = po1.ltp||80;
-        const nc2 = bp2 - sp2;
-        pnl = (peIntr(atm) - peIntr(po1.strike) - nc2) * lotSz; break;
+        const debit = (pe_atm||150) - (po1.ltp||80);
+        pnl = (peIntr(atm) - peIntr(po1.strike) - debit) * lotSz; break;
       }}
 
       // ── Straddle / Strangle ──
@@ -2440,39 +2440,159 @@ function buildIntradaySim(m) {{
         pnl = (tp - ceIntr(co1.strike) - peIntr(po1.strike)) * lotSz; break;
       }}
 
-      // ── Iron Condor / Fly ──
-      case 'short_iron_condor': {{
-        const cr2 = (ce_atm||150)+(pe_atm||150)-(co1.ltp||80)-(po1.ltp||80);
-        pnl = (cr2 - Math.max(0,ceIntr(atm)-ceIntr(co1.strike)) - Math.max(0,peIntr(atm)-peIntr(po1.strike))) * lotSz; break;
-      }}
-      case 'long_iron_condor': {{
-        const db = (co1.ltp||80)+(po1.ltp||80)-(ce_atm||150)-(pe_atm||150);
-        pnl = (-db + Math.max(0,ceIntr(atm)-ceIntr(co1.strike)) + Math.max(0,peIntr(atm)-peIntr(po1.strike))) * lotSz; break;
-      }}
+      // ── Short Iron Fly: SELL ATM CE + SELL ATM PE + BUY OTM CE + BUY OTM PE ──
       case 'short_iron_fly': {{
-        const cr2 = (ce_atm||150)+(pe_atm||150)-(co1.ltp||80)-(po1.ltp||80);
-        pnl = (cr2 - ceIntr(atm) - peIntr(atm) + ceIntr(co1.strike) + peIntr(po1.strike)) * lotSz; break;
+        const credit = (ce_atm||150) + (pe_atm||150) - (co1.ltp||80) - (po1.ltp||80);
+        pnl = (credit - ceIntr(atm) - peIntr(atm) + ceIntr(co1.strike) + peIntr(po1.strike)) * lotSz; break;
       }}
+      // ── Long Iron Fly: BUY ATM CE + BUY ATM PE + SELL OTM CE + SELL OTM PE ──
       case 'long_iron_fly': {{
-        const db = (co1.ltp||80)+(po1.ltp||80)-(ce_atm||150)-(pe_atm||150);
-        pnl = (-db + ceIntr(atm) + peIntr(atm) - ceIntr(co1.strike) - peIntr(po1.strike)) * lotSz; break;
+        const debit = (ce_atm||150) + (pe_atm||150) - (co1.ltp||80) - (po1.ltp||80);
+        pnl = (-debit + ceIntr(atm) + peIntr(atm) - ceIntr(co1.strike) - peIntr(po1.strike)) * lotSz; break;
+      }}
+      // ── Short Iron Condor: SELL co1 CE + BUY co2 CE + SELL po1 PE + BUY po2 PE ──
+      case 'short_iron_condor': {{
+        const sc = co1.ltp||100, bc = co2.ltp||50, sp2 = po1.ltp||100, bp2 = po2.ltp||50;
+        const credit = sc - bc + sp2 - bp2;
+        const callLoss = Math.max(0, ceIntr(co1.strike) - ceIntr(co2.strike));
+        const putLoss  = Math.max(0, peIntr(po1.strike) - peIntr(po2.strike));
+        pnl = (credit - callLoss - putLoss) * lotSz; break;
+      }}
+      // ── Long Iron Condor: BUY co1 CE + SELL co2 CE + BUY po1 PE + SELL po2 PE ──
+      case 'long_iron_condor': {{
+        const sc = co1.ltp||100, bc = co2.ltp||50, sp2 = po1.ltp||100, bp2 = po2.ltp||50;
+        const debit = bc - sc + bp2 - sp2;
+        const callProfit = Math.max(0, ceIntr(co1.strike) - ceIntr(co2.strike));
+        const putProfit  = Math.max(0, peIntr(po1.strike) - peIntr(po2.strike));
+        pnl = (-debit + callProfit + putProfit) * lotSz; break;
       }}
 
-      // ── Butterfly ──
-      case 'call_butterfly': {{
-        const tc = (ce_atm||150) + (co2.ltp||40) - 2*(co1.ltp||80);
-        pnl = (ceIntr(atm) + ceIntr(co2.strike) - 2*ceIntr(co1.strike) - tc) * lotSz; break;
+      // ── Butterfly: BUY low + SELL 2x mid + BUY high ──
+      case 'call_butterfly':
+      case 'bull_butterfly': {{
+        const debit = (ce_atm||150) - 2*(co1.ltp||80) + (co2.ltp||40);
+        pnl = (ceIntr(atm) - 2*ceIntr(co1.strike) + ceIntr(co2.strike) - debit) * lotSz; break;
       }}
-      case 'put_butterfly': {{
-        const tp = (pe_atm||150) + (po2.ltp||40) - 2*(po1.ltp||80);
-        pnl = (peIntr(atm) + peIntr(po2.strike) - 2*peIntr(po1.strike) - tp) * lotSz; break;
+      case 'put_butterfly':
+      case 'bear_butterfly': {{
+        const debit = (pe_atm||150) - 2*(po1.ltp||80) + (po2.ltp||40);
+        pnl = (peIntr(atm) - 2*peIntr(po1.strike) + peIntr(po2.strike) - debit) * lotSz; break;
       }}
 
-      // ── Covered / Calendar / Synthetic — fall back to delta approx ──
+      // ── Ratio Back Spreads: SELL 1x ATM + BUY 2x OTM ──
+      // Unlimited profit if big move, small loss/profit if near ATM
+      case 'call_ratio_back': {{
+        const sp2 = ce_atm||150, bp2 = co1.ltp||80;
+        const nc2 = 2*bp2 - sp2; // net credit(+) or debit(-)
+        pnl = (nc2 - ceIntr(atm) + 2*ceIntr(co1.strike)) * lotSz; break;
+      }}
+      case 'put_ratio_back': {{
+        const sp2 = pe_atm||150, bp2 = po1.ltp||80;
+        const nc2 = 2*bp2 - sp2;
+        pnl = (nc2 - peIntr(atm) + 2*peIntr(po1.strike)) * lotSz; break;
+      }}
+
+      // ── Ratio Spreads: BUY 1x ATM + SELL 2x OTM ──
+      // Max profit at OTM strike, unlimited loss beyond
+      case 'call_ratio_spread': {{
+        const bp2 = ce_atm||150, sp2 = co1.ltp||80;
+        const nc2 = 2*sp2 - bp2;
+        pnl = (nc2 + ceIntr(atm) - 2*ceIntr(co1.strike)) * lotSz; break;
+      }}
+      case 'put_ratio_spread': {{
+        const bp2 = pe_atm||150, sp2 = po1.ltp||80;
+        const nc2 = 2*sp2 - bp2;
+        pnl = (nc2 + peIntr(atm) - 2*peIntr(po1.strike)) * lotSz; break;
+      }}
+
+      // ── Jade Lizard: SELL OTM PE + SELL OTM CE + BUY further OTM CE ──
+      case 'jade_lizard': {{
+        const pp = po1.ltp||100, cs = co1.ltp||80, cb = co2.ltp||40;
+        const credit = pp + cs - cb;
+        pnl = (credit - peIntr(po1.strike) - ceIntr(co1.strike) + ceIntr(co2.strike)) * lotSz; break;
+      }}
+      // ── Reverse Jade: SELL OTM CE + SELL OTM PE + BUY further OTM PE ──
+      case 'reverse_jade': {{
+        const cp2 = co1.ltp||100, ps = po1.ltp||80, pb = po2.ltp||40;
+        const credit = cp2 + ps - pb;
+        pnl = (credit - ceIntr(co1.strike) - peIntr(po1.strike) + peIntr(po2.strike)) * lotSz; break;
+      }}
+
+      // ── Bull Condor: BUY ATM CE + SELL co1 + SELL co2 + BUY co3 ──
+      case 'bull_condor': {{
+        const s1 = ce_atm||150, s2 = co1.ltp||100, s3 = co2.ltp||60, s4 = co3.ltp||30;
+        const debit = s1 - s2 - s3 + s4;
+        pnl = (ceIntr(atm) - ceIntr(co1.strike) - ceIntr(co2.strike) + ceIntr(co3.strike) - debit) * lotSz; break;
+      }}
+      // ── Bear Condor: BUY ATM PE + SELL po1 + SELL po2 + BUY po3 ──
+      case 'bear_condor': {{
+        const s1 = pe_atm||150, s2 = po1.ltp||100, s3 = po2.ltp||60, s4 = po3.ltp||30;
+        const debit = s1 - s2 - s3 + s4;
+        pnl = (peIntr(atm) - peIntr(po1.strike) - peIntr(po2.strike) + peIntr(po3.strike) - debit) * lotSz; break;
+      }}
+
+      // ── Batman: 2x (BUY ATM + SELL 2x OTM + BUY far OTM) call butterfly ──
+      case 'batman': {{
+        const s1 = ce_atm||150, s2 = co1.ltp||80, s3 = co2.ltp||40;
+        const unitDebit = s1 - 2*s2 + s3;
+        const unitPnl   = ceIntr(atm) - 2*ceIntr(co1.strike) + ceIntr(co2.strike) - unitDebit;
+        pnl = 2 * unitPnl * lotSz; break;
+      }}
+
+      // ── Double Fly: call butterfly + put butterfly ──
+      case 'double_fly': {{
+        const cDebit = (ce_atm||150) - 2*(co1.ltp||80) + (co2.ltp||40);
+        const pDebit = (pe_atm||150) - 2*(po1.ltp||80) + (po2.ltp||40);
+        const cPnl   = ceIntr(atm) - 2*ceIntr(co1.strike) + ceIntr(co2.strike) - cDebit;
+        const pPnl   = peIntr(atm) - 2*peIntr(po1.strike) + peIntr(po2.strike) - pDebit;
+        pnl = (cPnl + pPnl) * lotSz; break;
+      }}
+
+      // ── Double Condor: call 4-leg condor + put 4-leg condor ──
+      case 'double_condor': {{
+        const cDebit = (ce_atm||150) - (co1.ltp||100) - (co2.ltp||60) + (co3.ltp||30);
+        const pDebit = (pe_atm||150) - (po1.ltp||100) - (po2.ltp||60) + (po3.ltp||30);
+        const cPnl   = ceIntr(atm) - ceIntr(co1.strike) - ceIntr(co2.strike) + ceIntr(co3.strike) - cDebit;
+        const pPnl   = peIntr(atm) - peIntr(po1.strike) - peIntr(po2.strike) + peIntr(po3.strike) - pDebit;
+        pnl = (cPnl + pPnl) * lotSz; break;
+      }}
+
+      // ── Synthetics / Risk Reversal / Range Forward — unlimited P&L, delta approx is appropriate ──
+      case 'long_synthetic': {{
+        const nc2 = (ce_atm||150) - (pe_atm||150);
+        pnl = (-nc2 + ceIntr(atm) - peIntr(atm)) * lotSz; break;
+      }}
+      case 'short_synthetic': {{
+        const nc2 = (ce_atm||150) - (pe_atm||150);
+        pnl = (nc2 - ceIntr(atm) + peIntr(atm)) * lotSz; break;
+      }}
+      case 'risk_reversal': {{
+        // BUY OTM PE + SELL OTM CE
+        const nc2 = (po1.ltp||100) - (co1.ltp||100);
+        pnl = (-nc2 + peIntr(po1.strike) - ceIntr(co1.strike)) * lotSz; break;
+      }}
+      case 'range_forward': {{
+        // BUY OTM CE + SELL OTM PE
+        const nc2 = (co1.ltp||100) - (po1.ltp||100);
+        pnl = (-nc2 + ceIntr(co1.strike) - peIntr(po1.strike)) * lotSz; break;
+      }}
+
+      // ── Calendar / Diagonal — multi-expiry, use conservative delta approx ──
+      case 'call_calendar':
+      case 'put_calendar':
+      case 'diagonal_calendar': {{
+        pnl = nd * movePts + nt;
+        if (maxL !== null) pnl = Math.max(-maxL, pnl);
+        if (maxP !== null) pnl = Math.min(maxP,  pnl);
+        pnl = Math.round(pnl);
+        return pnl;
+      }}
+
+      // ── Everything else — delta approx ──
       default: {{
         pnl = nd * movePts + nt;
-        if (maxL !== null && maxL < 999999) pnl = Math.max(-maxL, pnl);
-        if (maxP !== null && maxP < 999999) pnl = Math.min(maxP,   pnl);
+        if (maxL !== null) pnl = Math.max(-maxL, pnl);
+        if (maxP !== null) pnl = Math.min(maxP,  pnl);
         pnl = Math.round(pnl);
         return pnl;
       }}
