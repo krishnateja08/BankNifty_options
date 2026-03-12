@@ -39,7 +39,7 @@ jobs:
           echo "=== Output files ==="
           ls -lh docs/
           echo "=== HTML preview (first 5 lines) ==="
-          head -5 docs/banknifty.html
+          head -5 docs/index.html
       - name: Setup GitHub Pages
         uses: actions/configure-pages@v4
       - name: Upload Pages artifact
