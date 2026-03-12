@@ -3378,6 +3378,7 @@ def generate_html(tech, oc, md, ts, vix_data=None, multi_expiry_analyzed=None, e
     greeks_sidebar = build_greeks_sidebar_html(oc)
     greeks_script  = build_greeks_script_html(oc)
     greeks_table   = build_greeks_table_html(oc)
+    # Note: fn_greeks_script_str is built later alongside other FN panel strings
 
     C = 2 * 3.14159 * 7
     cp    = tech["price"] if tech else 0
@@ -3470,6 +3471,28 @@ def generate_html(tech, oc, md, ts, vix_data=None, multi_expiry_analyzed=None, e
             }
     fn_all_expiry_json = json.dumps(_fn_all_exp)
     default_instrument = instrument
+
+    # ── Pre-render BN and FN HTML panels for instrument switching ──
+    def _esc(s):
+        """Escape backticks and ${ so the string is safe inside JS template literals."""
+        return s.replace('\\', '\\\\').replace('`', '\\`').replace('${', '\\${')
+
+    bn_oi_html_str      = _esc(build_oi_html(oc))               if oc    else ""
+    bn_kl_html_str      = _esc(build_key_levels_html(tech, oc)) if tech  else ""
+    bn_greeks_panel_str = _esc(build_greeks_sidebar_html(oc))
+    bn_greeks_table_str = _esc(build_greeks_table_html(oc))
+    bn_strikes_html_str = _esc(build_strikes_html(oc))
+
+    _unavail_oi     = "<div style='padding:20px;color:rgba(255,255,255,.5);'>FinNifty OI data unavailable.</div>"
+    _unavail_kl     = "<div style='padding:20px;color:rgba(255,255,255,.5);'>FinNifty Key Levels unavailable.</div>"
+    _unavail_greeks = "<div style='padding:14px 12px;font-size:15.9px;color:rgba(255,255,255,.68);text-align:center;'>FinNifty Greeks unavailable.</div>"
+
+    fn_oi_html_str      = _esc(build_oi_html(fn_oc))                  if fn_oc    else _esc(_unavail_oi)
+    fn_kl_html_str      = _esc(build_key_levels_html(fn_tech, fn_oc)) if fn_tech  else _esc(_unavail_kl)
+    fn_greeks_panel_str = _esc(build_greeks_sidebar_html(fn_oc))      if fn_oc    else _esc(_unavail_greeks)
+    fn_greeks_table_str = _esc(build_greeks_table_html(fn_oc))        if fn_oc    else ""
+    fn_strikes_html_str = _esc(build_strikes_html(fn_oc))             if fn_oc    else ""
+    fn_greeks_script_str = build_greeks_script_html(fn_oc)            if fn_oc    else ""
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -3635,6 +3658,22 @@ document.addEventListener("click",function(e){{
 
 
 <script>
+const INSTRUMENT_PANELS = {{
+  BANKNIFTY: {{
+    oi:           `{bn_oi_html_str}`,
+    kl:           `{bn_kl_html_str}`,
+    greeksPanel:  `{bn_greeks_panel_str}`,
+    greeksTable:  `{bn_greeks_table_str}`,
+    strikes:      `{bn_strikes_html_str}`,
+  }},
+  FINNIFTY: {{
+    oi:           `{fn_oi_html_str}`,
+    kl:           `{fn_kl_html_str}`,
+    greeksPanel:  `{fn_greeks_panel_str}`,
+    greeksTable:  `{fn_greeks_table_str}`,
+    strikes:      `{fn_strikes_html_str}`,
+  }}
+}};
 const INSTRUMENT_DATA = {{
   BANKNIFTY: {{
     name:"BankNifty", lotSize:{lot_size_bn},
@@ -3664,6 +3703,30 @@ function switchInstrument(sym) {{
     return;
   }}
   _activeInstrument = sym;
+
+  // ── Swap HTML panels (fixes OI, KeyLevels, Greeks, Strikes) ──
+  const panels = INSTRUMENT_PANELS[sym];
+  if (panels) {{
+    const oiEl = document.getElementById('oi');
+    if (oiEl && panels.oi) oiEl.innerHTML = panels.oi;
+    const klEl = document.getElementById('kl');
+    if (klEl && panels.kl) klEl.innerHTML = panels.kl;
+    const gpEl = document.getElementById('greeksPanel');
+    if (gpEl && panels.greeksPanel) gpEl.innerHTML = panels.greeksPanel;
+    const gtEl = document.getElementById('greeksTable');
+    if (gtEl) gtEl.outerHTML = panels.greeksTable || '';
+    const skEl = document.getElementById('strikes');
+    if (skEl && panels.strikes) skEl.innerHTML = panels.strikes;
+  }}
+  // Reinitialise the greeks strike selector with new instrument data
+  if (sym === 'FINNIFTY' && typeof _fnGreeksUpdate === 'function') {{
+    var sel = document.getElementById('greeksStrikeSelect');
+    if (sel) _fnGreeksUpdate(sel.value);
+  }} else if (sym === 'BANKNIFTY' && typeof greeksUpdateStrike === 'function') {{
+    var sel = document.getElementById('greeksStrikeSelect');
+    if (sel) greeksUpdateStrike(sel.value);
+  }}
+
   const sBN = document.getElementById('stratBN');
   const sFN = document.getElementById('stratFN');
   if (sBN) sBN.style.display = sym==='BANKNIFTY' ? '' : 'none';
@@ -3705,6 +3768,7 @@ function switchInstrument(sym) {{
 }}
 </script>
 {greeks_script}
+{fn_greeks_script_str.replace('window.greeksUpdateStrike', 'window._fnGreeksUpdate') if fn_greeks_script_str else ""}
 {ANIMATED_JS}
 </body>
 </html>"""
