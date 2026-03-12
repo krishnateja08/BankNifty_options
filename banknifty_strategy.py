@@ -3172,7 +3172,7 @@ ANIMATED_JS = """
     if (_refreshing) return;
     _refreshing = true;
     showSpinner(true);
-    iframe.src = 'banknifty.html?_=' + Date.now();
+    iframe.src = 'index.html?_=' + Date.now();
   }
 
   iframe.addEventListener('load', function() {
@@ -3596,7 +3596,7 @@ def main():
                      expiry_list=expiry_list)
 
     os.makedirs("docs", exist_ok=True)
-    out = os.path.join("docs", "banknifty.html")
+    out = os.path.join("docs", "index.html")
     with open(out, "w", encoding="utf-8") as f:
         f.write(html)
     print(f"  Saved: {out}  ({len(html)/1024:.1f} KB)")
