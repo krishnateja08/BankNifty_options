@@ -1068,7 +1068,7 @@ def build_greeks_table_html(oc_analysis):
 #  SECTION 5B -- HERO
 # =================================================================
 
-def build_dual_gauge_hero(oc, tech, md, ts):
+def build_dual_gauge_hero(oc, tech, md, ts, instrument="BANKNIFTY"):
     if oc:
         chg_bull = oc["chg_bull_force"]; chg_bear = oc["chg_bear_force"]
         bull_pct = oc["chg_bull_pct"]; bear_pct = oc["chg_bear_pct"]; pcr = oc["pcr_oi"]
@@ -3367,7 +3367,7 @@ def generate_html(tech, oc, md, ts, vix_data=None, multi_expiry_analyzed=None, e
     strat_html     = build_strategies_html(oc, tech, md, multi_expiry_analyzed=multi_expiry_analyzed, expiry_list=expiry_list, lot_size=lot_size)
     strikes_html   = build_strikes_html(oc)
     ticker_html    = build_ticker_bar(tech, oc, vix_data)
-    gauge_html     = build_dual_gauge_hero(oc, tech, md, ts)
+    gauge_html     = build_dual_gauge_hero(oc, tech, md, ts, instrument=instrument)
     greeks_sidebar = build_greeks_sidebar_html(oc)
     greeks_script  = build_greeks_script_html(oc)
     greeks_table   = build_greeks_table_html(oc)
