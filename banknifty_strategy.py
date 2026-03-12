@@ -2798,15 +2798,15 @@ body::before{content:'';position:fixed;inset:0;
 header{display:flex;align-items:center;justify-content:space-between;padding:14px 32px;
   background:rgba(6,8,15,.85);backdrop-filter:blur(16px);
   border-bottom:1px solid rgba(255,255,255,.07);position:sticky;top:0;z-index:200;
-  box-shadow:0 1px 0 rgba(0,200,150,.1)}
-.logo-wrap{position:relative;height:42px;overflow:hidden;min-width:400px;}
+  box-shadow:0 1px 0 rgba(0,200,150,.1);gap:20px;overflow:hidden;}
+.logo-wrap{position:relative;height:42px;overflow:hidden;min-width:140px;max-width:200px;flex-shrink:0;}
 .logo-slide{position:absolute;top:0;left:0;width:100%;font-family:var(--fh);font-size:29px;font-weight:700;
   background:linear-gradient(90deg,#00c896,#6480ff);-webkit-background-clip:text;-webkit-text-fill-color:transparent;
   filter:drop-shadow(0 0 12px rgba(0,200,150,.3));opacity:0;transform:translateY(20px);
   transition:opacity .5s ease, transform .5s ease;white-space:nowrap;}
 .logo-slide.active{opacity:1;transform:translateY(0);}
 .logo-slide.exit{opacity:0;transform:translateY(-20px);}
-.hdr-meta{display:flex;align-items:center;gap:14px;font-size:15.9px;color:var(--muted);font-family:var(--fm)}
+.hdr-meta{display:flex;align-items:center;gap:14px;font-size:15.9px;color:var(--muted);font-family:var(--fm);flex-shrink:0;}
 .live-dot{width:7px;height:7px;border-radius:50%;background:#00c896;box-shadow:0 0 10px #00c896;animation:pulse 2s infinite}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.2}}
 .refresh-countdown{display:flex;align-items:center;gap:8px;background:rgba(0,200,150,.07);
@@ -2974,7 +2974,13 @@ footer{padding:16px 32px;border-top:1px solid rgba(255,255,255,.06);background:r
 .greeks-tbl-strike{font-family:'DM Mono',monospace;font-size:17.4px;font-weight:700;color:rgba(255,255,255,.8);}
 .greeks-tbl-cell{font-family:'DM Mono',monospace;font-size:15.9px;font-weight:600;text-align:center;color:rgba(255,255,255,.65);}
 /* ── Instrument Switcher ─────────────────── */
-.instrument-switcher{display:flex;align-items:center;gap:6px;flex-shrink:0;}
+.hdr-right{display:flex;align-items:center;gap:14px;margin-left:auto;flex-shrink:0;}
+.instrument-switcher{display:flex;align-items:center;gap:8px;flex-shrink:0;}
+.hdr-sep{color:rgba(255,255,255,.15);flex-shrink:0;}
+.hdr-label{color:rgba(255,255,255,.75);font-size:15.9px;font-family:var(--fm);}
+.hdr-ts{color:rgba(255,255,255,.75);font-size:15.9px;font-family:var(--fm);}
+@media(max-width:1100px){.hdr-ts,.hdr-sep{display:none;}}
+@media(max-width:800px){.hdr-label{display:none;}}
 .inst-btn{padding:5px 14px;border-radius:20px;border:1px solid;cursor:pointer;
   font-family:var(--fh);font-size:14.5px;font-weight:700;transition:all .2s;background:transparent;
   letter-spacing:.5px;white-space:nowrap;}
@@ -3511,19 +3517,20 @@ def generate_html(tech, oc, md, ts, vix_data=None, multi_expiry_analyzed=None, e
 <div class="app">
 <header>
   <div class="logo-wrap" id="logoWrap"></div>
-  <div class="hdr-meta">
-    <div class="live-dot"></div>
-    <span>NSE <span id="hdrInstrumentName">{instrument}</span> Options Dashboard</span>
-    <span style="color:rgba(255,255,255,.15);">|</span>
+  <div class="hdr-right">
     <div class="instrument-switcher">
       <button class="inst-btn" id="instBtnBN" onclick="switchInstrument('BANKNIFTY')" style="border-color:rgba(0,200,150,.6);color:#00c896;background:rgba(0,200,150,.14);">&#9670; BankNifty</button>
       <button class="inst-btn" id="instBtnFN" onclick="switchInstrument('FINNIFTY')" style="border-color:rgba(255,255,255,.15);color:rgba(255,255,255,.5);">&#9671; FinNifty</button>
     </div>
-    <span style="color:rgba(255,255,255,.15);">|</span>
-    <span style="color:rgba(255,255,255,.75);">Last report generated:&nbsp;<span style="color:#00c896;font-weight:600;">{ts}</span></span>
-    <span style="color:rgba(255,255,255,.15);">|</span>
+    <span class="hdr-sep">|</span>
+    <div class="hdr-meta">
+    <div class="live-dot"></div>
+    <span class="hdr-label">NSE <span id="hdrInstrumentName">{instrument}</span></span>
+    <span class="hdr-sep">|</span>
+    <span class="hdr-ts">Updated:&nbsp;<span style="color:#00c896;font-weight:600;">{ts}</span></span>
+    <span class="hdr-sep">|</span>
     <span style="color:rgba(255,255,255,.75);">IST&nbsp;<span id="liveClock" style="font-family:'DM Mono',monospace;color:#ffd166;font-weight:700;letter-spacing:1px;">--:--:--</span></span>
-    <span style="color:rgba(255,255,255,.15);">|</span>
+    <span class="hdr-sep">|</span>
     <div class="refresh-countdown">
       <div class="countdown-arc-wrap">
         <svg width="18" height="18" viewBox="0 0 18 18">
