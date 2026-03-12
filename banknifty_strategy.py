@@ -2292,7 +2292,7 @@ function calcMetrics(shape, smartPop) {{
            netDelta:Math.round(netDelta*100)/100,
            netTheta:Math.round(netTheta*100)/100,
            netVega:Math.round(netVega*100)/100,
-           mlRawVal:ml}};
+           mlRawVal:ml, shape:shape}};
 }}
 
 function renderMetrics(m, scoreBreakdown) {{
@@ -2363,22 +2363,126 @@ function renderMetrics(m, scoreBreakdown) {{
 
 // ── Intraday P&L Simulator ───────────────────────────────────────────────────
 function buildIntradaySim(m) {{
-  const lotSz   = OC.lotSize;
-  const maxL    = m.mlRawVal === 999999 ? null : m.mlRawVal;
-  const maxP    = m.mpRaw    === 999999 ? null : m.mpRaw;
-  const nd      = m.netDelta;   // ₹ per 1 point BankNifty move
-  const nt      = m.netTheta;   // ₹ per day (negative = decay cost)
-  const nv      = m.netVega;    // ₹ per 1% IV change
+  const nd      = m.netDelta;
+  const nt      = m.netTheta;
+  const nv      = m.netVega;
+
+  // Declare ALL strategy context BEFORE calcPnl (avoids JS TDZ errors)
+  const shape  = m.shape || '';
+  const spot   = OC.spot;
+  const atm    = OC.atm;
+  const ce_atm = getATMLTP('ce');
+  const pe_atm = getATMLTP('pe');
+  const co1    = getOTM('ce',1), co2 = getOTM('ce',2);
+  const po1    = getOTM('pe',1), po2 = getOTM('pe',2);
+  const maxP   = (m.mpRaw    !== undefined && m.mpRaw    < 9000000) ? m.mpRaw    : null;
+  const maxL   = (m.mlRawVal !== undefined && m.mlRawVal < 9000000) ? m.mlRawVal : null;
 
   const moves = [-300,-200,-150,-100,-50,0,50,100,150,200,300];
 
   function calcPnl(movePts) {{
-    let pnl = nd * movePts + nt;
-    if (maxL !== null) pnl = Math.max(-maxL, pnl);
-    if (maxP !== null) pnl = Math.min(maxP * 0.9, pnl);
+    const newSpot = spot + movePts;
+    const lotSz   = OC.lotSize || 30;
+    let pnl = 0;
+
+    // Helper: intrinsic value of option at newSpot
+    const ceIntr = (k) => Math.max(0, newSpot - k);
+    const peIntr = (k) => Math.max(0, k - newSpot);
+
+    switch(shape) {{
+      // ── Single legs ──
+      case 'long_call':
+        pnl = (ceIntr(atm) - (ce_atm||150)) * lotSz; break;
+      case 'short_call':
+        pnl = ((ce_atm||150) - ceIntr(atm)) * lotSz; break;
+      case 'long_put':
+        pnl = (peIntr(atm) - (pe_atm||150)) * lotSz; break;
+      case 'short_put':
+        pnl = ((pe_atm||150) - peIntr(atm)) * lotSz; break;
+
+      // ── Bull / Bear spreads ──
+      case 'bull_call_spread': {{
+        const sp2 = co1.ltp||80, bp2 = ce_atm||150;
+        const nc2 = bp2 - sp2;
+        pnl = (ceIntr(atm) - ceIntr(co1.strike) - nc2) * lotSz; break;
+      }}
+      case 'bear_call_spread': {{
+        const sp2 = ce_atm||150, bp2 = co1.ltp||80;
+        const cr  = sp2 - bp2;
+        pnl = (cr - ceIntr(atm) + ceIntr(co1.strike)) * lotSz; break;
+      }}
+      case 'bull_put_spread': {{
+        const sp2 = pe_atm||150, bp2 = po1.ltp||80;
+        const cr  = sp2 - bp2;
+        pnl = (cr - peIntr(atm) + peIntr(po1.strike)) * lotSz; break;
+      }}
+      case 'bear_put_spread': {{
+        const bp2 = pe_atm||150, sp2 = po1.ltp||80;
+        const nc2 = bp2 - sp2;
+        pnl = (peIntr(atm) - peIntr(po1.strike) - nc2) * lotSz; break;
+      }}
+
+      // ── Straddle / Strangle ──
+      case 'long_straddle': {{
+        const tp = (ce_atm||150) + (pe_atm||150);
+        pnl = (ceIntr(atm) + peIntr(atm) - tp) * lotSz; break;
+      }}
+      case 'short_straddle': {{
+        const tp = (ce_atm||150) + (pe_atm||150);
+        pnl = (tp - ceIntr(atm) - peIntr(atm)) * lotSz; break;
+      }}
+      case 'long_strangle': {{
+        const tp = (co1.ltp||100) + (po1.ltp||100);
+        pnl = (ceIntr(co1.strike) + peIntr(po1.strike) - tp) * lotSz; break;
+      }}
+      case 'short_strangle': {{
+        const tp = (co1.ltp||100) + (po1.ltp||100);
+        pnl = (tp - ceIntr(co1.strike) - peIntr(po1.strike)) * lotSz; break;
+      }}
+
+      // ── Iron Condor / Fly ──
+      case 'short_iron_condor': {{
+        const cr2 = (ce_atm||150)+(pe_atm||150)-(co1.ltp||80)-(po1.ltp||80);
+        pnl = (cr2 - Math.max(0,ceIntr(atm)-ceIntr(co1.strike)) - Math.max(0,peIntr(atm)-peIntr(po1.strike))) * lotSz; break;
+      }}
+      case 'long_iron_condor': {{
+        const db = (co1.ltp||80)+(po1.ltp||80)-(ce_atm||150)-(pe_atm||150);
+        pnl = (-db + Math.max(0,ceIntr(atm)-ceIntr(co1.strike)) + Math.max(0,peIntr(atm)-peIntr(po1.strike))) * lotSz; break;
+      }}
+      case 'short_iron_fly': {{
+        const cr2 = (ce_atm||150)+(pe_atm||150)-(co1.ltp||80)-(po1.ltp||80);
+        pnl = (cr2 - ceIntr(atm) - peIntr(atm) + ceIntr(co1.strike) + peIntr(po1.strike)) * lotSz; break;
+      }}
+      case 'long_iron_fly': {{
+        const db = (co1.ltp||80)+(po1.ltp||80)-(ce_atm||150)-(pe_atm||150);
+        pnl = (-db + ceIntr(atm) + peIntr(atm) - ceIntr(co1.strike) - peIntr(po1.strike)) * lotSz; break;
+      }}
+
+      // ── Butterfly ──
+      case 'call_butterfly': {{
+        const tc = (ce_atm||150) + (co2.ltp||40) - 2*(co1.ltp||80);
+        pnl = (ceIntr(atm) + ceIntr(co2.strike) - 2*ceIntr(co1.strike) - tc) * lotSz; break;
+      }}
+      case 'put_butterfly': {{
+        const tp = (pe_atm||150) + (po2.ltp||40) - 2*(po1.ltp||80);
+        pnl = (peIntr(atm) + peIntr(po2.strike) - 2*peIntr(po1.strike) - tp) * lotSz; break;
+      }}
+
+      // ── Covered / Calendar / Synthetic — fall back to delta approx ──
+      default: {{
+        pnl = nd * movePts + nt;
+        if (maxL !== null && maxL < 999999) pnl = Math.max(-maxL, pnl);
+        if (maxP !== null && maxP < 999999) pnl = Math.min(maxP,   pnl);
+        pnl = Math.round(pnl);
+        return pnl;
+      }}
+    }}
+
+    // Hard-clamp to known max profit / max loss
+    if (maxL !== null && maxL < 999999) pnl = Math.max(-maxL, pnl);
+    if (maxP !== null && maxP < 999999) pnl = Math.min(maxP,  pnl);
     return Math.round(pnl);
   }}
-
   const flatPnl  = calcPnl(0);
   const flatCol  = flatPnl >= 0 ? '#38d888' : '#f04050';
   const ntCol    = nt >= 0 ? '#38d888' : '#f04050';
