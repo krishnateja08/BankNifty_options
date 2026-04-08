@@ -1,4506 +1,8132 @@
-#!/usr/bin/env python3
 """
-BankNifty Options Strategy Dashboard — GitHub Pages Generator
-Aurora Borealis Theme · v19.1 · Smart Dynamic PoP Engine + Intraday P&L Simulator
-- PoP now reflects: Market Bias + Support/Resistance + Max CE/PE OI walls + PCR
-- lotSize fixed to 30 (BankNifty lot size)
-- BankNifty expiry: LAST TUESDAY OF THE MONTH (monthly, not weekly)
-- Strategies ranked by smart PoP — highest PoP = best trade right now
-- FIXED v18.1: All strategy legs now show actual strike prices (3-4 leg strategies)
-- FIXED v18.2: Gauges now show OI CHANGE data (chg_bull_force / chg_bear_force)
-- FIXED v18.3: Silent background auto-refresh — no flicker, no layout shift
-               Works on both file:// and http:// protocols using hidden iframe trick
-- FIXED v18.4: Holiday-aware expiry — if last Tuesday is NSE holiday, expiry moves
-               to previous trading day (Monday, then Friday if Monday also holiday)
-- NEW v18.5: Intraday P&L Simulator — per-strategy Today P&L (Delta+Theta+Vega)
-             3-tab panel: Scenarios Table · Greeks Breakdown · Live Slider
+BANKNIFTY COMPLETE ANALYSIS - DEEP OCEAN THEME
+CARD STYLE: Glassmorphism Frosted — Stat Card + Progress Bar (Layout 4)
+CHANGE IN OPEN INTEREST: Navy Command Theme (v3)
+FII/DII SECTION: Theme 3 · Pulse Flow
+MARKET DIRECTION: Holographic Glass Widget (Compact)
+KEY LEVELS: 1H Candles · Last 120 bars · ±200 pts from price · Rounded to 100
+AUTO REFRESH: JSON timestamp polling every 30s · Reloads ONLY when script re-runs · No flicker · No scroll jump
+STRATEGY CHECKLIST TAB: Rules-based scoring · Auto-filled from live data · N/A safe
+INTRADAY OI TREND TAB: Every-run snapshot → oi_log_banknifty.json · 3/5/15 Min/1 Hr filter · IST timestamps
+WEEKLY OUTLOOK TAB: Pivot Points (Classic/Fibonacci/Camarilla) · Fibonacci Retracement · ATR/VIX range · OI walls · SMA zones · Confluence clustering
+BANKNIFTY HEATMAP TAB: (Disabled — BankNifty does not have a stock heatmap) · Color-coded by % change · Market Breadth · High Weightage Movers
 
-pip install curl_cffi pandas numpy yfinance pytz scipy
+FIX v7: Intraday OI Trend aggregation fix — grouped intervals (5/15/60 min) now use latest
+         snapshot values instead of summing cumulative OI (was inflating CE/PE Δ by N×).
+         Also fixed grouped rows using oldest entry instead of newest for pcr/signal/spot.
+         Auto-scheduler removed from main() — use external cron/scheduler instead.
+FIX v6: Three signal-accuracy improvements applied
+         1. PCR > 1.8 signal corrected: extreme put writing = institutional floor → BUY/NEUTRAL (was wrongly SELL)
+         2. VWAP dynamic calibration: uses live spot/ETF ratio instead of fixed ×100 to avoid intraday drift
+         3. Momentum override thresholds lowered: 1.0%→0.5% (hard), 0.5%→0.25% (soft) for faster V-reversal detection
+FIX v5: BankNifty Heatmap tab added
+FIX v4: Intraday OI Trend tab + oi_log_banknifty.json persistence
+FIX v3: Holiday-aware expiry logic
+FIX v2: Expiry date now time-aware
+FIX v1: Net OI = PE Δ - CE Δ (positive = bullish)
 """
-
-import os, json, time, warnings
+from curl_cffi import requests
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
-from curl_cffi import requests as curl_requests
+import time
+from datetime import datetime, timedelta, date
 import yfinance as yf
-from math import log, sqrt, exp
-from scipy.stats import norm as _norm
+import warnings
+import os
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+import json
 import pytz
+warnings.filterwarnings('ignore')
 
-warnings.filterwarnings("ignore")
-
-IST = pytz.timezone("Asia/Kolkata")
-
-def now_ist():
-    return datetime.now(IST)
-
-def today_ist():
-    return now_ist().date()
-
-def ist_weekday():
-    return today_ist().weekday()
-
-def ist_timestamp_str():
-    return now_ist().strftime("%d-%b-%Y %H:%M IST")
-
-
-# =================================================================
-#  NSE MARKET HOLIDAYS 2026
-#  Source: NSE India official holiday list
-#  If Tuesday expiry falls on a holiday → move to Monday
-#  If Monday also holiday → move to Friday
-# =================================================================
-
-NSE_HOLIDAYS_2026 = {
-    # date-string: description
-    "15-Jan-2026": "Municipal Corporation Election - Maharashtra",
-    "26-Jan-2026": "Republic Day",
-    "03-Mar-2026": "Holi",
-    "26-Mar-2026": "Shri Ram Navami",
-    "31-Mar-2026": "Shri Mahavir Jayanti",
-    "03-Apr-2026": "Good Friday",
-    "14-Apr-2026": "Dr. Baba Saheb Ambedkar Jayanti",
-    "01-May-2026": "Maharashtra Day",
-    "28-May-2026": "Bakri Id",
-    "26-Jun-2026": "Muharram",
-    "14-Sep-2026": "Ganesh Chaturthi",
-    "02-Oct-2026": "Mahatma Gandhi Jayanti",
-    "20-Oct-2026": "Dussehra",
-    "10-Nov-2026": "Diwali-Balipratipada",
-    "24-Nov-2026": "Prakash Gurpurb Sri Guru Nanak Dev",
-    "25-Dec-2026": "Christmas",
+NSE_FO_HOLIDAYS = {
+    "26-Jan-2025","19-Feb-2025","14-Mar-2025","31-Mar-2025","10-Apr-2025",
+    "14-Apr-2025","18-Apr-2025","01-May-2025","15-Aug-2025","27-Aug-2025",
+    "02-Oct-2025","20-Oct-2025","21-Oct-2025","05-Nov-2025","19-Nov-2025","25-Dec-2025",
+    "15-Jan-2026","26-Jan-2026","03-Mar-2026","26-Mar-2026","31-Mar-2026",
+    "03-Apr-2026","14-Apr-2026","01-May-2026","28-May-2026","26-Jun-2026",
+    "14-Sep-2026","02-Oct-2026","20-Oct-2026","10-Nov-2026","24-Nov-2026","25-Dec-2026",
 }
 
-# Convert to a set of date objects for fast lookup
-_HOLIDAY_DATES_2026 = set()
-for _ds in NSE_HOLIDAYS_2026:
+# ═══════════════════════════════════════════════════════════════════════════════
+#  BANKNIFTY ANALYSIS — DATA & HTML
+# ═══════════════════════════════════════════════════════════════════════════════
+
+NIFTY50_SYMBOLS = [
+    ("ADANIPORTS", "ADANIPORTS.NS"), ("APOLLOHOSP", "APOLLOHOSP.NS"),
+    ("ASIANPAINT", "ASIANPAINT.NS"), ("AXISBANK",   "AXISBANK.NS"),
+    ("BAJAJ-AUTO","BAJAJ-AUTO.NS"),  ("BAJAJFINSV", "BAJAJFINSV.NS"),
+    ("BAJFINANCE","BAJFINANCE.NS"),  ("BEL",        "BEL.NS"),
+    ("BHARTIARTL","BHARTIARTL.NS"), ("CIPLA",       "CIPLA.NS"),
+    ("COALINDIA", "COALINDIA.NS"),  ("DRREDDY",     "DRREDDY.NS"),
+    ("EICHERMOT", "EICHERMOT.NS"),  ("ETERNAL",     "ETERNAL.NS"),
+    ("GRASIM",    "GRASIM.NS"),     ("HCLTECH",     "HCLTECH.NS"),
+    ("HDFCBANK",  "HDFCBANK.NS"),   ("HDFCLIFE",    "HDFCLIFE.NS"),
+    ("HEROMOTOCO","HEROMOTOCO.NS"), ("HINDALCO",    "HINDALCO.NS"),
+    ("HINDUNILVR","HINDUNILVR.NS"), ("ICICIBANK",   "ICICIBANK.NS"),
+    ("INDIGO",    "INDIGO.NS"),     ("INFY",        "INFY.NS"),
+    ("ITC",       "ITC.NS"),        ("JIOFIN",      "JIOFIN.NS"),
+    ("JSWSTEEL",  "JSWSTEEL.NS"),   ("KOTAKBANK",   "KOTAKBANK.NS"),
+    ("LT",        "LT.NS"),         ("M&M",         "M&M.NS"),
+    ("MARUTI",    "MARUTI.NS"),     ("MAXHEALTH",   "MAXHEALTH.NS"),
+    ("NESTLEIND", "NESTLEIND.NS"),  ("NTPC",        "NTPC.NS"),
+    ("ONGC",      "ONGC.NS"),       ("POWERGRID",   "POWERGRID.NS"),
+    ("RELIANCE",  "RELIANCE.NS"),   ("SBILIFE",     "SBILIFE.NS"),
+    ("SBIN",      "SBIN.NS"),       ("SHRIRAMFIN",  "SHRIRAMFIN.NS"),
+    ("SUNPHARMA", "SUNPHARMA.NS"),  ("TATAMOTORS",  "TMCV.NS"),
+    ("TATAMOTORS",  "TMPV.NS"),
+    ("TATACONSUM","TATACONSUM.NS"), ("TATASTEEL",   "TATASTEEL.NS"),
+    ("TCS",       "TCS.NS"),        ("TECHM",       "TECHM.NS"),
+    ("TITAN",     "TITAN.NS"),      ("TRENT",       "TRENT.NS"),
+    ("ULTRACEMCO","ULTRACEMCO.NS"), ("WIPRO",       "WIPRO.NS"),
+]
+
+# High-weightage stocks (top 15 by approximate Nifty weight)
+HIGH_WEIGHTAGE = {
+    "RELIANCE", "HDFCBANK", "ICICIBANK", "INFY", "TCS",
+    "BHARTIARTL", "LT", "AXISBANK", "KOTAKBANK", "SBIN"
+}
+
+# Fixed display order by Nifty index weight
+HIGH_WEIGHTAGE_ORDER = [
+    "RELIANCE", "HDFCBANK", "ICICIBANK", "INFY", "TCS",
+    "BHARTIARTL", "LT", "AXISBANK", "KOTAKBANK", "SBIN"
+]
+
+def fetch_heatmap_data():
+    """
+    Fetches live % change data for all 50 Nifty stocks using yfinance.
+    Returns a list of dicts: {symbol, name, price, prev_close, change_pct, change_abs, volume}
+    """
+    print("  📊 Fetching BankNifty heatmap data via yfinance...")
+    results = []
+    tickers_str = " ".join([sym for _, sym in NIFTY50_SYMBOLS])
     try:
-        _HOLIDAY_DATES_2026.add(datetime.strptime(_ds, "%d-%b-%Y").date())
-    except Exception:
-        pass
+        data = yf.download(tickers_str, period="5d", interval="1d",
+                   group_by="ticker", auto_adjust=True, progress=False)
+        ist_tz = pytz.timezone('Asia/Kolkata')
+        timestamp = datetime.now(ist_tz).strftime('%d-%b-%Y %H:%M IST')
+
+        for name, sym in NIFTY50_SYMBOLS:
+            try:
+                if len(NIFTY50_SYMBOLS) == 1:
+                    df = data
+                else:
+                    df = data[sym] if sym in data.columns.get_level_values(0) else None
+                if df is None or df.empty or len(df) < 2:
+                    try:
+                        df_fallback = yf.download(sym, period="5d", interval="1d",
+                                                   auto_adjust=True, progress=False)
+                        if not df_fallback.empty and len(df_fallback) >= 2:
+                            df = df_fallback
+                        else:
+                            results.append({
+                                'symbol': name, 'ticker': sym,
+                                'price': 0, 'prev_close': 0,
+                                'change_pct': 0, 'change_abs': 0,
+                                'volume': 0, 'high_wt': name in HIGH_WEIGHTAGE
+                            })
+                            continue
+                    except Exception:
+                        results.append({
+                            'symbol': name, 'ticker': sym,
+                            'price': 0, 'prev_close': 0,
+                            'change_pct': 0, 'change_abs': 0,
+                            'volume': 0, 'high_wt': name in HIGH_WEIGHTAGE
+                        })
+                        continue
+   
+                # dropna: bulk yf.download() fills NaN for dates a ticker had no data.
+                # Without this, df.iloc[-2]['Close'] is often NaN → renders as ₹nan.
+                df_clean = df.dropna(subset=['Close'])
+                if len(df_clean) < 2:
+                    # Per-ticker fallback when bulk data is insufficient
+                    try:
+                        df_fb = yf.download(sym, period="5d", interval="1d",
+                                            auto_adjust=True, progress=False)
+                        df_clean = df_fb.dropna(subset=['Close']) if not df_fb.empty else df_clean
+                    except Exception:
+                        pass
+                if len(df_clean) < 2:
+                    results.append({
+                        'symbol': name, 'ticker': sym,
+                        'price': 0, 'prev_close': 0,
+                        'change_pct': 0, 'change_abs': 0,
+                        'volume': 0, 'high_wt': name in HIGH_WEIGHTAGE
+                    })
+                    continue
+                today   = df_clean.iloc[-1]
+                prev    = df_clean.iloc[-2]
+                price   = float(today['Close'])
+                p_close = float(prev['Close'])
+                chg_abs = price - p_close
+                chg_pct = (chg_abs / p_close * 100) if p_close > 0 else 0
+                vol     = int(today['Volume']) if not pd.isna(today['Volume']) else 0
+                results.append({
+                    'symbol':     name,
+                    'ticker':     sym,
+                    'price':      round(price, 2),
+                    'prev_close': round(p_close, 2),
+                    'change_pct': round(chg_pct, 2),
+                    'change_abs': round(chg_abs, 2),
+                    'volume':     vol,
+                    'high_wt':    name in HIGH_WEIGHTAGE,
+                })
+            except Exception as e:
+                print(f"    ⚠️  {name}: {e}")
+                results.append({
+                    'symbol': name, 'ticker': sym,
+                    'price': 0, 'prev_close': 0,
+                    'change_pct': 0, 'change_abs': 0,
+                    'volume': 0, 'high_wt': name in HIGH_WEIGHTAGE
+                })
+        advance = sum(1 for r in results if r['change_pct'] > 0)
+        decline = sum(1 for r in results if r['change_pct'] < 0)
+        neutral = sum(1 for r in results if r['change_pct'] == 0)
+        print(f"  ✅ Heatmap: {len(results)} stocks | Adv: {advance} Dec: {decline} Neu: {neutral}")
+        return results, timestamp, advance, decline, neutral
+    except Exception as e:
+        print(f"  ❌ Heatmap fetch failed: {e}")
+        return [], "N/A", 0, 0, 0
+def fetch_global_bias():
+    """
+    Fetches DJI, NASDAQ, S&P 500 previous session data via yfinance.
+    Returns 'bullish', 'bearish', or 'neutral' based on majority direction.
+    """
+    print("  🌐 Fetching global indices bias (DJI / NASDAQ / S&P 500)...")
+    tickers = {"DJI": "^DJI", "NASDAQ": "^IXIC", "SP500": "^GSPC"}
+    score = 0
+    results = []
+    for name, sym in tickers.items():
+        try:
+            df = yf.Ticker(sym).history(period="2d", interval="1d")
+            if df is None or len(df) < 2:
+                print(f"    ⚠️  {name}: insufficient data")
+                continue
+            prev  = float(df['Close'].iloc[-2])
+            last  = float(df['Close'].iloc[-1])
+            chg   = round((last - prev) / prev * 100, 2)
+            direction = "▲" if chg >= 0 else "▼"
+            print(f"    {direction} {name}: {chg:+.2f}%")
+            score += 1 if chg >= 0 else -1
+            results.append(chg)
+        except Exception as e:
+            print(f"    ⚠️  {name} fetch failed: {e}")
+
+    if not results:
+        print("  ⚠️  Global bias: all fetches failed — defaulting to None")
+        return None
+
+    if score >= 2:
+        bias = "bullish"
+    elif score <= -2:
+        bias = "bearish"
+    else:
+        bias = "neutral"
+
+    print(f"  ✅ Global bias → {bias.upper()} (score: {score}/{len(results)})")
+    return bias
+def fetch_india_vix():
+    """Fetches India VIX from yfinance."""
+    try:
+        print("  🌡️ Fetching India VIX...")
+        df = yf.Ticker("^INDIAVIX").history(period="5d", interval="1d")
+        if df is None or df.empty or len(df) < 2:
+            print("  ⚠️  India VIX: insufficient data")
+            return None, None
+        vix_today = float(df['Close'].iloc[-1])
+        vix_prev  = float(df['Close'].iloc[-2])
+        vix_trend = "rising" if vix_today > vix_prev else "falling"
+        print(f"  ✅ India VIX: {vix_today:.2f} ({vix_trend})")
+        return round(vix_today, 2), vix_trend
+    except Exception as e:
+        print(f"  ⚠️  India VIX fetch failed: {e}")
+        return None, None   
+def fetch_volume_at_levels(technical):
+    """
+    Uses BANKBEES.NS (Nifty ETF) for both price and volume.
+    ETF price ≈ BankNifty/100, so levels are scaled down before comparison.
+    """
+    try:
+        import yfinance as _yf
+        print("  📦 Fetching volume at support/resistance levels...")
+
+        if not technical.get('support') or not technical.get('resistance'):
+            print("  ⚠️  Key levels are N/A — skipping volume at levels")
+            return None, None
+
+        df = _yf.Ticker("BANKBEES.NS").history(interval="1h", period="60d")
+
+        if df is None or df.empty or len(df) < 25:
+            print("  ⚠️  Insufficient BANKBEES 1H data")
+            return None, None
+
+        df = df.dropna(subset=['Close', 'Volume'])
+        df = df[df['Volume'] > 0]
+
+        if len(df) < 25:
+            print("  ⚠️  Not enough non-zero volume rows in BANKBEES")
+            return None, None
+
+        # BANKBEES trades at ~BankNifty/100, so scale levels down
+        support    = technical['support']    / 100
+        resistance = technical['resistance'] / 100
+        proximity  = 400 / 100  # ±2.0 on ETF scale = ±200 on Nifty scale
+
+        df['vol_avg_20'] = df['Volume'].rolling(20).mean()
+        df = df.dropna(subset=['vol_avg_20'])
+
+        near_support    = df[abs(df['Close'] - support)    <= proximity]
+        near_resistance = df[abs(df['Close'] - resistance) <= proximity]
+
+        vol_support = vol_resistance = None
+
+        if not near_support.empty:
+            avg_vol_sup  = near_support['vol_avg_20'].mean()
+            zone_vol_sup = near_support['Volume'].mean()
+            if avg_vol_sup > 0:
+                vol_support = round((zone_vol_sup - avg_vol_sup) / avg_vol_sup * 100, 1)
+                print(f"  ✅ Vol at Support ({technical['support']}): {vol_support:+.1f}% vs avg  [{len(near_support)} candles]")
+            else:
+                print(f"  ⚠️  Vol at Support: avg volume is zero")
+        else:
+            print(f"  ⚠️  No bars found near support ({technical['support']} ±75 pts) — will show N/A")
+
+        if not near_resistance.empty:
+            avg_vol_res  = near_resistance['vol_avg_20'].mean()
+            zone_vol_res = near_resistance['Volume'].mean()
+            if avg_vol_res > 0:
+                vol_resistance = round((zone_vol_res - avg_vol_res) / avg_vol_res * 100, 1)
+                print(f"  ✅ Vol at Resistance ({technical['resistance']}): {vol_resistance:+.1f}% vs avg  [{len(near_resistance)} candles]")
+            else:
+                print(f"  ⚠️  Vol at Resistance: avg volume is zero")
+        else:
+            print(f"  ⚠️  No bars found near resistance ({technical['resistance']} ±75 pts) — will show N/A")
+
+        return vol_support, vol_resistance
+
+    except Exception as e:
+        print(f"  ❌ Volume at levels fetch failed: {e}")
+        return None, None
 
 
-def is_nse_holiday(dt):
-    """Return True if the given date is an NSE trading holiday or weekend."""
-    if dt.weekday() >= 5:   # Saturday=5, Sunday=6
-        return True
-    return dt in _HOLIDAY_DATES_2026
+# ═══════════════════════════════════════════════════════════════════════════════
+#  WEEKLY OUTLOOK — Projection Engine
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def compute_weekly_outlook(html_data, vix_val=None):
+    """
+    Computes weekly support/resistance projections using:
+      1. Weekly Pivot Points (Classic + Fibonacci + Camarilla)
+      2. Fibonacci Retracement (20-day swing high/low)
+      3. ATR-14 based expected range
+      4. VIX-implied expected range
+      5. OI walls from current option chain
+      6. SMA zones (20/50/200)
+      7. Level clustering (confluence detection)
+    Returns a dict with all computed levels and scenario projections.
+    """
+    import yfinance as yf
+    import numpy as np
+    print("\n🔮 Computing Weekly Outlook projections...")
+    outlook = {
+        'weekly_pivots': {}, 'fib_levels': {}, 'atr': None,
+        'atr_weekly_range': None, 'vix_weekly_range': None,
+        'clusters_bull': [], 'clusters_bear': [], 'clusters_neutral': [],
+        'scenarios': {}, 'current_price': 0, 'prev_week': {},
+        'sma_zones': {}, 'oi_walls': {},
+    }
+    try:
+        nifty = yf.Ticker("^NSEBANK")
+        # ── Fetch daily data (1 year) ──────────────────────────────────
+        df = nifty.history(period="1y")
+        if df.empty or len(df) < 30:
+            print("  ⚠️  Insufficient daily data for weekly outlook")
+            return outlook
+        current_price = float(df['Close'].iloc[-1])
+        outlook['current_price'] = current_price
+
+        # ── Previous WEEK high/low/close ───────────────────────────────
+        df_idx = df.copy()
+        df_idx.index = pd.to_datetime(df_idx.index)
+        if df_idx.index.tz is not None:
+            df_idx.index = df_idx.index.tz_localize(None)
+        df_idx['week'] = df_idx.index.isocalendar().week.values
+        df_idx['year'] = df_idx.index.year
+        current_yw = (df_idx['year'].iloc[-1], df_idx['week'].iloc[-1])
+        # Get previous week
+        prev_weeks = df_idx[(df_idx['year'] < current_yw[0]) |
+                            ((df_idx['year'] == current_yw[0]) & (df_idx['week'] < current_yw[1]))]
+        if prev_weeks.empty:
+            print("  ⚠️  No previous week data found")
+            return outlook
+        last_yw = (prev_weeks['year'].iloc[-1], prev_weeks['week'].iloc[-1])
+        pw = prev_weeks[(prev_weeks['year'] == last_yw[0]) & (prev_weeks['week'] == last_yw[1])]
+        pw_high  = float(pw['High'].max())
+        pw_low   = float(pw['Low'].min())
+        pw_close = float(pw['Close'].iloc[-1])
+        pw_open  = float(pw['Open'].iloc[0])
+        outlook['prev_week'] = {'high': pw_high, 'low': pw_low, 'close': pw_close, 'open': pw_open}
+        print(f"  📅 Prev Week: H={pw_high:.0f} L={pw_low:.0f} C={pw_close:.0f}")
+
+        # ═══ 1. WEEKLY PIVOT POINTS ════════════════════════════════════
+        pp = (pw_high + pw_low + pw_close) / 3
+        # Classic
+        classic = {
+            'PP': round(pp),
+            'R1': round(2 * pp - pw_low),      'S1': round(2 * pp - pw_high),
+            'R2': round(pp + (pw_high - pw_low)), 'S2': round(pp - (pw_high - pw_low)),
+            'R3': round(pw_high + 2 * (pp - pw_low)), 'S3': round(pw_low - 2 * (pw_high - pp)),
+        }
+        # Fibonacci Pivots
+        diff_hl = pw_high - pw_low
+        fib_pivots = {
+            'PP': round(pp),
+            'R1': round(pp + 0.382 * diff_hl), 'S1': round(pp - 0.382 * diff_hl),
+            'R2': round(pp + 0.618 * diff_hl), 'S2': round(pp - 0.618 * diff_hl),
+            'R3': round(pp + 1.000 * diff_hl), 'S3': round(pp - 1.000 * diff_hl),
+        }
+        # Camarilla
+        camarilla = {
+            'PP': round(pp),
+            'R1': round(pw_close + 1.1 * diff_hl / 12), 'S1': round(pw_close - 1.1 * diff_hl / 12),
+            'R2': round(pw_close + 1.1 * diff_hl / 6),  'S2': round(pw_close - 1.1 * diff_hl / 6),
+            'R3': round(pw_close + 1.1 * diff_hl / 4),  'S3': round(pw_close - 1.1 * diff_hl / 4),
+            'R4': round(pw_close + 1.1 * diff_hl / 2),  'S4': round(pw_close - 1.1 * diff_hl / 2),
+        }
+        outlook['weekly_pivots'] = {'classic': classic, 'fibonacci': fib_pivots, 'camarilla': camarilla}
+        print(f"  📊 Classic Pivots: S2={classic['S2']} S1={classic['S1']} PP={classic['PP']} R1={classic['R1']} R2={classic['R2']}")
+
+        # ═══ 2. FIBONACCI RETRACEMENT (20-day swing) ══════════════════
+        last_20 = df.tail(20)
+        swing_high = float(last_20['High'].max())
+        swing_low  = float(last_20['Low'].min())
+        swing_range = swing_high - swing_low
+        fib_retrace = {
+            'swing_high': round(swing_high),
+            'swing_low':  round(swing_low),
+            '23.6': round(swing_high - 0.236 * swing_range),
+            '38.2': round(swing_high - 0.382 * swing_range),
+            '50.0': round(swing_high - 0.500 * swing_range),
+            '61.8': round(swing_high - 0.618 * swing_range),
+            '78.6': round(swing_high - 0.786 * swing_range),
+        }
+        outlook['fib_levels'] = fib_retrace
+        print(f"  📐 Fibonacci: Swing H={swing_high:.0f} L={swing_low:.0f} | 38.2%={fib_retrace['38.2']} 61.8%={fib_retrace['61.8']}")
+
+        # ═══ 3. ATR (14-day) → Expected weekly range ══════════════════
+        df_atr = df.copy()
+        df_atr['H-L']  = df_atr['High'] - df_atr['Low']
+        df_atr['H-PC'] = abs(df_atr['High'] - df_atr['Close'].shift(1))
+        df_atr['L-PC'] = abs(df_atr['Low']  - df_atr['Close'].shift(1))
+        df_atr['TR']   = df_atr[['H-L', 'H-PC', 'L-PC']].max(axis=1)
+        atr_14 = float(df_atr['TR'].rolling(14).mean().iloc[-1])
+        atr_weekly = atr_14 * np.sqrt(5)  # scale daily ATR to weekly
+        outlook['atr'] = round(atr_14)
+        outlook['atr_weekly_range'] = round(atr_weekly)
+        print(f"  📏 ATR-14: {atr_14:.0f} | Weekly range: ±{atr_weekly:.0f}")
+
+        # ═══ 4. VIX-implied weekly range ══════════════════════════════
+        if vix_val and vix_val > 0:
+            # VIX is annualized → weekly: VIX / sqrt(52) / 100 * price
+            vix_weekly_pct = vix_val / (52 ** 0.5)
+            vix_weekly_pts = current_price * vix_weekly_pct / 100
+            outlook['vix_weekly_range'] = round(vix_weekly_pts)
+            print(f"  🌡️  VIX ({vix_val:.1f}) → Weekly range: ±{vix_weekly_pts:.0f} pts ({vix_weekly_pct:.2f}%)")
+
+        # ═══ 5. OI walls from html_data ═══════════════════════════════
+        oi_walls = {}
+        if html_data.get('has_option_data'):
+            oi_walls = {
+                'ce_wall': html_data.get('max_ce_oi', 0),
+                'pe_wall': html_data.get('max_pe_oi', 0),
+                'support': html_data.get('support', 0),
+                'resistance': html_data.get('resistance', 0),
+                'strong_support': html_data.get('strong_support', 0),
+                'strong_resistance': html_data.get('strong_resistance', 0),
+                'max_pain': html_data.get('max_pain', 0),
+            }
+        outlook['oi_walls'] = oi_walls
+
+        # ═══ 6. SMA zones ═════════════════════════════════════════════
+        outlook['sma_zones'] = {
+            'sma_20':  round(float(html_data.get('sma_20', 0))),
+            'sma_50':  round(float(html_data.get('sma_50', 0))),
+            'sma_200': round(float(html_data.get('sma_200', 0))),
+        }
+
+        # ═══ 7. LEVEL CLUSTERING ══════════════════════════════════════
+        # Gather ALL levels into a single list, then cluster within 50 pts
+        all_levels = []
+
+        def _add(val, label, category):
+            if val and val > 0:
+                all_levels.append({'value': round(val), 'label': label, 'cat': category})
+
+        # Pivots (classic)
+        _add(classic.get('R1'), 'Pivot R1', 'resistance')
+        _add(classic.get('R2'), 'Pivot R2', 'resistance')
+        _add(classic.get('R3'), 'Pivot R3', 'resistance')
+        _add(classic.get('S1'), 'Pivot S1', 'support')
+        _add(classic.get('S2'), 'Pivot S2', 'support')
+        _add(classic.get('S3'), 'Pivot S3', 'support')
+        _add(classic.get('PP'), 'Pivot PP', 'neutral')
+        # Fibonacci pivots
+        _add(fib_pivots.get('R1'), 'Fib Pivot R1', 'resistance')
+        _add(fib_pivots.get('R2'), 'Fib Pivot R2', 'resistance')
+        _add(fib_pivots.get('S1'), 'Fib Pivot S1', 'support')
+        _add(fib_pivots.get('S2'), 'Fib Pivot S2', 'support')
+        # Camarilla
+        _add(camarilla.get('R3'), 'Cam R3', 'resistance')
+        _add(camarilla.get('R4'), 'Cam R4', 'resistance')
+        _add(camarilla.get('S3'), 'Cam S3', 'support')
+        _add(camarilla.get('S4'), 'Cam S4', 'support')
+        # Fibonacci retracement
+        _add(fib_retrace.get('23.6'), 'Fib 23.6%', 'resistance' if current_price < fib_retrace.get('23.6', 0) else 'support')
+        _add(fib_retrace.get('38.2'), 'Fib 38.2%', 'resistance' if current_price < fib_retrace.get('38.2', 0) else 'support')
+        _add(fib_retrace.get('50.0'), 'Fib 50%',   'resistance' if current_price < fib_retrace.get('50.0', 0) else 'support')
+        _add(fib_retrace.get('61.8'), 'Fib 61.8%', 'resistance' if current_price < fib_retrace.get('61.8', 0) else 'support')
+        # OI walls
+        _add(oi_walls.get('ce_wall'),          'CE Wall (Max OI)',  'resistance')
+        _add(oi_walls.get('pe_wall'),          'PE Wall (Max OI)',  'support')
+        _add(oi_walls.get('resistance'),       'OI Resistance',     'resistance')
+        _add(oi_walls.get('support'),          'OI Support',        'support')
+        _add(oi_walls.get('strong_resistance'),'Strong OI Res',     'resistance')
+        _add(oi_walls.get('strong_support'),   'Strong OI Sup',     'support')
+        _add(oi_walls.get('max_pain'),         'Max Pain',          'neutral')
+        # SMA zones
+        for sma_key in ('sma_20', 'sma_50', 'sma_200'):
+            sma_v = outlook['sma_zones'].get(sma_key, 0)
+            if sma_v > 0:
+                cat = 'resistance' if current_price < sma_v else 'support'
+                _add(sma_v, sma_key.upper().replace('_', ' '), cat)
+        # ATR projected bounds
+        _add(round(current_price + atr_weekly), 'ATR Upper', 'resistance')
+        _add(round(current_price - atr_weekly), 'ATR Lower', 'support')
+        # VIX projected bounds
+        if outlook.get('vix_weekly_range'):
+            _add(round(current_price + outlook['vix_weekly_range']), 'VIX Upper', 'resistance')
+            _add(round(current_price - outlook['vix_weekly_range']), 'VIX Lower', 'support')
+
+        # Cluster: group levels within 50 pts of each other
+        CLUSTER_GAP = 100
+        sorted_levels = sorted(all_levels, key=lambda x: x['value'])
+        clusters = []
+        used = set()
+        for i, lvl in enumerate(sorted_levels):
+            if i in used:
+                continue
+            group = [lvl]
+            used.add(i)
+            for j in range(i + 1, len(sorted_levels)):
+                if j in used:
+                    continue
+                if sorted_levels[j]['value'] - lvl['value'] <= CLUSTER_GAP:
+                    group.append(sorted_levels[j])
+                    used.add(j)
+                else:
+                    break
+            avg_val = round(sum(g['value'] for g in group) / len(group))
+            labels  = [g['label'] for g in group]
+            cats    = [g['cat'] for g in group]
+            # Determine cluster type by majority
+            r_count = cats.count('resistance')
+            s_count = cats.count('support')
+            if r_count > s_count:
+                ctype = 'resistance'
+            elif s_count > r_count:
+                ctype = 'support'
+            else:
+                ctype = 'neutral'
+            clusters.append({
+                'value': avg_val, 'count': len(group), 'labels': labels,
+                'type': ctype, 'strength': 'STRONG' if len(group) >= 3 else ('MODERATE' if len(group) == 2 else 'WEAK'),
+            })
+
+        # Separate into bull/bear/neutral targets
+        outlook['clusters_bull'] = sorted(
+            [c for c in clusters if c['type'] == 'resistance' and c['value'] > current_price],
+            key=lambda x: x['value']
+        )
+        outlook['clusters_bear'] = sorted(
+            [c for c in clusters if c['type'] == 'support' and c['value'] < current_price],
+            key=lambda x: -x['value']
+        )
+        outlook['clusters_neutral'] = [c for c in clusters if c['type'] == 'neutral']
+
+        # ═══ 8. BUILD SCENARIOS ═══════════════════════════════════════
+        bull_t1 = outlook['clusters_bull'][0] if outlook['clusters_bull'] else None
+        bull_t2 = outlook['clusters_bull'][1] if len(outlook['clusters_bull']) > 1 else None
+        bear_t1 = outlook['clusters_bear'][0] if outlook['clusters_bear'] else None
+        bear_t2 = outlook['clusters_bear'][1] if len(outlook['clusters_bear']) > 1 else None
+
+        range_upper = current_price + (outlook.get('vix_weekly_range') or outlook.get('atr_weekly_range') or 200)
+        range_lower = current_price - (outlook.get('vix_weekly_range') or outlook.get('atr_weekly_range') or 200)
+
+        outlook['scenarios'] = {
+            'bullish': {
+                'target_1': bull_t1['value'] if bull_t1 else round(current_price + 300),
+                'target_1_strength': bull_t1['strength'] if bull_t1 else 'WEAK',
+                'target_1_confluence': bull_t1['labels'] if bull_t1 else [],
+                'target_2': bull_t2['value'] if bull_t2 else round(current_price + 600),
+                'target_2_strength': bull_t2['strength'] if bull_t2 else 'WEAK',
+                'target_2_confluence': bull_t2['labels'] if bull_t2 else [],
+            },
+            'bearish': {
+                'target_1': bear_t1['value'] if bear_t1 else round(current_price - 300),
+                'target_1_strength': bear_t1['strength'] if bear_t1 else 'WEAK',
+                'target_1_confluence': bear_t1['labels'] if bear_t1 else [],
+                'target_2': bear_t2['value'] if bear_t2 else round(current_price - 600),
+                'target_2_strength': bear_t2['strength'] if bear_t2 else 'WEAK',
+                'target_2_confluence': bear_t2['labels'] if bear_t2 else [],
+            },
+            'neutral': {
+                'range_high': round(range_upper),
+                'range_low':  round(range_lower),
+            },
+        }
+        print(f"  🎯 Bull T1={outlook['scenarios']['bullish']['target_1']} T2={outlook['scenarios']['bullish']['target_2']}")
+        print(f"  🎯 Bear T1={outlook['scenarios']['bearish']['target_1']} T2={outlook['scenarios']['bearish']['target_2']}")
+        print(f"  🎯 Neutral Range: {outlook['scenarios']['neutral']['range_low']} – {outlook['scenarios']['neutral']['range_high']}")
+        print(f"  ✅ Weekly Outlook computed with {len(clusters)} level clusters")
+
+    except Exception as e:
+        print(f"  ❌ Weekly Outlook computation failed: {e}")
+        import traceback; traceback.print_exc()
+
+    return outlook
 
 
-def get_prev_trading_day(dt):
-    """Return the nearest previous trading day (not holiday, not weekend)."""
-    candidate = dt - timedelta(days=1)
-    for _ in range(10):           # safety: max 10 look-back days
-        if not is_nse_holiday(candidate):
-            return candidate
-        candidate -= timedelta(days=1)
-    return candidate              # fallback (should never reach here)
+def build_weekly_outlook_tab_html(outlook):
+    """Builds the complete HTML for the Weekly Outlook tab."""
+    cp       = outlook.get('current_price', 0)
+    pw       = outlook.get('prev_week', {})
+    pivots   = outlook.get('weekly_pivots', {})
+    fib      = outlook.get('fib_levels', {})
+    atr      = outlook.get('atr', 0)
+    atr_wr   = outlook.get('atr_weekly_range', 0)
+    vix_wr   = outlook.get('vix_weekly_range', 0)
+    oi       = outlook.get('oi_walls', {})
+    sma      = outlook.get('sma_zones', {})
+    sc       = outlook.get('scenarios', {})
+    cl_bull  = outlook.get('clusters_bull', [])
+    cl_bear  = outlook.get('clusters_bear', [])
+    classic  = pivots.get('classic', {})
+    fib_piv  = pivots.get('fibonacci', {})
+    cam      = pivots.get('camarilla', {})
+    sc_bull  = sc.get('bullish', {})
+    sc_bear  = sc.get('bearish', {})
+    sc_neut  = sc.get('neutral', {})
+
+    def fmt(v):
+        if v and v > 0:
+            return f"₹{int(v):,}"
+        return "N/A"
+
+    def strength_badge(s):
+        if s == 'STRONG':
+            return '<span style="background:rgba(0,230,118,0.18);color:#00e676;padding:4px 12px;border-radius:10px;font-size:11px;font-weight:700;letter-spacing:1px;border:1px solid rgba(0,230,118,0.4);text-shadow:0 0 8px rgba(0,230,118,0.3);">STRONG</span>'
+        elif s == 'MODERATE':
+            return '<span style="background:rgba(255,183,77,0.18);color:#ffb74d;padding:4px 12px;border-radius:10px;font-size:11px;font-weight:700;letter-spacing:1px;border:1px solid rgba(255,183,77,0.4);text-shadow:0 0 8px rgba(255,183,77,0.3);">MODERATE</span>'
+        return '<span style="background:rgba(176,190,197,0.12);color:rgba(176,190,197,0.65);padding:4px 12px;border-radius:10px;font-size:11px;font-weight:700;letter-spacing:1px;border:1px solid rgba(176,190,197,0.25);">WEAK</span>'
+
+    def confluence_tags(labels):
+        if not labels:
+            return '<span style="color:rgba(176,190,197,0.3);">—</span>'
+        html_t = ''
+        for lb in labels[:5]:
+            html_t += f'<span style="display:inline-block;background:rgba(79,195,247,0.15);color:#80deea;padding:4px 12px;border-radius:6px;font-size:12px;font-weight:500;margin:3px 4px 3px 0;border:1px solid rgba(79,195,247,0.35);">{lb}</span>'
+        if len(labels) > 5:
+            html_t += f'<span style="color:#90a4ae;font-size:11px;">+{len(labels)-5} more</span>'
+        return html_t
+
+    # ── Cluster bars for visual ────────────────────────────────────
+    all_clusters = []
+    for c in cl_bull[:4]:
+        all_clusters.append(('bull', c))
+    for c in cl_bear[:4]:
+        all_clusters.append(('bear', c))
+    all_clusters.sort(key=lambda x: x[1]['value'])
+
+    # ── Build the visual range bar ─────────────────────────────────
+    range_low  = sc_neut.get('range_low', cp - 300)
+    range_high = sc_neut.get('range_high', cp + 300)
+    bar_min = min(range_low, cp - 400, min((c[1]['value'] for c in all_clusters), default=cp-400))
+    bar_max = max(range_high, cp + 400, max((c[1]['value'] for c in all_clusters), default=cp+400))
+    bar_span = bar_max - bar_min if bar_max > bar_min else 1
+
+    def to_pct(v):
+        return max(2, min(98, (v - bar_min) / bar_span * 100))
+
+    cp_pct = to_pct(cp)
+
+    # Build marker divs
+    marker_html = ''
+    label_flip = True  # alternate above/below to avoid overlap
+    for ctype, cl in all_clusters:
+        pct = to_pct(cl['value'])
+        color = '#00e676' if ctype == 'bear' else '#ff5252'  # support=green, resistance=red
+        if cl['strength'] == 'STRONG':
+            sz = 16; opacity = 1.0
+        elif cl['strength'] == 'MODERATE':
+            sz = 12; opacity = 0.8
+        else:
+            sz = 8; opacity = 0.5
+        # Dot
+        marker_html += f'<div style="position:absolute;left:{pct:.1f}%;top:50%;transform:translate(-50%,-50%);width:{sz}px;height:{sz}px;background:{color};border-radius:50%;opacity:{opacity};z-index:2;box-shadow:0 0 {sz}px {color}40;" title="{fmt(cl["value"])} ({cl["strength"]} — {", ".join(cl["labels"][:3])})"></div>'
+        # Price label for STRONG and MODERATE dots
+        if cl['strength'] in ('STRONG', 'MODERATE'):
+            lbl_top = '-22px' if label_flip else '38px'
+            lbl_color = color
+            marker_html += f'<div style="position:absolute;left:{pct:.1f}%;top:{lbl_top};transform:translateX(-50%);font-family:\'JetBrains Mono\',monospace;font-size:10px;color:{lbl_color};white-space:nowrap;z-index:3;opacity:0.85;font-weight:600;">{fmt(cl["value"])}</div>'
+            label_flip = not label_flip
+
+    # Pivot point table builder
+    def pivot_row(label, val, cls=''):
+        if not val:
+            return ''
+        dist = val - cp
+        dist_pct = dist / cp * 100 if cp > 0 else 0
+        arrow = '▲' if dist > 0 else '▼' if dist < 0 else '—'
+        dcol = '#34d399' if dist > 0 else '#f87171' if dist < 0 else 'rgba(176,190,197,0.5)'
+        return f'''<tr class="{cls}">
+            <td style="color:rgba(128,222,234,0.8);font-weight:600;">{label}</td>
+            <td style="font-family:'JetBrains Mono',monospace;color:#e0f7fa;font-weight:700;">{fmt(val)}</td>
+            <td style="font-family:'JetBrains Mono',monospace;color:{dcol};font-size:12px;">{arrow} {abs(dist):.0f} pts ({abs(dist_pct):.2f}%)</td>
+        </tr>'''
+
+    html = f"""
+    <div class="tab-panel" id="tab-weekly">
+    <style>
+        .wo-card{{background:linear-gradient(135deg,rgba(10,14,26,0.96),rgba(13,18,37,0.92));border:1px solid rgba(79,195,247,0.12);border-radius:14px;padding:20px 24px;margin:16px 0;}}
+        .wo-title{{font-family:'JetBrains Mono',monospace;font-size:13px;letter-spacing:2.5px;color:#00e5ff;text-transform:uppercase;margin-bottom:14px;display:flex;align-items:center;gap:8px;text-shadow:0 0 12px rgba(0,229,255,0.3);}}
+        .wo-title svg{{width:18px;height:18px;stroke:#00e5ff;fill:none;stroke-width:1.5;}}
+        .wo-scenario{{background:linear-gradient(135deg,rgba(10,14,26,0.98),rgba(8,12,24,0.95));border:1px solid rgba(79,195,247,0.1);border-radius:12px;padding:18px 20px;flex:1;min-width:240px;}}
+        .wo-sc-head{{font-family:'JetBrains Mono',monospace;font-size:14px;letter-spacing:2px;font-weight:700;margin-bottom:14px;display:flex;align-items:center;gap:8px;text-shadow:0 0 10px rgba(0,229,255,0.15);}}
+        .wo-sc-row{{display:flex;justify-content:space-between;align-items:center;padding:10px 0;border-bottom:1px solid rgba(79,195,247,0.06);}}
+        .wo-sc-label{{font-size:14px;color:#b0bec5;}}
+        .wo-sc-val{{font-family:'JetBrains Mono',monospace;font-size:18px;font-weight:700;}}
+        .wo-sc-conf{{padding:6px 0;}}
+        .wo-tbl{{width:100%;border-collapse:collapse;font-size:14px;}}
+        .wo-tbl th{{font-family:'JetBrains Mono',monospace;font-size:11px;letter-spacing:1.5px;color:#00e5ff;text-align:left;padding:10px 12px;border-bottom:1px solid rgba(79,195,247,0.15);text-transform:uppercase;}}
+        .wo-tbl td{{padding:9px 12px;border-bottom:1px solid rgba(79,195,247,0.05);color:#cfd8dc;}}
+        .wo-tbl tr:hover td{{background:rgba(79,195,247,0.04);}}
+        .wo-range-bar{{position:relative;height:50px;background:linear-gradient(90deg,rgba(239,68,68,0.08),rgba(79,195,247,0.04) 50%,rgba(16,185,129,0.08));border-radius:20px;margin:28px 0 40px;border:1px solid rgba(79,195,247,0.1);overflow:visible;}}
+        .wo-range-zone{{position:absolute;top:4px;bottom:4px;background:rgba(79,195,247,0.06);border-radius:16px;border:1px dashed rgba(79,195,247,0.15);}}
+        .wo-cp-marker{{position:absolute;top:50%;transform:translate(-50%,-50%);z-index:5;}}
+        .wo-cp-dot{{width:18px;height:18px;background:#00e5ff;border-radius:50%;box-shadow:0 0 14px rgba(0,229,255,0.6);}}
+        .wo-cp-label{{position:absolute;top:-24px;left:50%;transform:translateX(-50%);font-family:'JetBrains Mono',monospace;font-size:13px;color:#00e5ff;white-space:nowrap;letter-spacing:0.5px;font-weight:700;}}
+        .wo-piv-toggle{{display:flex;gap:6px;margin-bottom:14px;flex-wrap:wrap;}}
+        .wo-piv-btn{{padding:6px 18px;font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:700;letter-spacing:1.5px;color:rgba(128,222,234,0.5);background:transparent;border:1px solid rgba(79,195,247,0.15);border-radius:16px;cursor:pointer;transition:all 0.2s;}}
+        .wo-piv-btn:hover{{color:#4fc3f7;border-color:rgba(79,195,247,0.4);}}
+        .wo-piv-btn.active{{color:#00e5ff;border-color:rgba(79,195,247,0.6);background:rgba(79,195,247,0.12);box-shadow:0 0 8px rgba(79,195,247,0.1);}}
+        .wo-piv-panel{{display:none;}}.wo-piv-panel.active{{display:block;}}
+        .wo-stat{{display:inline-flex;flex-direction:column;align-items:center;padding:10px 18px;background:rgba(79,195,247,0.04);border:1px solid rgba(79,195,247,0.08);border-radius:10px;min-width:100px;}}
+        .wo-stat-val{{font-family:'JetBrains Mono',monospace;font-size:18px;font-weight:700;color:#e0f7fa;}}
+        .wo-stat-lbl{{font-size:11px;color:#90a4ae;margin-top:4px;letter-spacing:0.8px;font-weight:600;}}
+        @media(max-width:768px){{
+            .wo-sc-wrap{{flex-direction:column!important;}}
+            .wo-stat{{min-width:70px;padding:8px 12px;}}
+            .wo-stat-val{{font-size:13px;}}
+        }}
+    </style>
+
+    <div style="padding:16px 0 8px;">
+        <div style="font-family:'JetBrains Mono',monospace;font-size:12px;letter-spacing:3px;color:#4fc3f7;margin-bottom:6px;">WEEKLY OUTLOOK</div>
+        <div style="font-size:26px;font-weight:700;color:#e0f7fa;text-shadow:0 0 20px rgba(0,229,255,0.15);">Projected Support &amp; Resistance</div>
+        <div style="font-size:14px;color:#90a4ae;margin-top:4px;">Confluence-based levels from Pivots · Fibonacci · ATR · VIX · OI Walls · SMA</div>
+    </div>
+
+    <!-- ── Quick Stats ── -->
+    <div style="display:flex;gap:10px;flex-wrap:wrap;margin:18px 0 24px;">
+        <div class="wo-stat"><div class="wo-stat-val">{fmt(cp)}</div><div class="wo-stat-lbl">SPOT PRICE</div></div>
+        <div class="wo-stat"><div class="wo-stat-val">±{atr_wr or '—'}</div><div class="wo-stat-lbl">ATR WEEKLY</div></div>
+        <div class="wo-stat"><div class="wo-stat-val">±{vix_wr or '—'}</div><div class="wo-stat-lbl">VIX RANGE</div></div>
+        <div class="wo-stat"><div class="wo-stat-val">{fmt(pw.get('high'))}</div><div class="wo-stat-lbl">PREV WK HIGH</div></div>
+        <div class="wo-stat"><div class="wo-stat-val">{fmt(pw.get('low'))}</div><div class="wo-stat-lbl">PREV WK LOW</div></div>
+        <div class="wo-stat"><div class="wo-stat-val">{atr or '—'}</div><div class="wo-stat-lbl">ATR-14 DAILY</div></div>
+    </div>
+
+    <!-- ══ SCENARIO CARDS ══ -->
+    <div class="wo-card">
+        <div class="wo-title">
+            <svg viewBox="0 0 16 16"><circle cx="8" cy="8" r="6"/><path d="M8 4v4l3 2"/></svg>
+            WEEKLY SCENARIO PROJECTIONS
+        </div>
+        <div class="wo-sc-wrap" style="display:flex;gap:14px;flex-wrap:wrap;">
+
+            <!-- BULLISH -->
+            <div class="wo-scenario" style="border-top:2px solid rgba(0,230,118,0.4);">
+                <div class="wo-sc-head" style="color:#00e676;">📈 BULLISH SCENARIO</div>
+                <div class="wo-sc-row">
+                    <span class="wo-sc-label">Target 1</span>
+                    <span class="wo-sc-val" style="color:#34d399;">{fmt(sc_bull.get('target_1'))}</span>
+                </div>
+                <div class="wo-sc-conf">{strength_badge(sc_bull.get('target_1_strength',''))} {confluence_tags(sc_bull.get('target_1_confluence',[]))}</div>
+                <div class="wo-sc-row">
+                    <span class="wo-sc-label">Target 2</span>
+                    <span class="wo-sc-val" style="color:#00e676;">{fmt(sc_bull.get('target_2'))}</span>
+                </div>
+                <div class="wo-sc-conf">{strength_badge(sc_bull.get('target_2_strength',''))} {confluence_tags(sc_bull.get('target_2_confluence',[]))}</div>
+            </div>
+
+            <!-- BEARISH -->
+            <div class="wo-scenario" style="border-top:2px solid rgba(255,82,82,0.4);">
+                <div class="wo-sc-head" style="color:#ff5252;">📉 BEARISH SCENARIO</div>
+                <div class="wo-sc-row">
+                    <span class="wo-sc-label">Target 1</span>
+                    <span class="wo-sc-val" style="color:#f87171;">{fmt(sc_bear.get('target_1'))}</span>
+                </div>
+                <div class="wo-sc-conf">{strength_badge(sc_bear.get('target_1_strength',''))} {confluence_tags(sc_bear.get('target_1_confluence',[]))}</div>
+                <div class="wo-sc-row">
+                    <span class="wo-sc-label">Target 2</span>
+                    <span class="wo-sc-val" style="color:#ff5252;">{fmt(sc_bear.get('target_2'))}</span>
+                </div>
+                <div class="wo-sc-conf">{strength_badge(sc_bear.get('target_2_strength',''))} {confluence_tags(sc_bear.get('target_2_confluence',[]))}</div>
+            </div>
+
+            <!-- NEUTRAL -->
+            <div class="wo-scenario" style="border-top:2px solid rgba(255,183,77,0.4);">
+                <div class="wo-sc-head" style="color:#ffb74d;">↔️ SIDEWAYS RANGE</div>
+                <div class="wo-sc-row">
+                    <span class="wo-sc-label">Range High</span>
+                    <span class="wo-sc-val" style="color:#34d399;">{fmt(sc_neut.get('range_high'))}</span>
+                </div>
+                <div class="wo-sc-conf">{strength_badge('MODERATE')} <span style="font-size:13px;color:#b0bec5;">VIX/ATR implied upper bound</span></div>
+                <div class="wo-sc-row">
+                    <span class="wo-sc-label">Range Low</span>
+                    <span class="wo-sc-val" style="color:#f87171;">{fmt(sc_neut.get('range_low'))}</span>
+                </div>
+                <div class="wo-sc-conf">{strength_badge('MODERATE')} <span style="font-size:13px;color:#b0bec5;">VIX/ATR implied lower bound</span></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ══ VISUAL RANGE BAR ══ -->
+    <div class="wo-card">
+        <div class="wo-title">
+            <svg viewBox="0 0 16 16"><line x1="2" y1="8" x2="14" y2="8"/><polyline points="4,5 2,8 4,11"/><polyline points="12,5 14,8 12,11"/></svg>
+            CONFLUENCE MAP
+        </div>
+        <div style="font-size:13px;color:#b0bec5;margin-bottom:8px;">
+            Each dot = a clustered level. Larger &amp; brighter = more confluences.
+            <span style="color:#00e676;font-weight:600;">● Support</span> &nbsp;
+            <span style="color:#ff5252;font-weight:600;">● Resistance</span> &nbsp;
+            <span style="color:#00e5ff;font-weight:600;">● Current Price</span>
+        </div>
+        <div style="display:flex;justify-content:space-between;font-family:'JetBrains Mono',monospace;font-size:13px;color:#90a4ae;margin-bottom:4px;font-weight:600;">
+            <span>{fmt(bar_min)}</span><span>{fmt(bar_max)}</span>
+        </div>
+        <div class="wo-range-bar">
+            <!-- Neutral range zone -->
+            <div class="wo-range-zone" style="left:{to_pct(range_low):.1f}%;width:{to_pct(range_high)-to_pct(range_low):.1f}%;"></div>
+            <!-- Level markers -->
+            {marker_html}
+            <!-- Current price -->
+            <div class="wo-cp-marker" style="left:{cp_pct:.1f}%;">
+                <div class="wo-cp-label">{fmt(cp)}</div>
+                <div class="wo-cp-dot"></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ══ PIVOT TABLES ══ -->
+    <div class="wo-card">
+        <div class="wo-title">
+            <svg viewBox="0 0 16 16"><rect x="2" y="2" width="12" height="12" rx="2"/><line x1="2" y1="6" x2="14" y2="6"/><line x1="6" y1="2" x2="6" y2="14"/></svg>
+            WEEKLY PIVOT POINTS
+        </div>
+        <div class="wo-piv-toggle">
+            <button class="wo-piv-btn active" onclick="switchWoPiv('classic',this)">CLASSIC</button>
+            <button class="wo-piv-btn" onclick="switchWoPiv('fibonacci',this)">FIBONACCI</button>
+            <button class="wo-piv-btn" onclick="switchWoPiv('camarilla',this)">CAMARILLA</button>
+        </div>
+
+        <!-- Classic -->
+        <div class="wo-piv-panel active" id="wo-piv-classic">
+        <table class="wo-tbl">
+            <tr><th>Level</th><th>Price</th><th>Distance from Spot</th></tr>
+            {pivot_row('R3', classic.get('R3'))}
+            {pivot_row('R2', classic.get('R2'))}
+            {pivot_row('R1', classic.get('R1'))}
+            {pivot_row('PP (Pivot)', classic.get('PP'), 'style="background:rgba(79,195,247,0.05);"' if False else '')}
+            {pivot_row('S1', classic.get('S1'))}
+            {pivot_row('S2', classic.get('S2'))}
+            {pivot_row('S3', classic.get('S3'))}
+        </table>
+        </div>
+
+        <!-- Fibonacci Pivots -->
+        <div class="wo-piv-panel" id="wo-piv-fibonacci">
+        <table class="wo-tbl">
+            <tr><th>Level</th><th>Price</th><th>Distance from Spot</th></tr>
+            {pivot_row('R3', fib_piv.get('R3'))}
+            {pivot_row('R2', fib_piv.get('R2'))}
+            {pivot_row('R1', fib_piv.get('R1'))}
+            {pivot_row('PP (Pivot)', fib_piv.get('PP'))}
+            {pivot_row('S1', fib_piv.get('S1'))}
+            {pivot_row('S2', fib_piv.get('S2'))}
+            {pivot_row('S3', fib_piv.get('S3'))}
+        </table>
+        </div>
+
+        <!-- Camarilla -->
+        <div class="wo-piv-panel" id="wo-piv-camarilla">
+        <table class="wo-tbl">
+            <tr><th>Level</th><th>Price</th><th>Distance from Spot</th></tr>
+            {pivot_row('R4', cam.get('R4'))}
+            {pivot_row('R3', cam.get('R3'))}
+            {pivot_row('R2', cam.get('R2'))}
+            {pivot_row('R1', cam.get('R1'))}
+            {pivot_row('PP (Pivot)', cam.get('PP'))}
+            {pivot_row('S1', cam.get('S1'))}
+            {pivot_row('S2', cam.get('S2'))}
+            {pivot_row('S3', cam.get('S3'))}
+            {pivot_row('S4', cam.get('S4'))}
+        </table>
+        </div>
+    </div>
+
+    <!-- ══ FIBONACCI RETRACEMENT ══ -->
+    <div class="wo-card">
+        <div class="wo-title">
+            <svg viewBox="0 0 16 16"><polyline points="2,13 6,5 10,9 14,3"/></svg>
+            FIBONACCI RETRACEMENT (20-DAY SWING)
+        </div>
+        <div style="font-size:14px;color:#b0bec5;margin-bottom:12px;">
+            Swing High: <span style="color:#34d399;font-weight:700;">{fmt(fib.get('swing_high'))}</span> &nbsp;·&nbsp;
+            Swing Low: <span style="color:#f87171;font-weight:700;">{fmt(fib.get('swing_low'))}</span>
+        </div>
+        <table class="wo-tbl">
+            <tr><th>Level</th><th>Price</th><th>Distance from Spot</th></tr>
+            {pivot_row('23.6%', fib.get('23.6'))}
+            {pivot_row('38.2%', fib.get('38.2'))}
+            {pivot_row('50.0%', fib.get('50.0'))}
+            {pivot_row('61.8%', fib.get('61.8'))}
+            {pivot_row('78.6%', fib.get('78.6'))}
+        </table>
+    </div>
+
+    <!-- ══ CONFLUENCE CLUSTERS ══ -->
+    <div class="wo-card">
+        <div class="wo-title">
+            <svg viewBox="0 0 16 16"><circle cx="5" cy="8" r="3"/><circle cx="11" cy="8" r="3"/></svg>
+            LEVEL CONFLUENCE CLUSTERS
+        </div>
+        <div style="font-size:13px;color:#b0bec5;margin-bottom:12px;">
+            Levels within 50 pts are grouped. More confluences = stronger zone.
+        </div>
+        <table class="wo-tbl">
+            <tr><th>Zone</th><th>Price</th><th>Strength</th><th>Confluences</th></tr>"""
+
+    # Add resistance clusters (above price)
+    for cl in (cl_bull[:5] if cl_bull else []):
+        html += f"""
+            <tr>
+                <td style="color:#f87171;font-weight:600;">Resistance</td>
+                <td style="font-family:'JetBrains Mono',monospace;color:#e0f7fa;font-weight:700;">{fmt(cl['value'])}</td>
+                <td>{strength_badge(cl['strength'])}</td>
+                <td>{confluence_tags(cl['labels'])}</td>
+            </tr>"""
+    # Current price row
+    html += f"""
+            <tr style="background:rgba(0,229,255,0.06);">
+                <td style="color:#00e5ff;font-weight:700;">▶ CURRENT</td>
+                <td style="font-family:'JetBrains Mono',monospace;color:#00e5ff;font-weight:700;">{fmt(cp)}</td>
+                <td></td><td></td>
+            </tr>"""
+    # Add support clusters (below price)
+    for cl in (cl_bear[:5] if cl_bear else []):
+        html += f"""
+            <tr>
+                <td style="color:#34d399;font-weight:600;">Support</td>
+                <td style="font-family:'JetBrains Mono',monospace;color:#e0f7fa;font-weight:700;">{fmt(cl['value'])}</td>
+                <td>{strength_badge(cl['strength'])}</td>
+                <td>{confluence_tags(cl['labels'])}</td>
+            </tr>"""
+
+    html += """
+        </table>
+    </div>
+
+    <!-- ══ HOW TO READ ══ -->
+    <div class="wo-card" style="border-color:rgba(79,195,247,0.08);">
+        <div class="wo-title" style="color:#80deea;">
+            <svg viewBox="0 0 16 16"><circle cx="8" cy="8" r="6"/><line x1="8" y1="5" x2="8" y2="8.5"/><circle cx="8" cy="11" r="0.6" fill="currentColor"/></svg>
+            HOW TO READ THIS TAB
+        </div>
+        <div style="font-size:14px;color:#b0bec5;line-height:2.0;">
+            <b style="color:#4dd0e1;">Scenario Cards:</b> If the bias is BUY → check Bullish targets. SELL → check Bearish targets. SIDEWAYS → expect price to stay within the neutral range.<br>
+            <b style="color:#4dd0e1;">Confluence Map:</b> Larger, brighter dots = zones where 3+ independent methods agree (e.g., Pivot R1 + Fibonacci 38.2% + OI Wall all near the same price). These are the highest-conviction levels.<br>
+            <b style="color:#4dd0e1;">STRONG Zones:</b> 3+ confluences — price is very likely to stall here. <b style="color:#e0e0e0;">MODERATE:</b> 2 confluences. <b style="color:#e0e0e0;">WEAK:</b> single indicator only.<br>
+            <b style="color:#4dd0e1;">Pivot Types:</b> Classic is the most widely used. Fibonacci adds golden-ratio precision. Camarilla is best for intraday reversal points.<br>
+            <b style="color:#4dd0e1;">Weekly Range (ATR/VIX):</b> The market is expected to move within ± this many points from the current price over the week. If price hits this boundary, expect a slowdown.
+        </div>
+    </div>
+
+    <script>
+    function switchWoPiv(panel, btn) {
+        document.querySelectorAll('.wo-piv-panel').forEach(function(p){ p.classList.remove('active'); });
+        document.querySelectorAll('.wo-piv-btn').forEach(function(b){ b.classList.remove('active'); });
+        var el = document.getElementById('wo-piv-' + panel);
+        if (el) el.classList.add('active');
+        if (btn) btn.classList.add('active');
+    }
+    </script>
+
+    </div><!-- /tab-weekly -->
+"""
+    return html
 
 
-# =================================================================
-#  SECTION 1 -- NSE OPTION CHAIN FETCHER
-# =================================================================
+def build_heatmap_tab_html(heatmap_data, timestamp, advance, decline, neutral):
+    """
+    Builds the complete HTML for the BankNifty Heatmap tab.
+    Embedded as JSON in <script> — fully dynamic on client side.
+    Also includes High Weightage Movers table and Intraday OI Change chart.
+    """
+    # Serialize heatmap data to JSON for embedding
+    hm_json = json.dumps(heatmap_data, ensure_ascii=False)
 
-class NSEOptionChain:
-    # symbol: "BANKNIFTY" or "FINNIFTY"
-    # BankNifty: lot=30, expiry=last Tuesday of month
-    # FinNifty:  lot=40, expiry=last Tuesday of month (same cycle)
-    INSTRUMENT_CONFIG = {
-        "BANKNIFTY": {
-            "lot_size": 30,
-            "yf_ticker": "^NSEBANK",
-            "display_name": "BankNifty",
-            "expiry_type": "last_tuesday",   # last Tuesday of month
-        },
-        "FINNIFTY": {
-            "lot_size": 60,
-            "yf_ticker": "^CNXFIN",
-            "display_name": "FinNifty",
-            "expiry_type": "last_tuesday",   # last Tuesday of month
-        },
+    # High weightage movers in fixed Nifty weight order
+    hw_lookup = {r['symbol']: r for r in heatmap_data if r['high_wt']}
+    hw_sorted = [hw_lookup[sym] for sym in HIGH_WEIGHTAGE_ORDER if sym in hw_lookup]
+    hw_rows_html = ""
+    for s in hw_sorted:
+        chg_col = "#00e676" if s['change_pct'] >= 0 else "#ff5252"
+        sign    = "+" if s['change_pct'] >= 0 else ""
+        hw_rows_html += f"""
+                <tr>
+                    <td class="hm-mover-sym">{s['symbol']}</td>
+                    <td class="hm-mover-prev">₹{s['prev_close']:,.2f}</td>
+                    <td class="hm-mover-price">₹{s['price']:,.2f}</td>
+                    <td class="hm-mover-chg" style="color:{chg_col};">{sign}{s['change_pct']:.2f}%</td>
+                </tr>"""
+
+    total = advance + decline + neutral or 1
+    adv_pct = round(advance / total * 100, 1)
+    dec_pct = round(decline / total * 100, 1)
+
+    return f"""
+    <!-- TAB 4: BANKNIFTY ANALYSIS -->
+    <div class="tab-panel" id="tab-heatmap">
+      <div class="section">
+        <div class="section-title">
+          <span>🟩</span> BANKNIFTY ANALYSIS
+          <span style="font-size:10px;color:rgba(128,222,234,0.35);font-weight:400;margin-left:auto;display:flex;flex-direction:column;align-items:flex-end;gap:3px;">
+            <span>Stock data as of: {timestamp}</span>
+            <span style="font-size:9px;color:rgba(239,68,68,0.45);letter-spacing:0.5px;">⟳ OI chart auto-refreshes · Stock tiles update on script re-run</span>
+          </span>
+        </div>
+
+        <!-- Breadth Strip -->
+        <div class="hm-breadth-strip">
+          <div class="hm-bs-left">
+            <div class="hm-bs-stat hm-bs-adv">
+              <div class="hm-bs-num" id="hmAdvCount">{advance}</div>
+              <div class="hm-bs-lbl">ADVANCE</div>
+            </div>
+            <div class="hm-bs-stat hm-bs-dec">
+              <div class="hm-bs-num" id="hmDecCount">{decline}</div>
+              <div class="hm-bs-lbl">DECLINE</div>
+            </div>
+            <div class="hm-bs-stat hm-bs-neu">
+              <div class="hm-bs-num" id="hmNeuCount">{neutral}</div>
+              <div class="hm-bs-lbl">NEUTRAL</div>
+            </div>
+          </div>
+          <div class="hm-bs-donut-wrap">
+            <canvas id="hmDonutCanvas" width="110" height="110"></canvas>
+            <div class="hm-bs-donut-center">
+              <div class="hm-bs-donut-num">50</div>
+              <div class="hm-bs-donut-sub">STOCKS</div>
+            </div>
+          </div>
+          <div class="hm-bs-right">
+            <div class="hm-breadth-label" style="font-size:11px;color:rgba(128,222,234,0.5);margin-bottom:8px;letter-spacing:1px;">MARKET BREADTH</div>
+            <div class="hm-breadth-row">
+              <span class="hm-br-dot" style="background:#00e676;"></span>
+              <span class="hm-br-label">Advancing</span>
+              <div class="hm-br-bar-wrap"><div class="hm-br-bar" style="width:{adv_pct}%;background:linear-gradient(90deg,#00e676,#00bfa5);"></div></div>
+              <span class="hm-br-val" style="color:#00e676;">{advance}</span>
+            </div>
+            <div class="hm-breadth-row">
+              <span class="hm-br-dot" style="background:#ff5252;"></span>
+              <span class="hm-br-label">Declining</span>
+              <div class="hm-br-bar-wrap"><div class="hm-br-bar" style="width:{dec_pct}%;background:linear-gradient(90deg,#ff5252,#d50000);"></div></div>
+              <span class="hm-br-val" style="color:#ff5252;">{decline}</span>
+            </div>
+            <div class="hm-breadth-row">
+              <span class="hm-br-dot" style="background:#78909c;"></span>
+              <span class="hm-br-label">Neutral</span>
+              <div class="hm-br-bar-wrap"><div class="hm-br-bar" style="width:2%;background:#546e7a;"></div></div>
+              <span class="hm-br-val" style="color:#9ab0bc;">{neutral}</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Heatmap Grid -->
+        <div class="hm-grid" id="hmGrid">
+          <!-- Populated by JS -->
+        </div>
+
+        <!-- Color Legend -->
+        <div class="hm-legend">
+          <div style="font-size:9px;letter-spacing:2px;color:rgba(128,222,234,0.4);text-transform:uppercase;font-weight:700;margin-bottom:8px;">COLOR SCALE</div>
+          <div class="hm-legend-bar">
+            <span class="hm-leg-txt" style="color:#d50000;">≤ -2%</span>
+            <div class="hm-leg-gradient"></div>
+            <span class="hm-leg-txt" style="color:#00e676;">≥ +2%</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- High Weightage Movers + OI Chart (2-col) -->
+      <div class="section">
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:24px;align-items:start;">
+
+          <!-- High Weightage Movers Table -->
+          <div>
+            <div class="section-title" style="border-bottom:1px solid rgba(79,195,247,0.18);padding-bottom:10px;margin-bottom:14px;">
+              <span>⚖️</span> HIGH WEIGHTAGE MOVERS
+            </div>
+            <div class="hm-mover-wrap">
+              <table class="hm-mover-table">
+                <thead>
+                  <tr>
+                    <th style="text-align:left;">SYMBOL</th>
+                    <th>PREV CLOSE</th>
+                    <th>PRICE</th>
+                    <th>% CHG</th>
+                  </tr>
+                </thead>
+                <tbody id="hmMoverBody">
+                  {hw_rows_html}
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <!-- Intraday OI Change Chart (mini) -->
+          <div>
+            <div class="section-title" style="border-bottom:1px solid rgba(79,195,247,0.18);padding-bottom:10px;margin-bottom:14px;">
+              <span>⚡</span> INTRADAY OI CHANGE
+              <span id="hmOIPCR" style="margin-left:auto;font-family:'JetBrains Mono',monospace;font-size:11px;color:rgba(128,222,234,0.5);">PCR: —</span>
+            </div>
+            <div style="display:flex;gap:10px;margin-bottom:8px;">
+              <button class="hm-idx-btn active" id="hmBtnNifty" onclick="setHMIndex('nifty',this)">NIFTY</button>
+              <button class="hm-idx-btn" id="hmBtnBankNifty" onclick="setHMIndex('banknifty',this)">BANKNIFTY</button>
+            </div>
+            <div class="hm-oi-chart-wrap">
+              <canvas id="hmOICanvas" width="420" height="200"></canvas>
+            </div>
+            <div style="display:flex;gap:16px;margin-top:8px;">
+              <div style="display:flex;align-items:center;gap:6px;font-size:10px;color:rgba(176,190,197,0.5);">
+                <span style="display:inline-block;width:24px;height:2px;background:#ef4444;border-radius:1px;"></span> Call OI Change
+              </div>
+              <div style="display:flex;align-items:center;gap:6px;font-size:10px;color:rgba(176,190,197,0.5);">
+                <span style="display:inline-block;width:24px;height:2px;background:#10b981;border-radius:1px;"></span> Put OI Change
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Heatmap data embedded as JSON for JS rendering -->
+      <script id="hmDataScript" type="application/json">{hm_json}</script>
+    </div><!-- /tab-heatmap -->
+"""
+
+
+def get_heatmap_javascript():
+    """Returns the JavaScript for the heatmap tab rendering."""
+    return """
+/* ════════════════════════════════════════════════════════════════
+   BANKNIFTY ANALYSIS — client-side rendering engine
+   Data loaded from embedded JSON, refreshed on silent page reload
+   ════════════════════════════════════════════════════════════════ */
+(function() {
+    var _hmIndex = 'nifty';
+
+    function getColor(pct) {
+        var capped = Math.max(-3, Math.min(3, pct));
+        if (pct === 0) return { bg: 'rgba(55,65,81,0.8)', border: 'rgba(100,116,139,0.4)', text: '#94a3b8' };
+        if (pct > 0) {
+            var intensity = Math.min(1, pct / 2.5);
+            var r = Math.round(0   + (0   - 0)   * intensity);
+            var g = Math.round(180 + (230 - 180) * intensity);
+            var b = Math.round(80  + (118 - 80)  * intensity);
+            var a = 0.25 + intensity * 0.55;
+            return {
+                bg:     'rgba(' + r + ',' + g + ',' + b + ',' + a + ')',
+                border: 'rgba(' + r + ',' + g + ',' + b + ',0.5)',
+                text:   pct > 1.5 ? '#fff' : '#a7f3d0'
+            };
+        } else {
+            var intensity = Math.min(1, Math.abs(pct) / 2.5);
+            var r = Math.round(220 + (239 - 220) * intensity);
+            var g = Math.round(50  + (68  - 50)  * intensity);
+            var b = Math.round(50  + (68  - 50)  * intensity);
+            var a = 0.25 + intensity * 0.55;
+            return {
+                bg:     'rgba(' + r + ',' + g + ',' + b + ',' + a + ')',
+                border: 'rgba(' + r + ',' + g + ',' + b + ',0.5)',
+                text:   Math.abs(pct) > 1.5 ? '#fff' : '#fca5a5'
+            };
+        }
     }
 
-    def __init__(self, symbol="BANKNIFTY"):
-        self.symbol = symbol
-        cfg = self.INSTRUMENT_CONFIG.get(symbol, self.INSTRUMENT_CONFIG["BANKNIFTY"])
-        self.lot_size    = cfg["lot_size"]
-        self.yf_ticker   = cfg["yf_ticker"]
-        self.display_name = cfg["display_name"]
+    // Full BankNifty weight order — descending by approximate index weight
+    var NIFTY_WEIGHT_ORDER = [
+        "HDFCBANK","RELIANCE","ICICIBANK","INFY","TCS",
+        "BHARTIARTL","LT","AXISBANK","SBIN","KOTAKBANK",
+        "BAJFINANCE","HINDUNILVR","MARUTI","SUNPHARMA","HCLTECH",
+        "TITAN","WIPRO","NTPC","M&M","ONGC",
+        "ULTRACEMCO","POWERGRID","TATAMOTORS","COALINDIA","ADANIPORTS",
+        "BAJAJ-AUTO","BAJAJFINSV","ETERNAL","GRASIM","ITC",
+        "JSWSTEEL","TATACONSUM","TATASTEEL","TECHM","DRREDDY",
+        "CIPLA","HINDALCO","EICHERMOT","SBILIFE","HDFCLIFE",
+        "JIOFIN","HEROMOTOCO","TRENT","MAXHEALTH","INDIGO",
+        "NESTLEIND","ASIANPAINT","SHRIRAMFIN","BEL","APOLLOHOSP"
+    ];
 
-    def _make_session(self):
+    function renderHeatmap() {
+    var el = document.getElementById('hmDataScript');
+    var grid = document.getElementById('hmGrid');
+    if (!el || !grid) {
+        console.warn('HM: elements missing after refresh');
+        return;
+    }
+    var rawText = el.textContent || el.innerHTML || el.innerText || '';
+    if (!rawText || rawText.trim() === '') {
+        console.warn('HM: empty data script');
+        return;
+    }
+    var data;
+    try { data = JSON.parse(rawText); }
+    catch(e) { console.warn('HM parse error:', e); return; }
+
+        // Sort by Nifty index weight (descending) — unknowns go to end
+        var weightIndex = {};
+        NIFTY_WEIGHT_ORDER.forEach(function(sym, i){ weightIndex[sym] = i; });
+        data = data.slice().sort(function(a, b) {
+            var ai = weightIndex[a.symbol] !== undefined ? weightIndex[a.symbol] : 999;
+            var bi = weightIndex[b.symbol] !== undefined ? weightIndex[b.symbol] : 999;
+            return ai - bi;
+        });
+
+        var html = '';
+        data.forEach(function(s) {
+            var c    = getColor(s.change_pct);
+            var sign = s.change_pct >= 0 ? '+' : '';
+            var hwBorder = s.high_wt ? '2px solid rgba(79,195,247,0.6)' : ('1px solid ' + c.border);
+            var priceStr = s.price > 0 ? '₹' + s.price.toLocaleString('en-IN') : '—';
+            html += '<div class="hm-cell" style="background:' + c.bg + ';border:' + hwBorder + ';color:' + c.text + ';"'
+                  + ' title="' + s.symbol + ' | Prev: ₹' + s.prev_close + ' | Price: ₹' + s.price + ' | Chg: ' + sign + s.change_pct + '%">'
+                  + '<div class="hm-cell-sym">' + s.symbol + '</div>'
+                  + '<div class="hm-cell-price">' + priceStr + '</div>'
+                  + '<div class="hm-cell-chg">' + sign + s.change_pct.toFixed(2) + '%</div>'
+                  + '</div>';
+        });
+        grid.innerHTML = html;
+
+        // Update breadth counters
+        var adv = data.filter(function(s){ return s.change_pct > 0; }).length;
+        var dec = data.filter(function(s){ return s.change_pct < 0; }).length;
+        var neu = data.filter(function(s){ return s.change_pct === 0; }).length;
+        var e;
+        e = document.getElementById('hmAdvCount'); if(e) e.textContent = adv;
+        e = document.getElementById('hmDecCount'); if(e) e.textContent = dec;
+        e = document.getElementById('hmNeuCount'); if(e) e.textContent = neu;
+
+        // Update mover table
+        // Update mover table — fixed Nifty weight order
+        var WEIGHT_ORDER = [
+            "RELIANCE","HDFCBANK","ICICIBANK","INFY","TCS",
+            "BHARTIARTL","LT","AXISBANK","KOTAKBANK","SBIN"
+        ];
+        var hwLookup = {};
+        data.forEach(function(s){ if(s.high_wt) hwLookup[s.symbol] = s; });
+        var hwStocks = WEIGHT_ORDER.map(function(sym){ return hwLookup[sym]; }).filter(Boolean);
+        var moverBody = document.getElementById('hmMoverBody');
+        if (moverBody) {
+            var mhtml = '';
+            hwStocks.forEach(function(s) {
+                var col  = s.change_pct >= 0 ? '#00e676' : '#ff5252';
+                var sign = s.change_pct >= 0 ? '+' : '';
+                mhtml += '<tr>'
+                       + '<td class="hm-mover-sym">' + s.symbol + '</td>'
+                       + '<td class="hm-mover-prev">₹' + s.prev_close.toLocaleString('en-IN') + '</td>'
+                       + '<td class="hm-mover-price">₹' + s.price.toLocaleString('en-IN') + '</td>'
+                       + '<td class="hm-mover-chg" style="color:' + col + ';">' + sign + s.change_pct.toFixed(2) + '%</td>'
+                       + '</tr>';
+            });
+            moverBody.innerHTML = mhtml;
+        }
+
+        drawDonut(adv, dec, neu);
+    }
+
+    function drawDonut(adv, dec, neu) {
+        var canvas = document.getElementById('hmDonutCanvas');
+        if (!canvas || !canvas.getContext) return;
+        var ctx = canvas.getContext('2d');
+        var cx = 55, cy = 55, r = 40, lw = 10;
+        ctx.clearRect(0, 0, 110, 110);
+        var total = adv + dec + neu || 1;
+        var slices = [
+            { val: adv, color: '#00e676' },
+            { val: dec, color: '#ef4444' },
+            { val: neu, color: '#546e7a' },
+        ];
+        var start = -Math.PI / 2;
+        slices.forEach(function(sl) {
+            if (!sl.val) return;
+            var sweep = (sl.val / total) * 2 * Math.PI;
+            ctx.beginPath();
+            ctx.arc(cx, cy, r, start, start + sweep);
+            ctx.strokeStyle = sl.color;
+            ctx.lineWidth = lw;
+            ctx.stroke();
+            start += sweep;
+        });
+        // center text handled by CSS overlay
+    }
+
+    /* ── OI Chart from oi_log_banknifty.json ────────────────────────────── */
+    function drawHMOIChart(data) {
+        var canvas = document.getElementById('hmOICanvas');
+        if (!canvas || !canvas.getContext) return;
+        var ctx = canvas.getContext('2d');
+        var W = canvas.parentElement ? canvas.parentElement.clientWidth - 32 : 420;
+        var H = 200;
+        canvas.width = W; canvas.height = H;
+        ctx.clearRect(0, 0, W, H);
+        if (!data || data.length < 2) {
+            ctx.fillStyle = 'rgba(128,222,234,0.2)';
+            ctx.font = '11px JetBrains Mono, monospace';
+            ctx.textAlign = 'center';
+            ctx.fillText('Loading OI data…', W/2, H/2);
+            return;
+        }
+        var reversed = data.slice().reverse();
+        var ceArr    = reversed.map(function(r){ return r.call_oi_chg || 0; });
+        var peArr    = reversed.map(function(r){ return r.put_oi_chg  || 0; });
+        var allVals  = ceArr.concat(peArr);
+        var minV = Math.min.apply(null, allVals);
+        var maxV = Math.max.apply(null, allVals);
+        var range = (maxV - minV) || 1;
+        var pad = 14;
+        function toX(i) { return (i / (ceArr.length - 1)) * (W - 2*pad) + pad; }
+        function toY(v) { return H - ((v - minV) / range) * (H - 2*pad) - pad; }
+
+        // Zero line
+        ctx.save();
+        ctx.strokeStyle = 'rgba(79,195,247,0.12)';
+        ctx.lineWidth = 1;
+        ctx.setLineDash([4, 4]);
+        var zy = toY(0);
+        ctx.beginPath(); ctx.moveTo(pad, zy); ctx.lineTo(W-pad, zy); ctx.stroke();
+        ctx.restore();
+
+        // Draw CE (red)
+        ctx.strokeStyle = '#ef4444'; ctx.lineWidth = 2; ctx.lineJoin = 'round';
+        ctx.beginPath();
+        ceArr.forEach(function(v, i){ i===0 ? ctx.moveTo(toX(i),toY(v)) : ctx.lineTo(toX(i),toY(v)); });
+        ctx.stroke();
+
+        // Draw PE (green)
+        ctx.strokeStyle = '#10b981'; ctx.lineWidth = 2; ctx.lineJoin = 'round';
+        ctx.beginPath();
+        peArr.forEach(function(v, i){ i===0 ? ctx.moveTo(toX(i),toY(v)) : ctx.lineTo(toX(i),toY(v)); });
+        ctx.stroke();
+
+        // Time labels on x-axis (every ~5th point)
+        ctx.fillStyle = 'rgba(128,222,234,0.3)';
+        ctx.font = '8px JetBrains Mono, monospace';
+        ctx.textAlign = 'center';
+        var step = Math.max(1, Math.floor(reversed.length / 6));
+        for (var i = 0; i < reversed.length; i += step) {
+            ctx.fillText(reversed[i].time || '', toX(i), H - 2);
+        }
+    }
+
+    window.setHMIndex = function(idx, btn) {
+        _hmIndex = idx;
+        document.querySelectorAll('.hm-idx-btn').forEach(function(b){ b.classList.remove('active'); });
+        btn.classList.add('active');
+        // Re-draw with same data (different index would need separate fetch)
+        if (window._oiData && window._oiData.length) drawHMOIChart(window._oiData);
+    };
+
+    /* Called on tab switch or page load */
+    window.renderHeatmap = renderHeatmap;
+
+    window.addEventListener('load', function() {
+    setTimeout(renderHeatmap, 100);
+    setTimeout(renderHeatmap, 500);
+    setTimeout(renderHeatmap, 1500);
+    setTimeout(function() {
+        if (window._oiData && window._oiData.length) drawHMOIChart(window._oiData);
+    }, 800);
+});
+
+    // Hook into loadOILog to also refresh OI chart
+    var _origRenderOI = window.renderOITable;
+
+    /* After oi_log loads, also draw heatmap OI chart */
+    var _origLoad = window.loadOILog;
+    function patchedLoadOILog() {
+        fetch('oi_log_banknifty.json?_t=' + Date.now(), {cache:'no-store'})
+            .then(function(r){ return r.json(); })
+            .then(function(data) {
+                if (Array.isArray(data) && data.length) {
+                    window._oiData = data;
+                    drawHMOIChart(data);
+                    var pcr = data[0] && data[0].pcr ? data[0].pcr : null;
+                    var el = document.getElementById('hmOIPCR');
+                    if (el && pcr) el.textContent = 'PCR: ' + pcr;
+                }
+            })
+            .catch(function(){});
+    }
+
+    // Run OI chart draw periodically
+    setInterval(function() {
+    patchedLoadOILog();
+    renderHeatmap();
+}, 30000);
+
+// Initial draw
+setTimeout(patchedLoadOILog, 1200);
+setTimeout(renderHeatmap, 800);
+setTimeout(renderHeatmap, 2000);
+})();
+"""
+
+
+def get_heatmap_css():
+    """Returns the CSS for the heatmap tab."""
+    return """
+        /* ══ BANKNIFTY ANALYSIS ═══════════════════════════════════════ */
+        .hm-breadth-strip{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:20px;background:rgba(6,13,20,0.7);border:1px solid rgba(79,195,247,0.14);border-radius:14px;padding:20px 24px;margin-bottom:20px;}
+        .hm-bs-left{display:flex;gap:24px;align-items:center;}
+        .hm-bs-stat{text-align:center;}
+        .hm-bs-num{font-family:'Orbitron',monospace;font-size:clamp(26px,4vw,36px);font-weight:900;line-height:1;}
+        .hm-bs-adv .hm-bs-num{color:#00e676;text-shadow:0 0 20px rgba(0,230,118,0.5);}
+        .hm-bs-dec .hm-bs-num{color:#ff5252;text-shadow:0 0 20px rgba(255,82,82,0.5);}
+        .hm-bs-neu .hm-bs-num{color:#9ab0bc;}
+        .hm-bs-lbl{font-size:9px;letter-spacing:2.5px;color:rgba(176,190,197,0.4);text-transform:uppercase;font-weight:700;margin-top:4px;}
+        .hm-bs-donut-wrap{position:relative;width:110px;height:110px;flex-shrink:0;}
+        .hm-bs-donut-center{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);text-align:center;}
+        .hm-bs-donut-num{font-family:'Orbitron',monospace;font-size:20px;font-weight:900;color:#e0f7fa;}
+        .hm-bs-donut-sub{font-size:8px;letter-spacing:2px;color:rgba(128,222,234,0.4);text-transform:uppercase;}
+        .hm-bs-right{flex:1;min-width:200px;}
+        .hm-breadth-label{font-size:11px;color:rgba(128,222,234,0.5);margin-bottom:8px;letter-spacing:1px;}
+        .hm-breadth-row{display:flex;align-items:center;gap:8px;margin-bottom:10px;}
+        .hm-br-dot{width:8px;height:8px;border-radius:50%;flex-shrink:0;}
+        .hm-br-label{font-size:10px;color:rgba(176,190,197,0.5);width:70px;flex-shrink:0;}
+        .hm-br-bar-wrap{flex:1;height:4px;background:rgba(0,0,0,0.35);border-radius:2px;overflow:hidden;}
+        .hm-br-bar{height:100%;border-radius:2px;transition:width 1s ease;}
+        .hm-br-val{font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:700;width:20px;text-align:right;flex-shrink:0;}
+        .hm-grid{display:grid;grid-template-columns:repeat(10,minmax(0,1fr));gap:6px;margin-bottom:16px;}
+        .hm-cell{border-radius:10px;padding:10px 8px;cursor:default;transition:all 0.2s ease;position:relative;overflow:hidden;display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:72px;text-align:center;}
+        .hm-cell:hover{transform:scale(1.06);z-index:10;box-shadow:0 8px 24px rgba(0,0,0,0.5);filter:brightness(1.15);}
+        .hm-cell-sym{font-family:'Oxanium',sans-serif;font-size:clamp(8px,1.2vw,11px);font-weight:700;letter-spacing:0.3px;line-height:1.2;word-break:break-word;}
+        .hm-cell-price{font-family:'JetBrains Mono',monospace;font-size:clamp(7px,0.9vw,9px);opacity:0.75;margin-top:3px;font-weight:600;}
+        .hm-cell-chg{font-family:'Oxanium',sans-serif;font-size:clamp(9px,1.2vw,12px);font-weight:800;margin-top:2px;letter-spacing:0.3px;}
+        .hm-legend{display:flex;flex-direction:column;align-items:center;margin-bottom:4px;}
+        .hm-legend-bar{display:flex;align-items:center;gap:12px;width:100%;max-width:400px;}
+        .hm-leg-gradient{flex:1;height:10px;border-radius:5px;background:linear-gradient(90deg,#b91c1c,#ef4444,#374151,#10b981,#065f46);}
+        .hm-leg-txt{font-family:'JetBrains Mono',monospace;font-size:10px;font-weight:700;}
+        .hm-mover-wrap{background:rgba(6,13,20,0.7);border:1px solid rgba(79,195,247,0.14);border-radius:12px;overflow:hidden;}
+        .hm-mover-table{width:100%;border-collapse:collapse;font-family:'JetBrains Mono',monospace;}
+        .hm-mover-table thead th{padding:10px 14px;font-size:9px;letter-spacing:2px;color:rgba(128,222,234,0.45);text-transform:uppercase;font-weight:700;text-align:right;border-bottom:1px solid rgba(79,195,247,0.15);background:rgba(79,195,247,0.05);}
+        .hm-mover-table thead th:first-child{text-align:left;}
+        .hm-mover-table tbody tr{border-bottom:1px solid rgba(79,195,247,0.06);transition:background 0.15s;}
+        .hm-mover-table tbody tr:hover{background:rgba(79,195,247,0.05);}
+        .hm-mover-table tbody td{padding:9px 14px;font-size:12px;text-align:right;color:#c8d8e0;}
+        .hm-mover-sym{text-align:left!important;color:#e0f7fa!important;font-weight:700;}
+        .hm-mover-prev{color:#8faabe!important;}
+        .hm-mover-price{color:#4fc3f7!important;font-weight:600;}
+        .hm-mover-chg{font-weight:700;}
+        .hm-oi-chart-wrap{background:rgba(6,13,20,0.7);border:1px solid rgba(79,195,247,0.14);border-radius:12px;padding:14px;overflow:hidden;}
+        .hm-idx-btn{padding:7px 18px;font-family:'Oxanium',sans-serif;font-size:11px;font-weight:700;letter-spacing:2px;color:rgba(176,190,197,0.5);background:transparent;border:1px solid rgba(79,195,247,0.2);border-radius:8px;cursor:pointer;transition:all 0.2s ease;}
+        .hm-idx-btn:hover{color:#4fc3f7;border-color:rgba(79,195,247,0.5);background:rgba(79,195,247,0.08);}
+        .hm-idx-btn.active{color:#00e5ff;border-color:rgba(79,195,247,0.6);background:rgba(79,195,247,0.15);box-shadow:0 0 10px rgba(79,195,247,0.1);}
+        @media(max-width:900px){.hm-grid{grid-template-columns:repeat(7,minmax(0,1fr));}}
+        @media(max-width:600px){
+          .hm-grid{grid-template-columns:repeat(5,minmax(0,1fr));gap:4px;}
+          .hm-cell{min-height:58px;padding:8px 4px;}
+          .hm-breadth-strip{flex-direction:column;align-items:flex-start;}
+          div[style*="grid-template-columns:1fr 1fr"]{grid-template-columns:1fr!important;}
+          .hm-bs-donut-wrap{align-self:center;}
+        }
+        @media(max-width:400px){.hm-grid{grid-template-columns:repeat(4,minmax(0,1fr));}}
+"""
+
+
+def _last_5_trading_days():
+    ist_off = timedelta(hours=5, minutes=30)
+    today   = (datetime.utcnow() + ist_off).date()
+    days, d = [], today - timedelta(days=1)
+    while len(days) < 10:
+        if d.weekday() < 5:
+            days.append(d)
+        d -= timedelta(days=1)
+    days.reverse()
+    return days
+
+def _parse_nse_fiidii(raw):
+    if not isinstance(raw, list) or not raw:
+        return []
+    days = []
+    for row in raw[:15]:
+        try:
+            dt_obj  = datetime.strptime(row.get("date", ""), "%d-%b-%Y")
+            fii_net = float(row.get("fiiBuyValue",0) or 0) - float(row.get("fiiSellValue",0) or 0)
+            dii_net = float(row.get("diiBuyValue",0) or 0) - float(row.get("diiSellValue",0) or 0)
+            days.append({'date': dt_obj.strftime("%b %d"), 'day': dt_obj.strftime("%a"),
+                         'fii': round(fii_net,2), 'dii': round(dii_net,2)})
+        except Exception:
+            continue
+    if len(days) < 3:
+        return []
+    days = days[:10]
+    days.reverse()
+    return days
+
+def _fetch_from_groww():
+    try:
+        from bs4 import BeautifulSoup
+        import requests as _req
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": "https://groww.in/",
+        }
+        resp = _req.get("https://groww.in/fii-dii-data", headers=headers, timeout=15)
+        if resp.status_code != 200:
+            print(f"  ⚠️  Groww HTTP {resp.status_code}"); return []
+        soup  = BeautifulSoup(resp.text, "html.parser")
+        table = soup.find("table")
+        if not table:
+            print("  ⚠️  Groww: table not found"); return []
+        rows  = table.find_all("tr")
+        days  = []
+        for row in rows[1:]:
+            cols = [td.get_text(strip=True) for td in row.find_all("td")]
+            if len(cols) < 7: continue
+            try:
+                dt_obj  = datetime.strptime(cols[0], "%d %b %Y")
+                fii_net = float(cols[3].replace(",","").replace("+",""))
+                dii_net = float(cols[6].replace(",","").replace("+",""))
+                days.append({'date': dt_obj.strftime("%b %d"), 'day': dt_obj.strftime("%a"),
+                             'fii': round(fii_net,2), 'dii': round(dii_net,2)})
+            except Exception:
+                continue
+            if len(days) == 10: break
+        if len(days) >= 3:
+            days.reverse()
+            print(f"  ✅ FII/DII from Groww: {days[0]['date']} → {days[-1]['date']}")
+            return days
+        return []
+    except Exception as e:
+        print(f"  ⚠️  Groww scrape failed: {e}"); return []
+
+def _fetch_from_nse_curl():
+    try:
+        from curl_cffi import requests as curl_req
         headers = {
             "authority": "www.nseindia.com",
             "accept": "application/json, text/plain, */*",
             "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+            "referer": "https://www.nseindia.com/reports/fii-dii",
+            "accept-language": "en-US,en;q=0.9",
+        }
+        s = curl_req.Session()
+        s.get("https://www.nseindia.com/", headers=headers, impersonate="chrome", timeout=12)
+        time.sleep(1.2)
+        s.get("https://www.nseindia.com/reports/fii-dii", headers=headers, impersonate="chrome", timeout=12)
+        time.sleep(0.8)
+        resp = s.get("https://www.nseindia.com/api/fiidiiTradeReact", headers=headers, impersonate="chrome", timeout=20)
+        if resp.status_code == 200:
+            days = _parse_nse_fiidii(resp.json())
+            if days:
+                print(f"  ✅ FII/DII from NSE (curl_cffi): {days[0]['date']} → {days[-1]['date']}")
+                return days
+    except Exception as e:
+        print(f"  ⚠️  NSE curl_cffi failed: {e}")
+    return []
+
+def fetch_fii_dii_data():
+    days = _fetch_from_groww()
+    if days: return days
+    days = _fetch_from_nse_curl()
+    if days: return days
+    print("  📌 FII/DII: using date-corrected fallback")
+    tdays = _last_5_trading_days()
+    placeholder = [
+        (-1540.20,2103.50),(823.60,891.40),(-411.80,1478.30),(69.45,1174.21),(-972.13,1666.98),
+        (-2103.40,1845.60),(1245.30,2340.10),(-876.50,1923.40),(432.80,1654.20),(-1120.60,2010.80)
+    ]
+    return [{'date': d.strftime('%b %d'), 'day': d.strftime('%a'),
+             'fii': placeholder[i][0], 'dii': placeholder[i][1], 'fallback': True}
+            for i, d in enumerate(tdays)]
+
+def compute_fii_dii_summary(data):
+    fii_vals = [d['fii'] for d in data]
+    dii_vals = [d['dii'] for d in data]
+    fii_avg  = sum(fii_vals) / len(fii_vals)
+    dii_avg  = sum(dii_vals) / len(dii_vals)
+    net_avg  = fii_avg + dii_avg
+    fii_span = f'<span style="color:#ff5252;font-weight:700;">₹{fii_avg:.0f} Cr/day</span>'
+    dii_span = f'<span style="color:#40c4ff;font-weight:700;">₹{dii_avg:+.0f} Cr/day</span>'
+    net_span = f'<span style="color:#b388ff;font-weight:700;">₹{net_avg:+.0f} Cr/day</span>'
+    if fii_avg > 0 and dii_avg > 0:
+        label='STRONGLY BULLISH'; emoji='🚀'; color='#00e676'; badge_cls='fii-bull'
+        fii_span = f'<span style="color:#00e676;font-weight:700;">₹{fii_avg:+.0f} Cr/day</span>'
+        insight=(f"Both FIIs (avg {fii_span}) and DIIs (avg {dii_span}) are net buyers — "
+                 f"strong dual institutional confirmation. Net combined flow: {net_span}.")
+    elif fii_avg < 0 and dii_avg > 0 and dii_avg > abs(fii_avg):
+        label='CAUTIOUSLY BULLISH'; emoji='📈'; color='#69f0ae'; badge_cls='fii-cbull'
+        insight=(f"FIIs are net sellers (avg {fii_span}) but DIIs are absorbing strongly (avg {dii_span}). "
+                 f"DII support is cushioning downside — FII return is key for breakout. Net combined flow: {net_span}.")
+    elif fii_avg < 0 and dii_avg > 0:
+        label='MIXED / NEUTRAL'; emoji='⚖️'; color='#ffd740'; badge_cls='fii-neu'
+        insight=(f"FII selling (avg {fii_span}) is partly offset by DII buying (avg {dii_span}). "
+                 f"Watch for 3+ consecutive days of FII buying for trend confirmation. Net combined flow: {net_span}.")
+    elif fii_avg < 0 and dii_avg < 0:
+        label='BEARISH'; emoji='📉'; color='#ff5252'; badge_cls='fii-bear'
+        dii_span=f'<span style="color:#ff5252;font-weight:700;">₹{dii_avg:.0f} Cr/day</span>'
+        insight=(f"Both FIIs (avg {fii_span}) and DIIs (avg {dii_span}) are net sellers — "
+                 f"clear bearish institutional pressure. Exercise caution. Net combined flow: {net_span}.")
+    else:
+        label='NEUTRAL'; emoji='🔄'; color='#b0bec5'; badge_cls='fii-neu'
+        insight="Mixed signals from institutional participants. Wait for a clearer trend."
+    max_abs = max(abs(v) for row in data for v in (row['fii'], row['dii'])) or 1
+    return {'fii_avg': fii_avg, 'dii_avg': dii_avg, 'net_avg': net_avg,
+            'label': label, 'emoji': emoji, 'color': color,
+            'badge_cls': badge_cls, 'insight': insight, 'max_abs': max_abs}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  STRATEGY CHECKLIST ENGINE
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def score_pcr(pcr):
+    if pcr is None:
+        return 0, "N/A", "PCR not available"
+    if pcr < 0.9:
+        return -1, f"{pcr:.3f}", f"PCR {pcr:.3f} → below 0.9 — excess call writing, bearish sentiment"
+    elif pcr > 1.1:
+        return +1, f"{pcr:.3f}", f"PCR {pcr:.3f} → above 1.1 — excess put writing, bullish sentiment"
+    else:
+        return 0, f"{pcr:.3f}", f"PCR {pcr:.3f} → in 0.9–1.1 range — neutral/mixed sentiment"
+
+def score_rsi(rsi):
+    if rsi is None:
+        return 0, "N/A", "RSI not available"
+    if rsi >= 60:
+        return +1, f"{rsi:.1f}", f"RSI {rsi:.1f} → above 60 — bullish momentum building"
+    elif rsi <= 40:
+        return -1, f"{rsi:.1f}", f"RSI {rsi:.1f} → below 40 — bearish momentum, oversold"
+    else:
+        return 0, f"{rsi:.1f}", f"RSI {rsi:.1f} → 40–60 zone — neutral, no overbought/oversold signal"
+
+def score_macd(macd_bullish):
+    if macd_bullish is None:
+        return 0, "N/A", "MACD data not available"
+    if macd_bullish:
+        return +1, "Bullish Crossover", "MACD crossed above signal line — bullish momentum"
+    else:
+        return -1, "Bearish Crossover", "MACD crossed below signal line — bearish momentum"
+
+def score_trend(sma_20_above, sma_50_above, sma_200_above):
+    if sma_200_above is None:
+        return 0, "N/A", "Trend data not available"
+    above_count = sum([sma_20_above, sma_50_above, sma_200_above])
+    if above_count == 3:
+        return +1, "Strong Uptrend", "Price above all SMAs (20/50/200) — strong structural uptrend"
+    elif above_count >= 2:
+        return +1, "Uptrend", "Price above majority of SMAs — uptrend intact"
+    elif above_count == 0:
+        return -1, "Downtrend", "Price below all SMAs (20/50/200) — structural downtrend"
+    else:
+        return -1, "Weak / Mixed", "Price below majority of SMAs — trend weakening"
+
+def score_global(global_bias):
+    if global_bias is None:
+        return 0, "N/A", "Global bias not provided"
+    if global_bias == "bullish":
+        return +1, "Bullish", "Global indices (Dow/S&P/SGX Gift Nifty) showing bullish bias"
+    elif global_bias == "bearish":
+        return -1, "Bearish", "Global indices showing bearish pressure"
+    else:
+        return 0, "Neutral", "Global indices mixed — no directional edge"
+        
+def score_vix(vix, trend):
+    if vix is None:
+        return 0, "N/A", "India VIX not available"
+    if vix > 20:
+        return -1, f"{vix:.1f} ({trend})", f"VIX {vix:.1f} above 20 — high fear, bearish/volatile market"
+    elif vix < 13:
+        return +1, f"{vix:.1f} ({trend})", f"VIX {vix:.1f} below 13 — low fear, complacency, bullish bias"
+    elif 13 <= vix <= 16:
+        score = +1 if trend == "falling" else 0
+        return score, f"{vix:.1f} ({trend})", f"VIX {vix:.1f} in normal range — {trend}"
+    else:  # 16–20
+        score = -1 if trend == "rising" else 0
+        return score, f"{vix:.1f} ({trend})", f"VIX {vix:.1f} elevated — {'rising, caution' if trend == 'rising' else 'stable watch zone'}"
+        
+def score_oi_direction(oi_class):
+    if oi_class is None:
+        return 0, "N/A", "OI direction data not available"
+    if oi_class == "bullish":
+        return +1, "Bullish OI", "Net OI change is bullish — put build-up / call unwinding dominant"
+    elif oi_class == "bearish":
+        return -1, "Bearish OI", "Net OI change is bearish — call build-up / put unwinding dominant"
+    else:
+        return 0, "Neutral OI", "OI changes balanced — no clear directional signal"
+
+BULLISH_MILD   = ["Bull Call Spread","Bull Put Spread","Jade Lizard","The Wheel Strategy (CSP + Covered Call)"]
+BULLISH_STRONG = ["Long Call","Bull Call Spread","Bull Call Ladder","Bull Put Spread","Bull Put Ladder",
+                  "Synthetic Long","Call Ratio Backspread","Strap (Bullish Bias)"]
+BEARISH_MILD   = ["Bear Call Spread","Bear Put Spread","Reverse Jade Lizard"]
+BEARISH_STRONG = ["Long Put","Bear Put Spread","Bear Call Spread","Bear Put Ladder","Bear Call Ladder",
+                  "Synthetic Short","Put Ratio Backspread","Strip (Bearish Bias)"]
+NEUTRAL_LOW_VOL    = ["Short Straddle","Short Strangle","Iron Condor","Iron Butterfly","Condor Spread (Short)"]
+NEUTRAL_NORMAL_VOL = ["Iron Condor","Iron Butterfly","Calendar Spread","Diagonal Spread","Butterfly Spread (Short)"]
+VOLATILITY_LONG    = ["Long Straddle","Long Strangle","Long Guts","Strap (Bullish Bias)","Strip (Bearish Bias)","Butterfly Spread (Long)"]
+ADVANCED_MISC      = ["Call Ratio Spread","Put Ratio Spread","Christmas Tree Spread"]
+
+STRAT_TYPE_MAP = {
+    "Long Call":"bullish","Bull Call Spread":"bullish","Bull Call Ladder":"bullish",
+    "Bull Put Spread":"bullish","Bull Put Ladder":"bullish","Synthetic Long":"bullish",
+    "Call Ratio Backspread":"bullish","Strap (Bullish Bias)":"volatility",
+    "Jade Lizard":"bullish","The Wheel Strategy (CSP + Covered Call)":"bullish",
+    "Long Put":"bearish","Bear Put Spread":"bearish","Bear Call Spread":"bearish",
+    "Bear Put Ladder":"bearish","Bear Call Ladder":"bearish","Synthetic Short":"bearish",
+    "Put Ratio Backspread":"bearish","Strip (Bearish Bias)":"volatility",
+    "Reverse Jade Lizard":"bearish",
+    "Short Straddle":"neutral","Short Strangle":"neutral","Iron Condor":"neutral",
+    "Iron Butterfly":"neutral","Condor Spread (Short)":"neutral",
+    "Calendar Spread":"neutral","Diagonal Spread":"neutral","Butterfly Spread (Short)":"neutral",
+    "Long Straddle":"volatility","Long Strangle":"volatility","Long Guts":"volatility",
+    "Butterfly Spread (Long)":"volatility",
+    "Call Ratio Spread":"advanced","Put Ratio Spread":"advanced","Christmas Tree Spread":"advanced",
+}
+
+def get_strike_suggestion(strategy_name, atm, ce_wall, pe_wall):
+    """
+    Returns a concise strike recommendation string for each strategy.
+    atm      = ATM strike (nearest to spot)
+    ce_wall  = Strike with max CE OI (acts as resistance)
+    pe_wall  = Strike with max PE OI (acts as support)
+    All strikes rounded to nearest 50.
+    """
+    atm_p50  = atm + 100    # 1 strike OTM call
+    atm_m50  = atm - 100    # 1 strike OTM put
+    atm_p100 = atm + 200
+    atm_m100 = atm - 200
+    atm_m150 = atm - 300
+
+    recs = {
+        # ── BULLISH ───────────────────────────────────────────────────────────
+        "Long Call":
+            f"BUY {atm}CE (ATM) or {atm_p50}CE (slight OTM)",
+        "Bull Call Spread":
+            f"BUY {atm}CE  +  SELL {ce_wall}CE (call wall)",
+        "Bull Call Ladder":
+            f"BUY {atm}CE  +  SELL {atm_p50}CE  +  SELL {atm_p100}CE",
+        "Bull Put Spread":
+            f"SELL {atm_m50}PE  +  BUY {pe_wall}PE (put wall hedge)",
+        "Bull Put Ladder":
+            f"SELL {atm}PE  +  BUY {atm_m50}PE  +  BUY {atm_m100}PE",
+        "Synthetic Long":
+            f"BUY {atm}CE  +  SELL {atm}PE  (same expiry)",
+        "Call Ratio Backspread":
+            f"SELL 1× {atm}CE  +  BUY 2× {atm_p50}CE",
+        "Strap (Bullish Bias)":
+            f"BUY 2× {atm}CE  +  BUY 1× {atm}PE  (same strike & expiry)",
+        "Jade Lizard":
+            f"SELL {atm_p50}CE  +  SELL {atm_m50}/{atm_m100}PE spread",
+        "The Wheel Strategy (CSP + Covered Call)":
+            f"SELL {pe_wall}PE (cash-secured); on assignment SELL {ce_wall}CE",
+
+        # ── BEARISH ───────────────────────────────────────────────────────────
+        "Long Put":
+            f"BUY {atm}PE (ATM) or {atm_m50}PE (slight OTM)",
+        "Bear Put Spread":
+            f"BUY {atm}PE  +  SELL {pe_wall}PE (put wall)",
+        "Bear Call Spread":
+            f"SELL {atm_p50}CE  +  BUY {ce_wall}CE (call wall hedge)",
+        "Bear Put Ladder":
+            f"BUY {atm}PE  +  SELL {atm_m50}PE  +  SELL {atm_m100}PE",
+        "Bear Call Ladder":
+            f"SELL {atm}CE  +  BUY {atm_p50}CE  +  BUY {atm_p100}CE",
+        "Synthetic Short":
+            f"SELL {atm}CE  +  BUY {atm}PE  (same expiry)",
+        "Put Ratio Backspread":
+            f"SELL 1× {atm}PE  +  BUY 2× {atm_m50}PE",
+        "Strip (Bearish Bias)":
+            f"BUY 1× {atm}CE  +  BUY 2× {atm}PE  (same strike & expiry)",
+        "Reverse Jade Lizard":
+            f"SELL {atm_m50}PE  +  SELL {atm_p50}/{atm_p100}CE spread",
+
+        # ── NEUTRAL ───────────────────────────────────────────────────────────
+        "Short Straddle":
+            f"SELL {atm}CE  +  SELL {atm}PE  (same ATM strike)",
+        "Short Strangle":
+            f"SELL {atm_p50}CE  +  SELL {atm_m50}PE  (OTM both sides)",
+        "Iron Condor":
+            f"SELL {atm_p50}CE / BUY {ce_wall}CE  +  SELL {atm_m50}PE / BUY {pe_wall}PE",
+        "Iron Butterfly":
+            f"SELL {atm}CE + SELL {atm}PE  |  BUY {atm_p100}CE + BUY {atm_m100}PE",
+        "Condor Spread (Short)":
+            f"SELL {atm_p50}CE + SELL {atm_m50}PE  +  BUY {atm_p100}CE + BUY {atm_m100}PE",
+        "Calendar Spread":
+            f"SELL near-expiry {atm}CE/PE  +  BUY next-expiry {atm}CE/PE",
+        "Diagonal Spread":
+            f"SELL near-expiry {atm_p50}CE  +  BUY next-expiry {atm}CE",
+        "Butterfly Spread (Short)":
+            f"SELL {atm_m50}CE + SELL {atm_p50}CE  +  BUY 2× {atm}CE",
+
+        # ── VOLATILITY ────────────────────────────────────────────────────────
+        "Long Straddle":
+            f"BUY {atm}CE  +  BUY {atm}PE  (same ATM strike & expiry)",
+        "Long Strangle":
+            f"BUY {atm_p50}CE  +  BUY {atm_m50}PE  (OTM both sides)",
+        "Long Guts":
+            f"BUY {atm}CE  +  BUY {atm}PE  (ITM both sides, 1 strike apart)",
+        "Butterfly Spread (Long)":
+            f"BUY {atm_m50}CE  +  SELL 2× {atm}CE  +  BUY {atm_p50}CE",
+
+        # ── ADVANCED ─────────────────────────────────────────────────────────
+        "Call Ratio Spread":
+            f"BUY 1× {atm}CE  +  SELL 2× {atm_p50}CE",
+        "Put Ratio Spread":
+            f"BUY 1× {atm}PE  +  SELL 2× {atm_m50}PE",
+        "Christmas Tree Spread":
+            f"BUY {atm}PE  +  SELL {atm_m50}PE  +  SELL {atm_m150}PE  (step-down strikes)",
+    }
+    return recs.get(strategy_name, f"ATM: ₹{atm:,} | CE Wall: ₹{ce_wall:,} | PE Wall: ₹{pe_wall:,}")
+
+
+def suggest_strategies(total_score, vol_view):
+    if   total_score >= 3:  bias = "strong_bullish";  bias_label = "STRONGLY BULLISH"
+    elif total_score >= 1:  bias = "mild_bullish";    bias_label = "MILDLY BULLISH"
+    elif total_score <= -3: bias = "strong_bearish";  bias_label = "STRONGLY BEARISH"
+    elif total_score <= -1: bias = "mild_bearish";    bias_label = "MILDLY BEARISH"
+    else:                   bias = "neutral";          bias_label = "NEUTRAL / RANGE-BOUND"
+    strats = []
+    if   bias == "strong_bullish": strats.extend(BULLISH_STRONG)
+    elif bias == "mild_bullish":   strats.extend(BULLISH_MILD)
+    elif bias == "strong_bearish": strats.extend(BEARISH_STRONG)
+    elif bias == "mild_bearish":   strats.extend(BEARISH_MILD)
+    else:
+        if   vol_view == "low":  strats.extend(NEUTRAL_LOW_VOL)
+        elif vol_view == "high": strats.extend(VOLATILITY_LONG)
+        else:                    strats.extend(NEUTRAL_NORMAL_VOL)
+    if vol_view == "high" and bias != "neutral":
+        strats.extend(VOLATILITY_LONG)
+    strats.extend(ADVANCED_MISC)
+    seen = set(); unique = []
+    for s in strats:
+        if s not in seen:
+            seen.add(s); unique.append(s)
+    return bias_label, unique
+
+def build_strategy_checklist_html(html_data, vol_support=None, vol_resistance=None, global_bias=None, vol_view="normal", vix_val=None, vix_trend=None):
+    d = html_data
+    pcr_val = d.get('pcr') if d.get('has_option_data') else None
+    rsi_val = d.get('rsi')
+    macd_bull = d.get('macd_bullish')
+    sma20 = d.get('sma_20_above'); sma50 = d.get('sma_50_above'); sma200 = d.get('sma_200_above')
+    oi_cls = d.get('oi_class') if d.get('has_option_data') else None
+    signals = [
+        ("📊", "PCR (OI Ratio)",         *score_pcr(pcr_val),          True),
+        ("📈", "RSI (14-Day)",            *score_rsi(rsi_val),           True),
+        ("⚡", "MACD Signal",             *score_macd(macd_bull),        True),
+        ("📉", "Market Trend (SMAs)",     *score_trend(sma20, sma50, sma200), True),
+        ("🔄", "OI Direction",            *score_oi_direction(oi_cls),   True),
+        ("🌐", "Global Market Bias",      *score_global(global_bias),    True),
+        ("🌡️", "India VIX",              *score_vix(vix_val, vix_trend), True),
+
+    ]
+    auto_scores  = [s[2] for s in signals if s[5]]
+    manual_scores = [s[2] for s in signals if not s[5]]
+    total_score  = sum(auto_scores) + sum(manual_scores)
+    bull_count = sum(1 for s in signals if s[2] > 0)
+    bear_count = sum(1 for s in signals if s[2] < 0)
+    neu_count  = sum(1 for s in signals if s[2] == 0 and s[3] != "N/A")
+    na_count   = sum(1 for s in signals if s[3] == "N/A")
+    bias_label, strategy_list = suggest_strategies(total_score, vol_view)
+    max_possible = len(signals)
+    circumference = 289.0
+    if total_score >= 0:
+        arc_pct = min(1.0, total_score / max(1, max_possible))
+    else:
+        arc_pct = min(1.0, abs(total_score) / max(1, max_possible))
+    dashoffset = circumference * (1 - arc_pct)
+    if   total_score >= 3:  ring_color = "#00e676"; bias_gradient = "linear-gradient(135deg,#00e676,#00bfa5)"
+    elif total_score >= 1:  ring_color = "#69f0ae"; bias_gradient = "linear-gradient(135deg,#69f0ae,#00c853)"
+    elif total_score <= -3: ring_color = "#ff5252"; bias_gradient = "linear-gradient(135deg,#ff5252,#b71c1c)"
+    elif total_score <= -1: ring_color = "#ff8a65"; bias_gradient = "linear-gradient(135deg,#ff8a65,#e64a19)"
+    else:                   ring_color = "#ffb74d"; bias_gradient = "linear-gradient(135deg,#ffcd3c,#f7931e)"
+    score_sign = "+" if total_score > 0 else ""
+
+    def sig_card(icon, name, score, display_val, msg, is_auto):
+        if display_val == "N/A":
+            tile_cls = "o5-tile o5-na"; chip_cls = "o5-chip o5-chip-na"; s_txt = "N/A"
+            val_color = "color:rgba(176,190,197,0.3);"
+            bar_style = "background:linear-gradient(90deg,transparent,rgba(176,190,197,0.15),transparent);"
+        elif score > 0:
+            tile_cls = "o5-tile o5-bull"; chip_cls = "o5-chip o5-chip-bull"; s_txt = f"+{score}"
+            val_color = "color:#34d399;"
+            bar_style = "background:linear-gradient(90deg,transparent,#10b981,transparent);"
+        elif score < 0:
+            tile_cls = "o5-tile o5-bear"; chip_cls = "o5-chip o5-chip-bear"; s_txt = str(score)
+            val_color = "color:#f87171;"
+            bar_style = "background:linear-gradient(90deg,transparent,#ef4444,transparent);"
+        else:
+            tile_cls = "o5-tile o5-neu"; chip_cls = "o5-chip o5-chip-neu"; s_txt = "0"
+            val_color = "color:#fbbf24;"
+            bar_style = "background:linear-gradient(90deg,transparent,#f59e0b,transparent);"
+        auto_badge = '<span class="auto-badge">AUTO</span>' if is_auto else '<span class="manual-badge">MANUAL</span>'
+        return f"""
+        <div class="{tile_cls}">
+            <div class="o5-tile-top">
+                <span class="o5-tile-label">{name} {auto_badge}</span>
+                <div class="{chip_cls}">{s_txt}</div>
+            </div>
+            <div class="o5-val" style="{val_color}">{display_val}</div>
+            <div class="o5-msg">{msg}</div>
+            <div class="o5-tile-bar" style="{bar_style}"></div>
+        </div>"""
+
+    sig_cards_html = "".join(sig_card(*s) for s in signals)
+
+    tag_map = {
+        "bullish":   ("strat-bull", "strat-tag-bull", "🟢 Bullish"),
+        "bearish":   ("strat-bear", "strat-tag-bear", "🔴 Bearish"),
+        "neutral":   ("strat-neu",  "strat-tag-neu",  "🟡 Neutral"),
+        "volatility":("strat-vol",  "strat-tag-vol",  "🟣 Volatility"),
+        "advanced":  ("strat-misc", "strat-tag-misc", "🔵 Advanced"),
+    }
+    # ── Strike data for recommendations ──────────────────────────────────
+    atm_strike  = d.get('atm_strike', 0)
+    ce_wall     = d.get('max_ce_oi', atm_strike + 200 if atm_strike else 0)
+    pe_wall     = d.get('max_pe_oi', atm_strike - 200 if atm_strike else 0)
+    has_strikes = atm_strike > 0
+
+    # Base R:R from market analysis — needed before card loop
+    rr_ratio = d.get('risk_reward_ratio', 0) or 0
+
+    # Per-strategy INDEPENDENT R:R — based on each strategy's structural profit/loss profile
+    # Uses: atm_strike, ce_wall (resistance), pe_wall (support), current_price
+    # These are real structural R:Rs, NOT derived from market direction R:R
+    def calc_strat_rr(strat_name, spot, atm, ce, pe, sl_pts, reward_pts_base):
+        """
+        Returns (rr_ratio, rr_note) for each strategy independently.
+        sl_pts      = hard stop loss distance in points (from market analysis)
+        reward_pts  = distance to target 1 (support/resistance)
+        For spreads: max_profit = spread_width - net_debit (approx)
+                     max_loss   = net_debit (approx half spread for even split)
+        """
+        spread = 400   # standard BankNifty spread width (4 strikes × 100)
+        half   = spread / 2   # approx net debit for ATM spread
+        sl     = max(sl_pts, 50)        # never divide by zero
+        rw     = max(reward_pts_base, 50)
+
+        rr_map = {
+            # Naked directional — full premium at risk, uncapped reward
+            "Long Call":            round(rw / sl, 2),
+            "Long Put":             round(rw / sl, 2),
+            "Synthetic Long":       round(rw / sl, 2),
+            "Synthetic Short":      round(rw / sl, 2),
+            # Debit spreads — max loss = net debit (~half spread), max profit = spread - debit
+            "Bull Call Spread":     round((spread - half) / half, 2),   # ~1.0 for equal width
+            "Bear Put Spread":      round((spread - half) / half, 2),
+            "Bull Put Spread":      round((spread - half) / half, 2),
+            "Bear Call Spread":     round((spread - half) / half, 2),
+            # Ladders — extra short strike adds premium but adds tail risk
+            "Bull Call Ladder":     round((spread * 0.6) / (spread * 0.4), 2),
+            "Bear Put Ladder":      round((spread * 0.6) / (spread * 0.4), 2),
+            "Bull Put Ladder":      round((spread * 0.5) / (spread * 0.5), 2),
+            "Bear Call Ladder":     round((spread * 0.5) / (spread * 0.5), 2),
+            # Ratio backspreads — small loss in middle, big win at extremes
+            "Call Ratio Backspread":  round((spread * 1.5) / (spread * 0.5), 2),
+            "Put Ratio Backspread":   round((spread * 1.5) / (spread * 0.5), 2),
+            # Strap/Strip — 2:1 long positions, pays on big move
+            "Strap (Bullish Bias)": round((rw * 1.5) / (sl * 0.8), 2),
+            "Strip (Bearish Bias)": round((rw * 1.5) / (sl * 0.8), 2),
+            # Income strategies — limited credit, unlimited risk
+            "Jade Lizard":          round((spread * 0.3) / (spread * 0.7), 2),
+            "Reverse Jade Lizard":  round((spread * 0.3) / (spread * 0.7), 2),
+            "The Wheel Strategy (CSP + Covered Call)": round((spread * 0.25) / (spread * 0.75), 2),
+            # Neutral short premium — limited credit, large risk
+            "Short Straddle":       round((half * 0.4) / (spread * 1.0), 2),
+            "Short Strangle":       round((half * 0.35) / (spread * 1.2), 2),
+            # Iron structures — defined on both sides
+            "Iron Condor":          round((half * 0.5) / (half * 0.5), 2),
+            "Iron Butterfly":       round((half * 0.6) / (half * 0.4), 2),
+            "Condor Spread (Short)":round((half * 0.45) / (half * 0.55), 2),
+            # Calendar/Diagonal — time value play
+            "Calendar Spread":      round((half * 0.8) / (half * 0.6), 2),
+            "Diagonal Spread":      round((half * 0.9) / (half * 0.6), 2),
+            "Butterfly Spread (Short)": round((half * 0.4) / (half * 0.6), 2),
+            # Long vol
+            "Long Straddle":        round((rw * 1.2) / (half * 0.8), 2),
+            "Long Strangle":        round((rw * 1.0) / (half * 0.7), 2),
+            "Long Guts":            round((rw * 0.9) / (half * 0.9), 2),
+            "Butterfly Spread (Long)": round((half * 1.2) / (half * 0.5), 2),
+            # Advanced ratio
+            "Call Ratio Spread":    round((spread * 0.8) / (spread * 0.5), 2),
+            "Put Ratio Spread":     round((spread * 0.8) / (spread * 0.5), 2),
+            "Christmas Tree Spread":round((spread * 0.7) / (spread * 0.45), 2),
+        }
+        return rr_map.get(strat_name, round(rw / sl, 2))
+
+    # ── All variables needed by card loop must be defined HERE ───────────────
+    current_price = d.get('current_price', 0)
+    support       = d.get('support', 0)
+    resistance    = d.get('resistance', 0)
+    stop_loss_val = d.get('stop_loss', None)
+    target_1_val  = d.get('target_1', resistance)
+    target_2_val  = d.get('target_2', 0)
+    expiry_date   = d.get('expiry', 'N/A')
+
+    sl_pts_for_rr     = abs(int(current_price - stop_loss_val)) if stop_loss_val and current_price else int(current_price * 0.005) if current_price else 150
+    reward_pts_for_rr = abs(int(target_1_val  - current_price)) if target_1_val  and current_price else 200
+    sl_pts_for_rr     = max(sl_pts_for_rr,     200)
+    reward_pts_for_rr = max(reward_pts_for_rr, 300)
+
+    strat_cards_html = ""
+    strat_data_js = {}  # for JS lookup
+
+    _border_grad = {
+        "bullish":    "linear-gradient(180deg,#00e676,#00796b)",
+        "bearish":    "linear-gradient(180deg,#ff5252,#b71c1c)",
+        "neutral":    "linear-gradient(180deg,#ffb74d,#e65100)",
+        "volatility": "linear-gradient(180deg,#b388ff,#6200ea)",
+        "advanced":   "linear-gradient(180deg,#4fc3f7,#0277bd)",
+    }
+    _rb_cls = {"PRIMARY":"sc-rb-primary","SECONDARY":"sc-rb-secondary","ADVANCED":"sc-rb-advanced"}
+    _type_info = {
+        "bullish":    ("Debit / Credit", "Directional"),
+        "bearish":    ("Debit / Credit", "Directional"),
+        "neutral":    ("Premium Sell",   "Range-bound"),
+        "volatility": ("Debit",          "Vol Breakout"),
+        "advanced":   ("Multi-leg",      "Experienced"),
+    }
+
+    for i, s in enumerate(strategy_list, 1):
+        stype      = STRAT_TYPE_MAP.get(s, "advanced")
+        _, tag_cls, tag_txt = tag_map.get(stype, tag_map["advanced"])
+        rank       = "PRIMARY" if i <= 4 else ("SECONDARY" if i <= 8 else "ADVANCED")
+        strike_rec = get_strike_suggestion(s, atm_strike, ce_wall, pe_wall) if has_strikes else "Strike data unavailable"
+        safe_name  = s.replace('"', '&quot;').replace("'", "\\'")
+        strat_rr   = calc_strat_rr(s, current_price, atm_strike, ce_wall, pe_wall, sl_pts_for_rr, reward_pts_for_rr)
+        strat_data_js[s] = {"strike": strike_rec, "type": stype, "rank": rank, "rr": strat_rr}
+
+        bar_grad = _border_grad.get(stype, _border_grad["advanced"])
+        if   strat_rr >= 2: rr_col, rr_lbl = "#00e676", "&#10003; Good"
+        elif strat_rr >= 1: rr_col, rr_lbl = "#ffb74d", "&#9888; Acceptable"
+        else:               rr_col, rr_lbl = "#ff5252", "&#10005; Poor"
+        rb_cls   = _rb_cls.get(rank, "sc-rb-advanced")
+        rr_bar_w = min(95, int(strat_rr / 3.0 * 100))
+        tl, ts   = _type_info.get(stype, ("Multi-leg", "Complex"))
+        panel_id = f"sc-dp-{i}"
+
+        strat_cards_html += f"""
+        <div class="sc-row" data-type="{stype}" data-strat="{safe_name}" onclick="scToggle(this,'{panel_id}')">
+            <div class="sc-row-bar" style="background:{bar_grad};"></div>
+            <div class="sc-row-num">{i:02d}</div>
+            <div class="sc-row-body">
+                <div class="sc-row-name">{s}</div>
+                <div class="sc-row-strike">&#127919; <span>{strike_rec}</span></div>
+            </div>
+            <div class="sc-row-meta">
+                <span class="sc-row-tag {tag_cls}">{tag_txt}</span>
+                <span class="sc-rb {rb_cls}">{rank}</span>
+                <span class="sc-row-rr" style="color:{rr_col};">R:R {strat_rr:.2f}</span>
+            </div>
+            <div class="sc-row-chevron" id="chev-{panel_id}">&#8250;</div>
+        </div>
+        <div class="sc-dp" id="{panel_id}">
+            <div class="sc-dp-grid">
+                <div class="sc-dp-box">
+                    <div class="sc-dp-lbl">STRATEGY TYPE</div>
+                    <div class="sc-dp-val" style="color:{rr_col};">{tl}</div>
+                    <div class="sc-dp-sub">{ts}</div>
+                </div>
+                <div class="sc-dp-box">
+                    <div class="sc-dp-lbl">RISK : REWARD</div>
+                    <div class="sc-dp-val" style="color:{rr_col};">1 : {strat_rr:.2f}</div>
+                    <div class="sc-dp-sub">{rr_lbl}</div>
+                    <div class="sc-dp-rr-track"><div class="sc-dp-rr-fill" style="width:{rr_bar_w}%;background:{bar_grad};"></div></div>
+                </div>
+                <div class="sc-dp-box">
+                    <div class="sc-dp-lbl">RANK</div>
+                    <div class="sc-dp-val" style="color:#80deea;">{rank}</div>
+                    <div class="sc-dp-sub">#{i:02d} of {len(strategy_list)}</div>
+                </div>
+            </div>
+            <div class="sc-dp-strike-box">
+                <span class="sc-dp-strike-lbl">&#127919; Strike Rec:</span> {strike_rec}
+            </div>
+            <div class="sc-dp-actions">
+                <button class="sc-dp-btn sc-dp-btn-close" onclick="scClose('{panel_id}',event)">&#10005; Close</button>
+                <button class="sc-dp-btn sc-dp-btn-load" onclick="scLoadPlan('{safe_name}',event)">&#128203; Load Trade Plan &#8599;</button>
+            </div>
+        </div>"""
+
+    # Build JS strategy data map
+    import json as _json
+    strat_js_map = _json.dumps(strat_data_js, ensure_ascii=False)
+
+    timestamp = d.get('timestamp', 'N/A')
+    na_span     = '<span class="na-inline">N/A</span>'
+    na_pill     = f'<span class="sc-pill sc-pill-na">— N/A: {na_count}</span>' if na_count > 0 else ''
+    score_note  = ("Strong directional conviction — proceed with caution and stop losses."
+                   if abs(total_score) >= 3 else
+                   "Moderate signal — size positions conservatively."
+                   if abs(total_score) >= 1 else
+                   "Mixed signals — range-bound or sideways strategies preferred.")
+    strat_count = len(strategy_list)
+
+    # ── Trade Plan auto-values (already defined above for card loop) ─────────
+
+    if stop_loss_val:
+        sl_display = f"&#8377;{int(stop_loss_val):,}"
+        sl_pts     = abs(int(current_price - stop_loss_val))
+    else:
+        sl_pts     = int(current_price * 0.005) if current_price else 50
+        sl_display = f"~&#8377;{int(current_price - sl_pts):,} (0.5% below spot)"
+
+    if target_1_val:
+        tgt1_display = f"&#8377;{int(target_1_val):,}"
+        reward_pts   = abs(int(target_1_val - current_price))
+    else:
+        tgt1_display = "N/A"
+        reward_pts   = 0
+
+    tgt2_display = f"&#8377;{int(target_2_val):,}" if target_2_val else "N/A (CE/PE wall)"
+    primary_strat        = strategy_list[0] if strategy_list else "N/A"
+    primary_strike_rec   = get_strike_suggestion(primary_strat, atm_strike, ce_wall, pe_wall) if has_strikes and strategy_list else "N/A"
+
+    html_parts = []
+    html_parts.append(f"""
+    <div class="tab-panel" id="tab-checklist">
+        <div class="section">
+            <div class="o5-wrap">
+                <div class="o5-top-banner">
+                    <div class="o5-banner-left">
+                        <div class="o5-score-circle" style="border-color:{ring_color};box-shadow:0 0 20px {ring_color}44,inset 0 0 16px {ring_color}11;">
+                            <div class="o5-score-num" style="color:{ring_color};">{score_sign}{total_score}</div>
+                            <div class="o5-score-lbl">SCORE</div>
+                        </div>
+                        <div>
+                            <div class="o5-verdict" style="color:{ring_color};text-shadow:0 0 20px {ring_color}66;">{bias_label}</div>
+                            <div class="o5-sub">Score {score_sign}{total_score} from {len(signals)} signals ({na_count} skipped as N/A). {score_note}</div>
+                        </div>
+                    </div>
+                    <div class="o5-pills">
+                        <span class="sc-pill sc-pill-bull">&#10003; BULL: {bull_count}</span>
+                        <span class="sc-pill sc-pill-bear">&#10007; BEAR: {bear_count}</span>
+                        <span class="sc-pill sc-pill-neu">&#9633; NEUTRAL: {neu_count}</span>
+                        {na_pill}
+                    </div>
+                </div>
+                <div class="o5-grid">{sig_cards_html}</div>
+            </div>
+        </div>
+        <div class="section">
+            <div class="section-title">
+                <span>&#127919;</span> SUGGESTED STRATEGY TYPES
+                <span style="font-size:10px;color:rgba(176,190,197,0.4);font-weight:400;letter-spacing:1px;">
+                    For study &amp; backtesting only &mdash; NOT financial advice
+                </span>
+            </div>
+            <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;margin-bottom:16px;">
+                <div style="font-size:13px;color:rgba(176,190,197,0.7);">
+                    IV View: <strong style="color:{ring_color};">{vol_view.upper()}</strong>
+                    &nbsp;&middot;&nbsp; Bias: <strong style="color:{ring_color};">{bias_label}</strong>
+                    &nbsp;&middot;&nbsp; <span style="color:rgba(128,222,234,0.7);">{strat_count} strategies found</span>
+                </div>
+                <div style="display:flex;gap:8px;flex-wrap:wrap;">
+                    <button class="filter-btn active" onclick="filterStrats('all',this)">All</button>
+                    <button class="filter-btn" onclick="filterStrats('bullish',this)">&#128994; Bullish</button>
+                    <button class="filter-btn" onclick="filterStrats('bearish',this)">&#128308; Bearish</button>
+                    <button class="filter-btn" onclick="filterStrats('neutral',this)">&#128993; Neutral</button>
+                    <button class="filter-btn" onclick="filterStrats('volatility',this)">&#128995; Volatility</button>
+                    <button class="filter-btn" onclick="filterStrats('advanced',this)">&#128309; Advanced</button>
+                </div>
+            </div>
+            <!-- compact strategy summary strip -->
+            <div class="sc-summary-strip">
+                <div class="sc-ss-item">
+                    <span class="sc-ss-dot" style="background:#00e5ff;box-shadow:0 0 5px #00e5ff;"></span>
+                    <span class="sc-ss-lbl">PRIMARY</span>
+                    <span class="sc-ss-val" style="color:#00e5ff;">{min(4, strat_count)}</span>
+                </div>
+                <div class="sc-ss-sep"></div>
+                <div class="sc-ss-item">
+                    <span class="sc-ss-dot" style="background:#ffb74d;"></span>
+                    <span class="sc-ss-lbl">SECONDARY</span>
+                    <span class="sc-ss-val" style="color:#ffb74d;">{max(0, min(4, strat_count - 4))}</span>
+                </div>
+                <div class="sc-ss-sep"></div>
+                <div class="sc-ss-item">
+                    <span class="sc-ss-dot" style="background:#b388ff;"></span>
+                    <span class="sc-ss-lbl">ADVANCED</span>
+                    <span class="sc-ss-val" style="color:#b388ff;">{max(0, strat_count - 8)}</span>
+                </div>
+                <div class="sc-ss-sep"></div>
+                <div style="margin-left:auto;font-family:'JetBrains Mono',monospace;font-size:11px;color:rgba(128,222,234,0.65);">
+                    ATM: &#8377;{atm_strike:,} &nbsp;&middot;&nbsp; CE Wall: &#8377;{ce_wall:,} &nbsp;&middot;&nbsp; PE Wall: &#8377;{pe_wall:,}
+                </div>
+            </div>
+            <div class="sc-compact-grid" id="stratGrid">{strat_cards_html}</div>
+        </div>
+        <!-- ══════════════ TRADE PLAN SECTION ══════════════ -->
+        <script id="stratDataMap" type="application/json">{strat_js_map}</script>
+        <div class="section">
+            <div class="section-title"><span>&#128203;</span> TRADE PLAN — AUTO FILLED
+                <span style="font-size:10px;color:rgba(176,190,197,0.4);font-weight:400;letter-spacing:1px;margin-left:auto;">
+                    Click any strategy card above to update this plan
+                </span>
+            </div>
+            <div class="tp-wrap">
+
+                <!-- Row 1: Primary strategy banner -->
+                <div class="tp-banner" id="tp-banner">
+                    <div class="tp-banner-left">
+                        <div class="tp-banner-label">SELECTED STRATEGY <span id="tp-rank-badge" class="tp-rank-badge">PRIMARY</span></div>
+                        <div class="tp-banner-strat" id="tp-strat-name">{primary_strat}</div>
+                        <div class="tp-banner-strike" id="tp-strike-rec">&#127919; {primary_strike_rec}</div>
+                    </div>
+                    <div class="tp-banner-right">
+                        <div class="tp-banner-label">EXPIRY</div>
+                        <div class="tp-banner-exp">{expiry_date}</div>
+                    </div>
+                </div>
+
+                <!-- Row 2: The 3 exit conditions -->
+                <div class="tp-exits">
+                    <div class="tp-exit tp-exit-profit">
+                        <div class="tp-exit-icon">&#9989;</div>
+                        <div class="tp-exit-title">PROFIT EXIT</div>
+                        <div class="tp-exit-val">{tgt1_display}</div>
+                        <div class="tp-exit-sub">Target 1 · {reward_pts} pts from spot</div>
+                        <div class="tp-exit-val2">{tgt2_display}</div>
+                        <div class="tp-exit-sub">Target 2 (CE/PE wall)</div>
+                        <div class="tp-exit-rule">&#128161; Take 50–60% profits at Target 1. Let the rest run to Target 2.</div>
+                    </div>
+                    <div class="tp-exit tp-exit-loss">
+                        <div class="tp-exit-icon">&#10060;</div>
+                        <div class="tp-exit-title">STOP LOSS EXIT</div>
+                        <div class="tp-exit-val">{sl_display}</div>
+                        <div class="tp-exit-sub">Hard stop · {sl_pts} pts from spot</div>
+                        <div class="tp-exit-rule">&#128161; Exit immediately when hit — no averaging down. Max 2% of capital at risk per trade.</div>
+                    </div>
+                    <div class="tp-exit tp-exit-time">
+                        <div class="tp-exit-icon">&#9200;</div>
+                        <div class="tp-exit-title">TIME EXIT</div>
+                        <div class="tp-exit-val">40% DTE Rule</div>
+                        <div class="tp-exit-sub">Exit if target not reached by 40% of expiry elapsed</div>
+                        <div class="tp-exit-rule">&#128161; Theta decay accelerates after 40% DTE. A stalled trade is a losing trade — exit and preserve capital.</div>
+                    </div>
+                </div>
+
+            </div>
+        </div>
+        <!-- ══════════════ END TRADE PLAN ══════════════ -->
+
+        <div class="section">
+            <div class="section-title"><span>&#128218;</span> SCORING LEGEND</div>
+            <div class="logic-box" style="margin-top:0;">
+                <div class="logic-box-head">HOW THE SCORE WORKS</div>
+                <div class="logic-grid">
+                    <div class="logic-item"><span class="lc-bull">+1</span> Signal is bullish &mdash; adds to bull case</div>
+                    <div class="logic-item"><span class="lc-bear">&minus;1</span> Signal is bearish &mdash; adds to bear case</div>
+                    <div class="logic-item"><span class="lc-side">0</span> Neutral signal &mdash; no directional contribution</div>
+                    <div class="logic-item"><span class="lc-info">N/A</span> Data not available &mdash; excluded from score</div>
+                    <div class="logic-item"><span class="lc-bull">&ge; +3</span> Strongly Bullish &middot; <span class="lc-bull">+1/+2</span> Mildly Bullish</div>
+                    <div class="logic-item"><span class="lc-bear">&le; &minus;3</span> Strongly Bearish &middot; <span class="lc-bear">&minus;1/&minus;2</span> Mildly Bearish</div>
+                    <div class="logic-item"><span class="lc-info">AUTO</span> Filled from live NSE + yfinance data</div>
+                    <div class="logic-item"><span class="lc-side">MANUAL</span> Requires your input &mdash; shown as N/A if not set</div>
+                </div>
+            </div>
+        </div>
+        <div class="section">
+            <div class="disclaimer">
+                <span class="disc-icon">⚠️</span>
+                <span class="disc-label">Disclaimer</span>
+                <span class="disc-sep">|</span>
+                <span class="disc-text">This checklist is for <strong>EDUCATIONAL purposes only</strong> &mdash; NOT financial advice.</span>
+                <span class="disc-sep">|</span>
+                <span class="disc-text">Strategy suggestions are rules-based &amp; have not been backtested.</span>
+                <span class="disc-sep">|</span>
+                <span class="disc-text">Always validate with your own analysis &amp; consult a SEBI-registered advisor.</span>
+            </div>
+        </div>
+    </div>
+""")
+    return "".join(html_parts)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  INTRADAY OI TREND — OI LOG HELPER
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def log_oi_snapshot(option_analysis, technical, key_levels=None, bias=None):
+    if not option_analysis or not technical:
+        print("  ⚠️  OI snapshot skipped — missing option_analysis or technical data")
+        return
+
+    ist_tz  = pytz.timezone('Asia/Kolkata')
+    ist_now = datetime.now(ist_tz)
+
+    # ── Market hours gate: only log between 09:00 and 15:30 IST ──
+    market_open  = ist_now.replace(hour=9,  minute=0,  second=0, microsecond=0)
+    market_close = ist_now.replace(hour=15, minute=30, second=0, microsecond=0)
+    if not (market_open <= ist_now <= market_close):
+        print(f"  ⏸️  OI snapshot skipped — outside market hours ({ist_now.strftime('%H:%M IST')})")
+        return
+
+    ce_chg  = option_analysis.get('total_ce_oi_change', 0)
+    pe_chg  = option_analysis.get('total_pe_oi_change', 0)
+    diff    = pe_chg - ce_chg
+    pcr     = round(option_analysis.get('pcr_oi', 0), 2)
+    spot    = round(float(technical.get('current_price', 0)), 2)
+
+    # ── VWAP calculation (moved up — needed for signal logic below) ──
+    # ^NSEBANK is an index with zero volume → VWAP always equals spot (wrong).
+    # BANKBEES.NS is the Nifty ETF trading at ~BankNifty/100 with real volume.
+    # FIX v6: Use dynamic calibration ratio (spot / last_etf_close) instead of fixed ×100
+    # to avoid drift where BANKBEES trades at 99.5×–100.5× Nifty, causing false VWAP signals.
+    vwap = spot
+    try:
+        import yfinance as _yf
+        df_1m = _yf.Ticker("BANKBEES.NS").history(interval="1m", period="1d")
+        if not df_1m.empty:
+            df_1m = df_1m.dropna(subset=['Close','Volume'])
+            df_1m = df_1m[df_1m['Volume'] > 0]
+            if len(df_1m) >= 5:
+                tp  = (df_1m['High'] + df_1m['Low'] + df_1m['Close']) / 3
+                cum_tpv = (tp * df_1m['Volume']).cumsum()
+                cum_vol = df_1m['Volume'].cumsum()
+                vwap_series = cum_tpv / cum_vol
+                last_vwap = vwap_series.iloc[-1]
+                last_etf_close = float(df_1m['Close'].iloc[-1])
+                first_etf_open = float(df_1m['Open'].iloc[0])
+                if not pd.isna(last_vwap) and last_vwap > 0 and first_etf_open > 0 and spot > 0:
+                    # FIX v8: Use day-open ETF price for calibration so VWAP doesn't
+                    # track spot in real-time (which made spot >= vwap almost always true).
+                    # We approximate BankNifty open from first ETF bar's open price.
+                    # This locks calibration for the day, letting VWAP move independently.
+                    nifty_approx_open = spot  # fallback
+                    try:
+                        df_nifty_1d = _yf.Ticker("^NSEBANK").history(period="1d", interval="1d")
+                        if not df_nifty_1d.empty:
+                            nifty_approx_open = float(df_nifty_1d['Open'].iloc[-1])
+                    except Exception:
+                        pass
+                    calibration = nifty_approx_open / first_etf_open
+                    vwap = round(float(last_vwap) * calibration, 2)
+                    print(f"  ✅ VWAP (BANKBEES × {calibration:.4f} day-open locked): {vwap}")
+                else:
+                    print(f"  ⚠️  VWAP: series NaN or zero — fallback to spot")
+            else:
+                print(f"  ⚠️  VWAP: insufficient 1m bars ({len(df_1m)}) — fallback to spot")
+        else:
+            print(f"  ⚠️  VWAP: empty dataframe — fallback to spot")
+    except Exception as e:
+        print(f"  ⚠️  VWAP calc failed: {e} — using spot as VWAP")
+
+    spot_above_vwap = spot >= vwap
+
+    # ── OI Signal Logic: Step 1 — direction, Step 2 — ratio, Step 3 — PCR+VWAP tiebreaker ──
+    # Step 1: CE and PE moving in OPPOSITE directions → clear signal
+    if   ce_chg > 0 and pe_chg < 0:
+        # Calls building + Puts unwinding = true bearish
+        opt_signal = "STRONG SELL"
+    elif ce_chg < 0 and pe_chg > 0:
+        # Calls unwinding + Puts building = true bullish
+        opt_signal = "STRONG BUY"
+
+    # Step 2: Both building → check if one side clearly dominates (1.5× ratio)
+    elif ce_chg > 0 and pe_chg > 0:
+        if   pe_chg > ce_chg * 1.5:
+            opt_signal = "BUY"           # Put build clearly dominant
+        elif ce_chg > pe_chg * 1.5:
+            opt_signal = "SELL"          # Call build clearly dominant
+        else:
+            # Step 3: Neither dominates → use PCR threshold + trend + VWAP tiebreaker
+            # FIX v10: 5-reading PCR trend with strength detection.
+            #   PCR > 1.5: STRONG BUY (extreme put writing = institutional floor)
+            #   PCR 1.1–1.5: BUY (put-heavy, bullish bias)
+            #   PCR 0.9–1.1: Check PCR trend across last 5 candles (~15 min) for direction
+            #   PCR 0.5–0.9: SELL (call-heavy, bearish bias)
+            #   PCR < 0.5: STRONG SELL (extreme call writing = ceiling)
+
+            # ── PCR trend detection: read last 5 PCR values from oi_log_banknifty.json ──
+            _pcr_trend = "FLAT"       # FLAT | MILD_RISING | STRONG_RISING | MILD_FALLING | STRONG_FALLING
+            _pcr_shift = 0.0          # total PCR change across window
+            try:
+                _pcr_log_path = "oi_log_banknifty.json"
+                if os.path.exists(_pcr_log_path):
+                    with open(_pcr_log_path, "r", encoding="utf-8") as _pf:
+                        _pcr_entries = json.load(_pf)
+                    if isinstance(_pcr_entries, list):
+                        _today_str_pcr = ist_now.strftime('%d-%b-%Y')
+                        _pcr_entries = [e for e in _pcr_entries
+                                        if e.get('timestamp', '').startswith(_today_str_pcr)
+                                        and e.get('pcr') is not None and e.get('pcr') > 0]
+                        # Most recent entries are at the front (prepended)
+                        _recent_pcrs = [e['pcr'] for e in _pcr_entries[:5]]
+                        if len(_recent_pcrs) >= 5:
+                            # Count how many consecutive pairs are rising/falling
+                            _pairs = len(_recent_pcrs) - 1  # 4 pairs for 5 readings
+                            _rising_count  = sum(1 for i in range(_pairs) if _recent_pcrs[i] > _recent_pcrs[i+1])
+                            _falling_count = sum(1 for i in range(_pairs) if _recent_pcrs[i] < _recent_pcrs[i+1])
+                            _pcr_shift = _recent_pcrs[0] - _recent_pcrs[-1]  # newest minus oldest
+
+                            # Strong trend: all 4 pairs consistent AND shift > 0.15
+                            # Mild trend: 4 of 4 OR 3 of 4 consistent, shift 0.08–0.15
+                            if _rising_count >= 4 and _pcr_shift > 0.15:
+                                _pcr_trend = "STRONG_RISING"
+                            elif _rising_count >= 3 and _pcr_shift > 0.08:
+                                _pcr_trend = "MILD_RISING"
+                            elif _falling_count >= 4 and _pcr_shift < -0.15:
+                                _pcr_trend = "STRONG_FALLING"
+                            elif _falling_count >= 3 and _pcr_shift < -0.08:
+                                _pcr_trend = "MILD_FALLING"
+
+                            print(f"  📈 PCR Trend: {_pcr_trend} | shift={_pcr_shift:+.3f} | "
+                                  f"rising={_rising_count}/4 falling={_falling_count}/4 | "
+                                  f"last 5: {_recent_pcrs}")
+                        elif len(_recent_pcrs) >= 3:
+                            # Fallback: if less than 5 readings available, use 3
+                            _pcr_shift = _recent_pcrs[0] - _recent_pcrs[-1]
+                            _rising_count  = sum(1 for i in range(len(_recent_pcrs)-1) if _recent_pcrs[i] > _recent_pcrs[i+1])
+                            _falling_count = sum(1 for i in range(len(_recent_pcrs)-1) if _recent_pcrs[i] < _recent_pcrs[i+1])
+                            if _rising_count == len(_recent_pcrs)-1 and _pcr_shift > 0.08:
+                                _pcr_trend = "MILD_RISING"
+                            elif _falling_count == len(_recent_pcrs)-1 and _pcr_shift < -0.08:
+                                _pcr_trend = "MILD_FALLING"
+                            print(f"  📈 PCR Trend (3-bar fallback): {_pcr_trend} | shift={_pcr_shift:+.3f} | last {len(_recent_pcrs)}: {_recent_pcrs}")
+            except Exception as _te:
+                print(f"  ⚠️  PCR trend detection failed: {_te}")
+
+            if pcr > 1.5:
+                opt_signal = "STRONG BUY" if spot_above_vwap else "BUY"
+            elif pcr > 1.1:
+                if spot_above_vwap:
+                    opt_signal = "BUY"
+                else:
+                    vwap_gap_pct = ((vwap - spot) / vwap) * 100 if vwap > 0 else 0
+                    opt_signal = "SELL" if vwap_gap_pct > 0.3 else "NEUTRAL"
+            elif pcr < 0.5:
+                opt_signal = "STRONG SELL" if not spot_above_vwap else "SELL"
+            elif pcr < 0.9:
+                if not spot_above_vwap:
+                    opt_signal = "SELL"
+                else:
+                    vwap_gap_pct = ((spot - vwap) / vwap) * 100 if vwap > 0 else 0
+                    opt_signal = "BUY" if vwap_gap_pct > 0.3 else "NEUTRAL"
+            else:
+                # PCR 0.9–1.1: use trend strength to break the tie
+                if _pcr_trend == "STRONG_RISING":
+                    opt_signal = "BUY"                          # strong conviction, no VWAP needed
+                elif _pcr_trend == "MILD_RISING":
+                    opt_signal = "BUY" if spot_above_vwap else "NEUTRAL"
+                elif _pcr_trend == "STRONG_FALLING":
+                    opt_signal = "SELL"                         # strong conviction, no VWAP needed
+                elif _pcr_trend == "MILD_FALLING":
+                    opt_signal = "SELL" if not spot_above_vwap else "NEUTRAL"
+                else:
+                    opt_signal = "NEUTRAL"   # PCR 0.9–1.1 + flat trend
+
+    # Step 4: Both unwinding → no conviction either way
+    elif ce_chg < 0 and pe_chg < 0:
+        opt_signal = "NEUTRAL"
+
+    else:
+        opt_signal = "NEUTRAL"
+
+    # ══ MOMENTUM OVERRIDE ═══════════════════════════════════════════════════
+    # When price action clearly contradicts the OI signal for 4+ consecutive
+    # readings, override to prevent stale signals during V-shaped reversals.
+    # Read last 6 entries from oi_log_banknifty.json to compute spot deltas.
+    # ═════════════════════════════════════════════════════════════════════════
+    _oi_signal_before_override = opt_signal   # preserve for logging
+    try:
+        _log_path = "oi_log_banknifty.json"
+        _prev_entries = []
+        if os.path.exists(_log_path):
+            with open(_log_path, "r", encoding="utf-8") as _f:
+                _prev_entries = json.load(_f)
+            if not isinstance(_prev_entries, list):
+                _prev_entries = []
+            # Keep only today's entries
+            _today_str = ist_now.strftime('%d-%b-%Y')
+            _prev_entries = [e for e in _prev_entries if e.get('timestamp', '').startswith(_today_str)]
+
+        if len(_prev_entries) >= 4 and spot > 0:
+            # Collect last 6 spot prices (most recent first, current spot not yet in log)
+            _recent_spots = [spot]  # current reading
+            for _e in _prev_entries[:5]:
+                _sp = _e.get('spot_price', 0)
+                if _sp and _sp > 0:
+                    _recent_spots.append(_sp)
+
+            if len(_recent_spots) >= 5:
+                # Compute consecutive deltas: spots[0]-spots[1], spots[1]-spots[2], ...
+                _deltas = [_recent_spots[i] - _recent_spots[i+1] for i in range(len(_recent_spots)-1)]
+                _consec_up   = all(d > 0 for d in _deltas[:4])
+                _consec_down = all(d < 0 for d in _deltas[:4])
+
+                # Compute move % from 6-reading low/high
+                _low6  = min(_recent_spots)
+                _high6 = max(_recent_spots)
+                _up_pct   = ((spot - _low6) / _low6 * 100) if _low6 > 0 else 0
+                _down_pct = ((_high6 - spot) / _high6 * 100) if _high6 > 0 else 0
+
+                # Override: Price rising but signal is SELL
+                # FIX v6: Lowered thresholds from 1.0%/0.5% → 0.5%/0.25%
+                # At Nifty ~22700, old 1.0% = 227 pts — too slow to catch V-shaped reversals.
+                if _consec_up and opt_signal in ("SELL", "STRONG SELL"):
+                    if _up_pct > 0.5:
+                        opt_signal = "BUY"
+                        print(f"  ⚡ MOMENTUM OVERRIDE: {_oi_signal_before_override} → BUY "
+                              f"(4 consecutive ▲ deltas, +{_up_pct:.2f}% from 6-reading low)")
+                    elif _up_pct > 0.25:
+                        opt_signal = "NEUTRAL"
+                        print(f"  ⚡ MOMENTUM OVERRIDE: {_oi_signal_before_override} → NEUTRAL "
+                              f"(4 consecutive ▲ deltas, +{_up_pct:.2f}% from 6-reading low)")
+
+                # Override: Price falling but signal is BUY
+                elif _consec_down and opt_signal in ("BUY", "STRONG BUY"):
+                    if _down_pct > 0.5:
+                        opt_signal = "SELL"
+                        print(f"  ⚡ MOMENTUM OVERRIDE: {_oi_signal_before_override} → SELL "
+                              f"(4 consecutive ▼ deltas, -{_down_pct:.2f}% from 6-reading high)")
+                    elif _down_pct > 0.25:
+                        opt_signal = "NEUTRAL"
+                        print(f"  ⚡ MOMENTUM OVERRIDE: {_oi_signal_before_override} → NEUTRAL "
+                              f"(4 consecutive ▼ deltas, -{_down_pct:.2f}% from 6-reading high)")
+
+    except Exception as _e:
+        print(f"  ⚠️  Momentum override check failed: {_e} — using OI signal as-is")
+
+    fut_price = round(spot - 25, 2)
+    try:
+        import yfinance as _yf
+        # Try BankNifty near-month futures first, then BANKBEES ETF × calibration
+        _fut_fetched = False
+        for _fut_sym in ("0NIFTY.NS", "BANKBEES.NS"):
+            try:
+                _fut_df = _yf.Ticker(_fut_sym).history(period="1d", interval="1m")
+                if _fut_df is not None and not _fut_df.empty:
+                    _last_close = float(_fut_df['Close'].dropna().iloc[-1])
+                    if _last_close > 0:
+                        if _fut_sym == "BANKBEES.NS" and spot > 0:
+                            # ETF trades at ~BankNifty/100 — scale up using live calibration
+                            _calibration = spot / _last_close
+                            fut_price = round(_last_close * _calibration, 2)
+                            print(f"  ✅ Futures proxy via BANKBEES × {_calibration:.2f}: {fut_price}")
+                        else:
+                            fut_price = round(_last_close, 2)
+                            print(f"  ✅ Futures price via {_fut_sym}: {fut_price}")
+                        _fut_fetched = True
+                        break
+            except Exception:
+                continue
+        if not _fut_fetched:
+            print(f"  ⚠️  Futures price: all tickers failed — using spot - 25 as proxy ({fut_price})")
+    except Exception as e:
+        print(f"  ⚠️  Futures price fetch failed: {e} — using spot - 25 as proxy")
+
+    vwap_signal = "BUY" if spot_above_vwap else "SELL"
+
+    # ── BankNifty % move from previous day close ──
+    nifty_move_pct = None
+    try:
+        import yfinance as _yf
+        df_nsei = _yf.Ticker("^NSEBANK").history(period="5d", interval="1d")
+        if df_nsei is not None and len(df_nsei) >= 2:
+            prev_close_day = float(df_nsei['Close'].iloc[-2])
+            if prev_close_day > 0:
+                nifty_move_pct = round((spot - prev_close_day) / prev_close_day * 100, 2)
+                print(f"  ✅ BankNifty Move %: {nifty_move_pct:+.2f}% (Spot={spot}, Prev Close={prev_close_day})")
+    except Exception as e:
+        print(f"  ⚠️  Nifty move % calc failed: {e}")
+
+    # ── Nearest level & distance based on signal direction ──
+    # SELL: target is S1 if spot > S1 (not yet reached), else switch to S2 (already broke S1)
+    # BUY:  target is R1 if spot < R1 (not yet reached), else switch to R2 (already broke R1)
+    # Distance is always stored as a POSITIVE number (how far to next target)
+    nearest_level = None
+    distance_pts  = None
+    nearest_label = None
+    if key_levels:
+        if opt_signal in ("SELL", "STRONG SELL"):
+            s1 = key_levels.get("support")
+            s2 = key_levels.get("strong_support")
+            if s1 is not None and spot > s1:
+                # Spot still above S1 — S1 is the next downside target
+                nearest_level = s1
+                nearest_label = "S1"
+                distance_pts  = round(spot - s1, 1)          # positive: how far to fall
+            elif s2 is not None:
+                # Spot has crossed/touched S1 — next target is S2
+                nearest_level = s2
+                nearest_label = "S2"
+                distance_pts  = round(max(spot - s2, 0), 1)  # positive: how far to S2
+            elif s1 is not None:
+                # No S2 available, fallback to S1
+                nearest_level = s1
+                nearest_label = "S1"
+                distance_pts  = round(abs(spot - s1), 1)
+
+        elif opt_signal in ("BUY", "STRONG BUY"):
+            r1 = key_levels.get("resistance")
+            r2 = key_levels.get("strong_resistance")
+            if r1 is not None and spot < r1:
+                # Spot still below R1 — R1 is the next upside target
+                nearest_level = r1
+                nearest_label = "R1"
+                distance_pts  = round(r1 - spot, 1)          # positive: how far to rise
+            elif r2 is not None:
+                # Spot has crossed/touched R1 — next target is R2
+                nearest_level = r2
+                nearest_label = "R2"
+                distance_pts  = round(max(r2 - spot, 0), 1)  # positive: how far to R2
+            elif r1 is not None:
+                # No R2 available, fallback to R1
+                nearest_level = r1
+                nearest_label = "R1"
+                distance_pts  = round(abs(r1 - spot), 1)
+
+    # ── RSI 14-period + EMA 5/13 on 15-min candles ────────────────────────
+    # Single yfinance fetch shared by both indicators — no double API call.
+    rsi_15m    = None
+    ema_signal = None   # "BUY" | "SELL"
+    ema5_val   = None
+    ema13_val  = None
+    try:
+        import yfinance as _yf
+        df_15 = _yf.Ticker("^NSEBANK").history(period="5d", interval="15m")
+        if df_15 is not None and len(df_15) >= 20:
+            close = df_15['Close'].dropna()
+            # ── RSI 14 ──────────────────────────────────────────────────
+            delta  = close.diff()
+            gain   = delta.where(delta > 0, 0.0).rolling(14).mean()
+            loss   = (-delta.where(delta < 0, 0.0)).rolling(14).mean()
+            rs     = gain / loss.replace(0, float('inf'))
+            rsi_s  = 100 - (100 / (1 + rs))
+            rsi_15m = round(float(rsi_s.iloc[-1]), 1) if not pd.isna(rsi_s.iloc[-1]) else None
+            # ── EMA 5 / 13 ──────────────────────────────────────────────
+            ema5  = close.ewm(span=5,  adjust=False).mean()
+            ema13 = close.ewm(span=13, adjust=False).mean()
+            ema5_val  = round(float(ema5.iloc[-1]),  2) if not pd.isna(ema5.iloc[-1])  else None
+            ema13_val = round(float(ema13.iloc[-1]), 2) if not pd.isna(ema13.iloc[-1]) else None
+            if ema5_val and ema13_val:
+                ema_signal = "BUY" if ema5_val > ema13_val else "SELL"
+            print(f"  ✅ RSI 15m: {rsi_15m} | EMA5: {ema5_val} EMA13: {ema13_val} → {ema_signal}")
+        else:
+            print(f"  ⚠️  RSI/EMA: insufficient 15m bars ({len(df_15) if df_15 is not None else 0})")
+    except Exception as e:
+        print(f"  ⚠️  RSI/EMA 15m calc failed: {e}")
+
+    snapshot = {
+        "time":          ist_now.strftime("%H:%M"),
+        "timestamp":     ist_now.strftime("%d-%b-%Y %H:%M IST"),
+        "call_oi_chg":   ce_chg,
+        "put_oi_chg":    pe_chg,
+        "diff":          diff,
+        "pcr":           pcr,
+        "opt_signal":    opt_signal,
+        "vwap":          vwap,
+        "fut_price":     fut_price,
+        "spot_price":    spot,
+        "vwap_signal":   vwap_signal,
+        "nifty_move_pct": nifty_move_pct,
+        "nearest_level": nearest_level,
+        "nearest_label": nearest_label,
+        "distance_pts":  distance_pts,
+        "rsi_15m":       rsi_15m,
+        "ema_signal":    ema_signal,
+        "ema5":          ema5_val,
+        "ema13":         ema13_val,
+        "bias":          bias or "SIDEWAYS",
+        "support":       key_levels.get("support") if key_levels else None,
+        "resistance":    key_levels.get("resistance") if key_levels else None,
+        "strong_support":    key_levels.get("strong_support") if key_levels else None,
+        "strong_resistance": key_levels.get("strong_resistance") if key_levels else None,
+    }
+
+    log_file = "oi_log_banknifty.json"
+    entries  = []
+
+    if os.path.exists(log_file):
+        try:
+            with open(log_file, "r", encoding="utf-8") as f:
+                entries = json.load(f)
+            if not isinstance(entries, list):
+                entries = []
+        except Exception as e:
+            print(f"  ⚠️  Could not read existing oi_log_banknifty.json: {e} — starting fresh")
+            entries = []
+    else:
+        print("  📭 oi_log_banknifty.json not found — starting fresh log for today")
+
+    # ── Daily reset: clear previous day entries on every trading day run ──
+    today_str  = ist_now.strftime('%d-%b-%Y')
+    is_weekday = ist_now.weekday() < 5  # Mon=0 to Fri=4
+    is_holiday = today_str in NSE_FO_HOLIDAYS
+    is_trading_day = is_weekday and not is_holiday
+
+    if not is_trading_day:
+        # Weekend or holiday — preserve last session data, skip new snapshot
+        print(f"  ⏸️  Not a trading day ({today_str}) — preserving last session data, skipping snapshot")
+        return
+
+    # It IS a trading day — always purge any non-today entries before appending
+    if entries:
+        before_count = len(entries)
+        entries = [
+            e for e in entries
+            if e.get('timestamp', '').startswith(today_str)
+        ]
+        removed = before_count - len(entries)
+        if removed > 0:
+            print(f"  🔄 Purged {removed} old entries — keeping only today: {today_str}")
+        else:
+            print(f"  ✅ Log already clean — all entries are from today: {today_str}")
+
+    entries.insert(0, snapshot)
+    entries = entries[:200]
+
+    with open(log_file, "w", encoding="utf-8") as f:
+        json.dump(entries, f, indent=2, ensure_ascii=False)
+
+    print(f"  📊 OI snapshot logged → {ist_now.strftime('%H:%M IST')} | "
+          f"CE Δ={ce_chg:+,} | PE Δ={pe_chg:+,} | Diff={diff:+,} | "
+          f"PCR={pcr:.2f} | Signal={opt_signal} | Spot={spot} | "
+          f"Move%={nifty_move_pct:+.2f}% | Total entries={len(entries)}"
+          if nifty_move_pct is not None else
+          f"  📊 OI snapshot logged → {ist_now.strftime('%H:%M IST')} | "
+          f"CE Δ={ce_chg:+,} | PE Δ={pe_chg:+,} | Diff={diff:+,} | "
+          f"PCR={pcr:.2f} | Signal={opt_signal} | Spot={spot} | "
+          f"Move%=N/A | Total entries={len(entries)}")
+
+
+def build_intraday_oi_tab_html():
+    return """
+    <!-- TAB: INTRADAY OI TREND -->
+    <div class="tab-panel" id="tab-oi-trend">
+      <div class="section">
+        <div class="section-title">
+          <span>&#128202;</span> INTRADAY OI TREND
+          <span class="annot-badge">AUTO-LOGGED EVERY RUN &middot; IST</span>
+          <span style="font-size:10px;color:rgba(128,222,234,0.35);font-weight:400;margin-left:auto;">
+            Source: <code style="color:#4fc3f7;font-family:'JetBrains Mono',monospace;">oi_log_banknifty.json</code>
+          </span>
+        </div>
+        <div class="oi-controls">
+          <div class="oi-interval-btns">
+            <button class="oi-int-btn active" id="btn3" onclick="setOIInterval(3,this)">3 Min</button>
+            <button class="oi-int-btn" id="btn5" onclick="setOIInterval(5,this)">5 Min</button>
+            <button class="oi-int-btn" id="btn15" onclick="setOIInterval(15,this)">15 Min</button>
+            <button class="oi-int-btn" id="btn60" onclick="setOIInterval(60,this)">1 Hr</button>
+          </div>
+          <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
+            <div class="oi-live-badge"><span class="oi-live-dot"></span> LIVE &middot; IST &middot; Auto-refresh 30s</div>
+            <div id="oiLastFetch" style="font-family:'JetBrains Mono',monospace;font-size:9px;color:rgba(128,222,234,0.8);letter-spacing:1px;">Last fetch: —</div>
+          </div>
+        </div>
+        <div class="oi-summary-strip">
+          <div class="oi-sum-card">
+            <div class="oi-sum-label">Latest PCR</div>
+            <div class="oi-sum-val oi-pcr-val" id="oiLatestPCR">—</div>
+          </div>
+          <div class="oi-sum-card">
+            <div class="oi-sum-label">Net OI Diff</div>
+            <div class="oi-sum-val" id="oiLatestDiff">—</div>
+          </div>
+          <div class="oi-sum-card">
+            <div class="oi-sum-label">Spot Price</div>
+            <div class="oi-sum-val oi-spot-cell" id="oiLatestSpot">—</div>
+          </div>
+          <div class="oi-sum-card">
+            <div class="oi-sum-label">OI Signal</div>
+            <div class="oi-sum-val" id="oiLatestSignal">—</div>
+          </div>
+        </div>
+        <!-- OI Stat Boxes -->
+        <div class="oi-stat-strip">
+          <div class="oi-stat-box">
+            <div class="oi-stat-label">LATEST DIFF</div>
+            <div class="oi-stat-val" id="oiStatLatest">—</div>
+            <div class="oi-stat-sub">PE &#916; &#8722; CE &#916;</div>
+          </div>
+          <div class="oi-stat-box">
+            <div class="oi-stat-label">SESSION HIGH</div>
+            <div class="oi-stat-val oi-stat-pos" id="oiStatHigh">—</div>
+            <div class="oi-stat-sub">Most bullish</div>
+          </div>
+          <div class="oi-stat-box">
+            <div class="oi-stat-label">SESSION LOW</div>
+            <div class="oi-stat-val oi-stat-neg" id="oiStatLow">—</div>
+            <div class="oi-stat-sub">Most bearish</div>
+          </div>
+          <div class="oi-stat-box">
+            <div class="oi-stat-label">TREND SIGNAL</div>
+            <div class="oi-stat-val" id="oiStatSignal">—</div>
+            <div class="oi-stat-sub" id="oiStatSignalSub">Calculating...</div>
+          </div>
+        </div>
+
+        <!-- ══ SIDE-BY-SIDE: Signal History + Sparkline (left) | BANKNIFTY Live Feed (right) ══ -->
+        <div class="nlf-side-by-side">
+          <!-- LEFT: Signal History + OI Sparkline -->
+          <div class="nlf-left">
+            <!-- Signal History Bar -->
+            <div style="display:flex;align-items:center;gap:10px;margin-bottom:12px;">
+              <span style="font-size:8px;letter-spacing:2px;color:rgba(128,222,234,0.9);text-transform:uppercase;white-space:nowrap;font-family:'JetBrains Mono',monospace;">SIGNAL HISTORY</span>
+              <div id="oiSignalBar" style="flex:1;display:flex;gap:3px;height:6px;border-radius:4px;overflow:hidden;"></div>
+            </div>
+
+            <div class="oi-chart-wrap" style="margin-bottom:0;">
+              <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+                <div class="oi-chart-label">NET OI DIFF (PE &#916; &#8722; CE &#916;) &mdash; INTRADAY SPARKLINE</div>
+                <div id="oiChartEntries" style="font-family:'JetBrains Mono',monospace;font-size:9px;color:rgba(128,222,234,0.8);letter-spacing:1px;"></div>
+              </div>
+              <!-- Chart: Y-labels + Canvas + Crosshair + Tooltip -->
+              <div style="display:flex;gap:0;position:relative;">
+                <div id="oiYLabels" style="width:58px;display:flex;flex-direction:column;justify-content:space-between;padding:4px 0;pointer-events:none;flex-shrink:0;"></div>
+                <div style="flex:1;position:relative;min-width:0;">
+                  <canvas id="oiSparklineCanvas" style="width:100%;height:300px;display:block;"></canvas>
+                  <div id="oiCrosshair" style="position:absolute;top:0;bottom:0;width:1px;background:rgba(79,195,247,0.3);pointer-events:none;display:none;z-index:10;"></div>
+                  <div id="oiChartTooltip" style="position:absolute;pointer-events:none;background:rgba(6,13,20,0.97);border:1px solid rgba(79,195,247,0.35);border-radius:8px;padding:9px 13px;font-family:'JetBrains Mono',monospace;font-size:11px;color:#e0f7fa;display:none;z-index:20;white-space:nowrap;box-shadow:0 8px 24px rgba(0,0,0,0.6);min-width:160px;">
+                    <div id="oiTTTime" style="font-size:9px;color:rgba(128,222,234,0.45);letter-spacing:1px;margin-bottom:5px;"></div>
+                    <div style="display:flex;justify-content:space-between;gap:16px;margin-bottom:2px;"><span style="color:rgba(176,190,197,0.5);">NET DIFF</span><span id="oiTTDiff" style="font-weight:700;"></span></div>
+                    <div style="display:flex;justify-content:space-between;gap:16px;margin-bottom:2px;"><span style="color:rgba(176,190,197,0.5);">CE &#916;</span><span id="oiTTCE" style="font-weight:700;color:#f87171;"></span></div>
+                    <div style="display:flex;justify-content:space-between;gap:16px;margin-bottom:2px;"><span style="color:rgba(176,190,197,0.5);">PE &#916;</span><span id="oiTTPE" style="font-weight:700;color:#34d399;"></span></div>
+                    <div style="display:flex;justify-content:space-between;gap:16px;"><span style="color:rgba(176,190,197,0.5);">SIGNAL</span><span id="oiTTSignal" style="font-weight:700;"></span></div>
+                  </div>
+                </div>
+              </div>
+              <!-- X-axis time labels -->
+              <div id="oiXLabels" style="display:flex;justify-content:space-between;padding:4px 0 0 60px;"></div>
+              <!-- Legend -->
+              <div style="display:flex;gap:20px;justify-content:center;flex-wrap:wrap;margin-top:10px;padding-top:10px;border-top:1px solid rgba(79,195,247,0.08);">
+                <div style="display:flex;align-items:center;gap:7px;font-size:10px;color:rgba(176,190,197,0.45);">
+                  <span style="display:inline-block;width:24px;height:2px;background:linear-gradient(90deg,#10b981,#34d399);border-radius:1px;"></span> Bullish Zone
+                </div>
+                <div style="display:flex;align-items:center;gap:7px;font-size:10px;color:rgba(176,190,197,0.45);">
+                  <span style="display:inline-block;width:24px;height:2px;background:linear-gradient(90deg,#ef4444,#f97316);border-radius:1px;"></span> Bearish Zone
+                </div>
+                <div style="display:flex;align-items:center;gap:7px;font-size:10px;color:rgba(176,190,197,0.45);">
+                  <span style="display:inline-block;width:24px;height:2px;border-top:1px dashed rgba(79,195,247,0.5);"></span> Zero Line
+                </div>
+              </div>
+            </div>
+          </div><!-- /nlf-left -->
+
+          <!-- RIGHT: BANKNIFTY Live Feed -->
+          <div class="nlf-right">
+            <div class="nlf-panel" id="niftyLiveFeed">
+              <!-- Header -->
+              <div class="nlf-header">
+                <div class="nlf-title-row">
+                  <span class="nlf-live-dot"></span>
+                  <span class="nlf-title">BANKNIFTY Live</span>
+                </div>
+                <div class="nlf-meta" id="nlfMeta">
+                  <span class="nlf-meta-spot">Spot <b id="nlfSpot">—</b></span>
+                  <span class="nlf-meta-item" id="nlfR1">R1 —</span>
+                  <span class="nlf-meta-sep">&middot;</span>
+                  <span class="nlf-meta-item">PCR <b id="nlfPCR">—</b></span>
+                </div>
+              </div>
+              <!-- Signal Badges -->
+              <div class="nlf-badges" id="nlfBadges"></div>
+              <!-- Table Header -->
+              <div class="nlf-thead">
+                <span class="nlf-th" style="text-align:left;">TIME</span>
+                <span class="nlf-th">SPOT</span>
+                <span class="nlf-th" style="text-align:right;">&#916;</span>
+                <span class="nlf-th" style="text-align:right;">NIFTY%</span>
+                <span class="nlf-th" style="text-align:center;">VWAP</span>
+                <span class="nlf-th" style="text-align:right;">NET OI</span>
+                <span class="nlf-th" style="text-align:right;">STK</span>
+                <span class="nlf-th" style="text-align:right;">RSI</span>
+              </div>
+              <!-- Table Body (populated by JS) -->
+              <div id="nlfBody" class="nlf-tbody"></div>
+              <!-- Footer -->
+              <div class="nlf-footer" id="nlfFooter"></div>
+            </div>
+          </div><!-- /nlf-right -->
+        </div><!-- /nlf-side-by-side -->
+        <div class="oi-table-wrap">
+          <!-- FOCUS / DETAIL toggle -->
+          <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px;">
+            <span style="font-family:'JetBrains Mono',monospace;font-size:9px;letter-spacing:2px;color:rgba(128,222,234,0.4);text-transform:uppercase;">VIEW</span>
+            <button id="btnFocus" onclick="setOIView('focus')" class="oi-view-btn oi-view-active">⚡ FOCUS</button>
+            <button id="btnDetail" onclick="setOIView('detail')" class="oi-view-btn">📊 DETAIL</button>
+          </div>
+          <div class="oi-table-scroll-hint">&#8596; Scroll to see all columns</div>
+          <table class="oi-table">
+            <thead>
+              <tr>
+                <th style="text-align:left;">TIME (IST)</th>
+                <th class="col-detail">CALL OI &#916;</th>
+                <th class="col-detail">PUT OI &#916;</th>
+                <th class="col-detail">DIFF</th>
+                <th>PCR</th>
+                <th>OPTION SIGNAL</th>
+                <th>SPOT PRICE</th>
+                <th>SPOT &#916;</th>
+                <th>BANKNIFTY MOVE %</th>
+                <th>STREAK</th>
+                <th>NEAREST LEVEL</th>
+                <th>DISTANCE</th>
+                <th>RSI 15M</th>
+                <th>EMA 5/13</th>
+                <th class="col-detail">VWAP</th>
+                <th>CONFLUENCE</th>
+              </tr>
+            </thead>
+            <tbody id="oiTableBody">
+              <tr><td colspan="16" class="oi-empty-state">&#8987; Loading oi_log_banknifty.json&hellip;</td></tr>
+            </tbody>
+          </table>
+        </div>
+          <div class="logic-box" style="margin-top:16px;">
+          <div class="logic-box-head">&#128214; HOW TO READ THIS TABLE</div>
+          <div class="logic-grid">
+            <div class="logic-item"><span class="lc-bear">Call OI +</span> Writers adding calls &#8594; Bearish pressure</div>
+            <div class="logic-item"><span class="lc-bull">Put OI +</span> Writers adding puts &#8594; Bullish support</div>
+            <div class="logic-item"><span class="lc-info">DIFF</span> = PE &#916; &#8722; CE &#916; &nbsp;&middot;&nbsp; <span class="lc-bull">+ve = Bullish</span> &nbsp;<span class="lc-bear">&#8722;ve = Bearish</span></div>
+            <div class="logic-item"><span class="lc-info">3/5/15 Min · 1 Hr</span> filters raw rows or aggregates into time slots</div>
+            <div class="logic-item"><span class="lc-bull">SPOT &#916;</span> Price change since previous snapshot &nbsp;&middot;&nbsp; &#9650; up &nbsp; &#9660; down &nbsp; &#8594; flat</div>
+            <div class="logic-item"><span class="lc-bull">BANKNIFTY MOVE %</span> % change from previous day close &nbsp;&middot;&nbsp; &#9650; green = up &nbsp; &#9660; red = down &nbsp; &#8594; flat = ±0.1%</div>
+            <div class="logic-item"><span class="lc-bull">STREAK</span> Consecutive snapshots with same signal &nbsp;&middot;&nbsp; &#215;1 = just flipped &nbsp;&middot;&nbsp; &#215;5+ = strong trend</div>
+            <div class="logic-item"><span class="lc-info">RSI 15M</span> 14-period RSI on 15-min candles &nbsp;&middot;&nbsp; <span class="lc-bull">&lt;30 = Oversold (OS) &nbsp;BUY zone</span> &nbsp;<span class="lc-bear">&gt;70 = Overbought (OB) &nbsp;SELL zone</span> &nbsp;&middot;&nbsp; 55+ = mild bull &nbsp;45&minus; = mild bear</div>
+            <div class="logic-item"><span class="lc-info">EMA 5/13</span> 15-min EMA crossover &nbsp;&middot;&nbsp; <span class="lc-bull">▲ BUY = EMA5 &gt; EMA13 (uptrend)</span> &nbsp;<span class="lc-bear">▼ SELL = EMA5 &lt; EMA13 (downtrend)</span> &nbsp;&middot;&nbsp; Gap = distance between EMAs (bigger = stronger trend)</div>
+            <div class="logic-item"><span class="lc-info">VWAP</span> Volume Weighted Avg Price &nbsp;&middot;&nbsp; <span class="lc-bull">▲ Above = Bullish bias</span> &nbsp;<span class="lc-bear">▼ Below = Bearish bias</span></div>
+            <div class="logic-item"><span class="lc-info">CONFLUENCE</span> Counts 5 signals (PCR, OI, VWAP, RSI, EMA) &nbsp;&middot;&nbsp; <span class="lc-bull">4-5/5 = STRONG</span> &nbsp;<span class="lc-side">3/5 = Moderate</span> &nbsp;<span class="lc-bear">&lt;3 = WEAK &mdash; avoid trade</span></div>
+            <div class="logic-item"><span class="lc-bear">⚠ NOISY</span> Signals at 9:15&ndash;9:20 and 3:25&ndash;3:30 are unreliable &mdash; opening/closing auction noise</div>
+            <div class="logic-item"><span class="lc-info">Timestamps</span> All times shown in IST (Asia/Kolkata)</div>
+          </div>
+        </div>
+      </div>
+    </div><!-- /tab-oi-trend -->
+"""
+
+
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  PRE-TRADE CHECKLIST — v6 addition
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def get_pretrade_checklist_css():
+    """CSS for the Pre-Trade Checklist tab — deep ocean theme."""
+    return """
+        /* PRE-TRADE CHECKLIST */
+        .ptc-progress-wrap{background:rgba(6,13,20,0.85);border:1px solid rgba(79,195,247,0.18);border-radius:14px;padding:18px 22px;margin-bottom:22px;}
+        .ptc-progress-header{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;margin-bottom:12px;}
+        .ptc-progress-label{font-family:'JetBrains Mono',monospace;font-size:10px;letter-spacing:2.5px;text-transform:uppercase;color:rgba(128,222,234,0.8);font-weight:700;}
+        .ptc-progress-count{font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:700;color:#80deea;}
+        .ptc-reset-btn{font-family:'Oxanium',sans-serif;font-size:10px;font-weight:700;letter-spacing:1px;padding:5px 14px;border-radius:20px;border:1px solid rgba(79,195,247,0.3);background:rgba(79,195,247,0.06);color:rgba(79,195,247,0.7);cursor:pointer;transition:all 0.2s ease;}
+        .ptc-reset-btn:hover{border-color:rgba(79,195,247,0.6);color:#4fc3f7;background:rgba(79,195,247,0.12);}
+        .ptc-bar-track{height:6px;background:rgba(0,0,0,0.4);border-radius:3px;overflow:hidden;margin-bottom:12px;}
+        .ptc-bar-fill{height:100%;border-radius:3px;background:linear-gradient(90deg,#00e5ff,#0288d1);transition:width 0.5s cubic-bezier(0.4,0,0.2,1),background 0.4s ease;}
+        .ptc-verdict{display:flex;align-items:center;gap:10px;font-size:13px;color:#80deea;font-family:'Rajdhani',sans-serif;font-weight:600;transition:color 0.3s ease;}
+        .ptc-verdict-icon{font-size:18px;flex-shrink:0;}
+        .ptc-list{display:flex;flex-direction:column;gap:0;}
+        .ptc-section-label{font-family:'JetBrains Mono',monospace;font-size:9px;letter-spacing:3px;text-transform:uppercase;font-weight:700;padding:6px 14px;margin:16px 0 6px 0;display:inline-block;border-radius:4px;}
+        .ptc-item{display:flex;align-items:center;gap:14px;padding:13px 18px;margin-bottom:5px;border-radius:6px;cursor:pointer;background:rgba(19,26,34,0.9);border:1px solid rgba(79,195,247,0.07);border-left-width:3px;user-select:none;transition:opacity 0.25s ease,filter 0.25s ease,background 0.2s ease;position:relative;overflow:hidden;}
+        .ptc-item::before{content:'';position:absolute;top:0;left:0;right:0;height:1px;background:linear-gradient(90deg,transparent,rgba(255,255,255,0.04),transparent);}
+        .ptc-item:hover{filter:brightness(1.12);background:rgba(26,36,48,0.95);}
+        .ptc-item.ptc-checked{opacity:0.42;}
+        .ptc-item.ptc-checked .ptc-text{text-decoration:line-through;text-decoration-color:rgba(176,190,197,0.4);}
+        .ptc-checkbox{width:20px;height:20px;border:2px solid;border-radius:3px;flex-shrink:0;display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:700;transition:all 0.2s ease;background:rgba(0,0,0,0.25);}
+        .ptc-text{font-family:'Rajdhani',sans-serif;font-size:clamp(13px,1.6vw,15px);font-weight:500;color:#c9d1d9;line-height:1.45;transition:text-decoration 0.2s ease;}
+        .ptc-text b{font-weight:700;}
+        .ptc-warning{font-size:11px;color:#ff4d4d;font-family:'JetBrains Mono',monospace;letter-spacing:0.5px;font-weight:700;margin-left:4px;}
+        .ptc-mindset-box{display:flex;align-items:flex-start;gap:16px;background:linear-gradient(135deg,rgba(79,195,247,0.05),rgba(124,77,255,0.05));border:1px solid rgba(79,195,247,0.14);border-radius:12px;padding:18px 22px;margin-top:22px;}
+        .ptc-mindset-icon{font-size:22px;flex-shrink:0;margin-top:2px;}
+        .ptc-mindset-title{font-family:'JetBrains Mono',monospace;font-size:10px;letter-spacing:2.5px;color:rgba(128,222,234,0.8);text-transform:uppercase;font-weight:700;margin-bottom:7px;}
+        .ptc-mindset-text{font-size:clamp(13px,1.5vw,14px);color:rgba(200,221,232,0.9);line-height:1.7;font-family:'Rajdhani',sans-serif;font-weight:500;}
+        .ptc-mindset-text strong{color:#4fc3f7;font-weight:700;}
+        @media(max-width:600px){.ptc-item{padding:10px 12px;gap:10px;}.ptc-text{font-size:13px;}.ptc-mindset-box{flex-direction:column;gap:10px;}}
+"""
+
+
+def build_pretrade_checklist_tab_html():
+    """
+    Builds the complete Pre-Trade Checklist tab HTML.
+    23 rules across 7 colour-coded sections.
+    """
+
+    # ── Section + item definitions ────────────────────────────────────────────
+    sections = [
+        {
+            "id": "core", "label": "Core Rules", "icon": "&#9881;",
+            "bg": "rgba(255,77,77,0.08)", "col": "#ff6060",
+            "items": [
+                {"id": "rr",      "c": "#ff4d4d",
+                 "h": 'Is R:R ratio &ge; 1.5? <b style="color:#ff4d4d;">If not, skip this trade.</b>'},
+                {"id": "levels",  "c": "#ffa500",
+                 "h": 'Is current price too close to <b style="color:#ffa500;">resistance (bearish) or support (bullish)</b>? If yes, wait.'},
+                {"id": "exits",   "c": "#e6c619",
+                 "h": 'Have I <b style="color:#e6c619;">written down all 3 exit conditions</b> above?'},
+                {"id": "capital", "c": "#00bcd4",
+                 "h": 'Am I risking <b style="color:#00bcd4;">&le; 2% of total capital</b> on this trade?'},
+                {"id": "event",   "c": "#9b59b6",
+                 "h": 'Is there a <b style="color:#9b59b6;">major event</b> (RBI, earnings, expiry) before my time exit?'},
+                {"id": "halfway", "c": "#2ecc71",
+                 "h": 'If halfway to target and stalled &mdash; <b style="color:#2ecc71;">take 50% profits and reassess.</b>'},
+            ]
+        },
+        {
+            "id": "market", "label": "Market Context", "icon": "&#127760;",
+            "bg": "rgba(0,229,255,0.08)", "col": "#00e5ff",
+            "items": [
+                {"id": "broader",  "c": "#00e5ff",
+                 "h": 'Is the broader market <b style="color:#00e5ff;">(Nifty/Sensex)</b> trending in my trade direction?'},
+                {"id": "trend",    "c": "#00e5ff",
+                 "h": 'Am I trading <b style="color:#00e5ff;">with the primary trend</b> on the higher timeframe?'},
+                {"id": "vol_sess", "c": "#00e5ff",
+                 "h": 'Is this a <b style="color:#00e5ff;">low-volume / holiday session</b>? If yes, avoid or reduce size.'},
+            ]
+        },
+        {
+            "id": "setup", "label": "Setup Quality", "icon": "&#127919;",
+            "bg": "rgba(255,171,64,0.08)", "col": "#ffab40",
+            "items": [
+                {"id": "confluence", "c": "#ffab40",
+                 "h": 'Is there a clear <b style="color:#ffab40;">confluence</b> &mdash; volume, breakout, or pattern confirmation?'},
+                {"id": "candle",     "c": "#ffab40",
+                 "h": 'Have I waited for <b style="color:#ffab40;">candle close confirmation</b> &mdash; not just a wick touch?'},
+                {"id": "agrade",     "c": "#ffab40",
+                 "h": 'Is this an <b style="color:#ffab40;">A-grade setup</b>, or am I forcing a trade out of FOMO?'},
+            ]
+        },
+        {
+            "id": "timing", "label": "Timing", "icon": "&#9201;",
+            "bg": "rgba(181,234,58,0.08)", "col": "#b5ea3a",
+            "items": [
+                {"id": "open15", "c": "#b5ea3a",
+                 "h": 'Am I <b style="color:#b5ea3a;">avoiding the first 15 minutes</b> of market open?'},
+                {"id": "eod1h",  "c": "#b5ea3a",
+                 "h": 'Is there <b style="color:#b5ea3a;">less than 1 hour left</b> in the session? If yes, reduce size or avoid.'},
+            ]
+        },
+        {
+            "id": "psych", "label": "Psychology &amp; Discipline", "icon": "&#129504;",
+            "bg": "rgba(240,98,146,0.08)", "col": "#f06292",
+            "items": [
+                {"id": "losses2", "c": "#f06292",
+                 "h": 'Have I already taken <b style="color:#f06292;">2+ losses today</b>? <span class="ptc-warning">If yes &mdash; STOP trading.</span>'},
+                {"id": "revenge", "c": "#f06292",
+                 "h": 'Am I trading to <b style="color:#f06292;">recover a loss</b>? <span class="ptc-warning">Revenge trading check.</span>'},
+                {"id": "mental",  "c": "#f06292",
+                 "h": 'Am I in the <b style="color:#f06292;">right mental state</b> &mdash; calm, not anxious or overconfident?'},
+            ]
+        },
+        {
+            "id": "position", "label": "Position &amp; Execution", "icon": "&#128208;",
+            "bg": "rgba(77,182,172,0.08)", "col": "#4db6ac",
+            "items": [
+                {"id": "possize", "c": "#4db6ac",
+                 "h": 'Is my <b style="color:#4db6ac;">position size pre-calculated</b> before entry?'},
+                {"id": "slplace", "c": "#4db6ac",
+                 "h": 'Will I place my <b style="color:#4db6ac;">stop-loss order immediately</b> after entry?'},
+                {"id": "target",  "c": "#4db6ac",
+                 "h": 'Is my <b style="color:#4db6ac;">target based on structure</b> &mdash; not wishful thinking?'},
+            ]
+        },
+        {
+            "id": "options", "label": "Options-Specific", "icon": "&#128202;",
+            "bg": "rgba(206,147,216,0.08)", "col": "#ce93d8",
+            "items": [
+                {"id": "iv",          "c": "#ce93d8",
+                 "h": 'Is <b style="color:#ce93d8;">IV (Implied Volatility)</b> too high to buy options profitably?'},
+                {"id": "theta",       "c": "#ce93d8",
+                 "h": 'Is <b style="color:#ce93d8;">theta (time decay)</b> working for or against me?'},
+                {"id": "expiry_time", "c": "#ce93d8",
+                 "h": 'Am I close to <b style="color:#ce93d8;">expiry</b> with insufficient time for the move to play out?'},
+            ]
+        },
+    ]
+
+    all_ids  = [it["id"] for sec in sections for it in sec["items"]]
+    TOTAL    = len(all_ids)
+    ids_json = "[" + ",".join(f'"{i}"' for i in all_ids) + "]"
+
+    # ── Build HTML for all items ──────────────────────────────────────────────
+    body_html = ""
+    for sec in sections:
+        body_html += (
+            f'<div class="ptc-section-label"'
+            f' style="background:{sec["bg"]};color:{sec["col"]};">'
+            f'{sec["icon"]} &nbsp;{sec["label"]}</div>'
+        )
+        for it in sec["items"]:
+            body_html += (
+                f'<div class="ptc-item" id="ptc-{it["id"]}"'
+                f' style="border-left-color:{it["c"]};"'
+                f' onclick="ptcToggle(\'{it["id"]}\')">'
+                f'<div class="ptc-checkbox"'
+                f' style="border-color:{it["c"]};color:{it["c"]};"'
+                f' id="ptc-cb-{it["id"]}"></div>'
+                f'<div class="ptc-text">{it["h"]}</div></div>'
+            )
+
+    return f"""
+    <!-- TAB: PRE-TRADE CHECKLIST -->
+    <div class="tab-panel" id="tab-pretrade">
+      <div class="section">
+        <div class="section-title">
+          <span>&#9989;</span> PRE-TRADE CHECKLIST
+          <span style="font-size:11px;color:rgba(128,222,234,0.75);font-weight:600;letter-spacing:1px;margin-left:auto;">
+            {TOTAL} rules &middot; Click to check / uncheck
+          </span>
+        </div>
+
+        <div class="ptc-progress-wrap">
+          <div class="ptc-progress-header">
+            <span class="ptc-progress-label">CHECKLIST PROGRESS</span>
+            <div style="display:flex;align-items:center;gap:12px;">
+              <span class="ptc-progress-count">
+                <span id="ptcChecked">0</span> / {TOTAL} checked
+              </span>
+              <button class="ptc-reset-btn" onclick="ptcReset()">&#8635; Reset</button>
+            </div>
+          </div>
+          <div class="ptc-bar-track">
+            <div class="ptc-bar-fill" id="ptcBarFill" style="width:0%"></div>
+          </div>
+          <div class="ptc-verdict">
+            <span class="ptc-verdict-icon" id="ptcVerdictIcon">&#9634;</span>
+            <span id="ptcVerdictText">Complete the checklist before entering any trade.</span>
+          </div>
+        </div>
+
+        <div class="ptc-list">
+          {body_html}
+        </div>
+
+        <div class="ptc-mindset-box">
+          <span class="ptc-mindset-icon">&#129497;</span>
+          <div>
+            <div class="ptc-mindset-title">TRADING MINDSET REMINDER</div>
+            <div class="ptc-mindset-text">
+              A loss that follows your rules is <strong>not a failure</strong>.
+              A loss without rules <strong>is</strong>. &nbsp;&middot;&nbsp;
+              Your job is not to be right &mdash; it is to <strong>manage risk</strong>.
+              &nbsp;&middot;&nbsp; <strong>No setup = No trade.</strong>
+            </div>
+          </div>
+        </div>
+
+        <div class="disclaimer" style="margin-top:16px;">
+          <span class="disc-icon">&#9888;&#65039;</span>
+          <span class="disc-label">Disclaimer</span>
+          <span class="disc-sep">|</span>
+          <span class="disc-text">For <strong>EDUCATIONAL purposes only</strong> &mdash; NOT financial advice.</span>
+          <span class="disc-sep">|</span>
+          <span class="disc-text">Always consult a SEBI-registered advisor before trading.</span>
+        </div>
+      </div>
+    </div><!-- /tab-pretrade -->
+
+    <script>
+    (function() {{
+      var IDS   = {ids_json};
+      var TOTAL = {TOTAL};
+      var KEY   = 'ptc_v1';
+
+      function save() {{
+        var s = {{}};
+        IDS.forEach(function(id) {{
+          var r = document.getElementById('ptc-' + id);
+          s[id] = r ? r.classList.contains('ptc-checked') : false;
+        }});
+        try {{ sessionStorage.setItem(KEY, JSON.stringify(s)); }} catch(e) {{}}
+      }}
+
+      function load() {{
+        try {{ var r = sessionStorage.getItem(KEY); return r ? JSON.parse(r) : {{}}; }}
+        catch(e) {{ return {{}}; }}
+      }}
+
+      function apply(s) {{
+        IDS.forEach(function(id) {{
+          var row = document.getElementById('ptc-' + id);
+          var cb  = document.getElementById('ptc-cb-' + id);
+          if (!row || !cb) return;
+          if (s[id]) {{ row.classList.add('ptc-checked');    cb.innerHTML = '&#10003;'; }}
+          else       {{ row.classList.remove('ptc-checked'); cb.innerHTML = ''; }}
+        }});
+        redraw();
+      }}
+
+      function redraw() {{
+        var n   = document.querySelectorAll('.ptc-item.ptc-checked').length;
+        var pct = Math.round(n / TOTAL * 100);
+        var fill = document.getElementById('ptcBarFill');
+        var cnt  = document.getElementById('ptcChecked');
+        var icon = document.getElementById('ptcVerdictIcon');
+        var txt  = document.getElementById('ptcVerdictText');
+        if (fill) fill.style.width = pct + '%';
+        if (cnt)  cnt.textContent  = n;
+        if (pct === 100) {{
+          if (fill) fill.style.background = 'linear-gradient(90deg,#00e676,#00bfa5)';
+          if (icon) icon.innerHTML = '&#128640;';
+          if (txt)  {{ txt.textContent = 'All checks passed \u2014 you may proceed!'; txt.style.color = '#00e676'; }}
+        }} else if (pct >= 70) {{
+          if (fill) fill.style.background = 'linear-gradient(90deg,#ffb74d,#ff8f00)';
+          if (icon) icon.innerHTML = '&#9888;&#65039;';
+          if (txt)  {{ txt.textContent = 'Almost there \u2014 complete remaining checks.'; txt.style.color = '#ffb74d'; }}
+        }} else {{
+          if (fill) fill.style.background = 'linear-gradient(90deg,#00e5ff,#0288d1)';
+          if (icon) icon.innerHTML = '&#9634;';
+          if (txt)  {{ txt.textContent = 'Complete the checklist before entering any trade.'; txt.style.color = 'rgba(128,222,234,0.6)'; }}
+        }}
+      }}
+
+      window.ptcToggle = function(id) {{
+        var row = document.getElementById('ptc-' + id);
+        var cb  = document.getElementById('ptc-cb-' + id);
+        if (!row || !cb) return;
+        if (!row.classList.contains('ptc-checked')) {{
+          row.classList.add('ptc-checked');    cb.innerHTML = '&#10003;';
+        }} else {{
+          row.classList.remove('ptc-checked'); cb.innerHTML = '';
+        }}
+        redraw(); save();
+      }};
+
+      window.ptcReset = function() {{
+        IDS.forEach(function(id) {{
+          var row = document.getElementById('ptc-' + id);
+          var cb  = document.getElementById('ptc-cb-' + id);
+          if (row) row.classList.remove('ptc-checked');
+          if (cb)  cb.innerHTML = '';
+        }});
+        redraw();
+        try {{ sessionStorage.removeItem(KEY); }} catch(e) {{}}
+      }};
+
+      window.addEventListener('load', function() {{ apply(load()); }});
+
+      /* Hook into switchTab so state restores on tab activation */
+      var _orig = window.switchTab;
+      if (typeof _orig === 'function') {{
+        window.switchTab = function(tab) {{
+          _orig(tab);
+          if (tab === 'pretrade') {{ setTimeout(function() {{ apply(load()); }}, 60); }}
+        }};
+      }}
+    }})();
+    </script>
+"""
+
+
+
+class BankNiftyHTMLAnalyzer:
+    def __init__(self):
+        self.yf_symbol  = "^NSEBANK"
+        self.nse_symbol = "BANKNIFTY"
+        self.report_lines = []
+        self.html_data    = {}
+        self.heatmap_data = []
+        self.heatmap_timestamp = "N/A"
+        self.heatmap_advance = 0
+        self.heatmap_decline = 0
+        self.heatmap_neutral = 0
+
+    def log(self, message):
+        print(message)
+        self.report_lines.append(message)
+
+    def _make_nse_session(self):
+        headers = {
+            "authority": "www.nseindia.com",
+            "accept": "application/json, text/plain, */*",
+            "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             "referer": "https://www.nseindia.com/option-chain",
             "accept-language": "en-US,en;q=0.9",
         }
-        session = curl_requests.Session()
+        session = requests.Session()
         try:
             session.get("https://www.nseindia.com/", headers=headers, impersonate="chrome", timeout=15)
             time.sleep(1.5)
             session.get("https://www.nseindia.com/option-chain", headers=headers, impersonate="chrome", timeout=15)
             time.sleep(1)
         except Exception as e:
-            print(f"  WARNING  Session warm-up: {e}")
+            print(f"  ⚠️  Session warm-up warning: {e}")
         return session, headers
 
-    def _current_or_next_last_tuesday_ist(self):
-        """
-        BankNifty expiry = LAST TUESDAY of the month.
-        - If today is past the last Tuesday of this month → use next month's last Tuesday
-        - If today IS the last Tuesday → use today (expiry day)
-        - Holiday adjustment: if last Tuesday is an NSE holiday → move to previous trading day
-        """
-        import calendar
-        from datetime import date as _date
-
-        today = today_ist()
-
-        def last_tuesday_of_month(year, month):
-            last_day = calendar.monthrange(year, month)[1]
-            d = _date(year, month, last_day)
-            while d.weekday() != 1:   # weekday 1 = Tuesday
-                d -= timedelta(days=1)
-            return d
-
-        # This month's last Tuesday
-        candidate = last_tuesday_of_month(today.year, today.month)
-
-        # If today is past the last Tuesday of this month → use next month's last Tuesday
-        if today > candidate:
-            if today.month == 12:
-                candidate = last_tuesday_of_month(today.year + 1, 1)
-            else:
-                candidate = last_tuesday_of_month(today.year, today.month + 1)
-
-        # ── Holiday adjustment ────────────────────────────────────
-        if is_nse_holiday(candidate):
-            reason = NSE_HOLIDAYS_2026.get(
-                candidate.strftime("%d-%b-%Y"), "Holiday/Weekend"
-            )
-            adjusted = get_prev_trading_day(candidate)
-            print(
-                f"  [Holiday] {candidate.strftime('%d-%b-%Y')} is '{reason}'. "
-                f"BankNifty expiry moved to {adjusted.strftime('%d-%b-%Y')} ({adjusted.strftime('%A')})"
-            )
-            expiry_date = adjusted
+    def get_upcoming_expiry_wednesday(self):
+        ist_tz      = pytz.timezone('Asia/Kolkata')
+        now_ist     = datetime.now(ist_tz)
+        today_ist   = now_ist.date()
+        weekday     = today_ist.weekday()
+        past_cutoff = (now_ist.hour, now_ist.minute) >= (16, 0)
+        if weekday == 2 and not past_cutoff:
+            days_ahead = 0
+        elif weekday == 2 and past_cutoff:
+            days_ahead = 7
+        elif weekday < 2:
+            days_ahead = 2 - weekday
         else:
-            expiry_date = candidate
+            days_ahead = 9 - weekday
+        raw_tuesday = today_ist + timedelta(days=days_ahead)
+        candidate = raw_tuesday
+        for _ in range(6):
+            cstr       = candidate.strftime('%d-%b-%Y')
+            is_weekend = candidate.weekday() >= 5
+            if cstr not in NSE_FO_HOLIDAYS and not is_weekend:
+                break
+            candidate -= timedelta(days=1)
+        expiry_str = candidate.strftime('%d-%b-%Y')
+        holiday_shifted = (candidate != raw_tuesday)
+        shift_note = f" ⚠️ HOLIDAY SHIFT from {raw_tuesday.strftime('%d-%b-%Y')}" if holiday_shifted else ""
+        print(f"  📅 Now (IST): {now_ist.strftime('%A %d-%b-%Y %H:%M')} | "
+              f"Raw Tue: {raw_tuesday.strftime('%d-%b-%Y')} | "
+              f"Adjusted expiry: {expiry_str}{shift_note} | "
+              f"Past 4PM: {past_cutoff}")
+        return expiry_str
 
-        result = expiry_date.strftime("%d-%b-%Y")
-        print(f"  {self.display_name} computed expiry (last Tue of month, holiday-adjusted): {result}")
-        return result
-
-    def _fetch_available_expiries(self, session, headers):
-        """Fallback: fetch actual expiry list from NSE and pick nearest upcoming."""
+    def fetch_available_expiries(self, session, headers):
         try:
-            url = f"https://www.nseindia.com/api/option-chain-v3?type=Indices&symbol={self.symbol}"
+            url  = f"https://www.nseindia.com/api/option-chain-v3?type=Indices&symbol={self.nse_symbol}"
             resp = session.get(url, headers=headers, impersonate="chrome", timeout=20)
             if resp.status_code == 200:
-                expiries = resp.json().get("records", {}).get("expiryDates", [])
+                data     = resp.json()
+                expiries = data.get('records', {}).get('expiryDates', [])
                 if expiries:
-                    today = today_ist()
-                    for exp_str in expiries:
-                        try:
-                            exp_dt = datetime.strptime(exp_str, "%d-%b-%Y").date()
-                            if exp_dt >= today:
-                                print(f"  Fallback expiry from NSE API: {exp_str}")
-                                return exp_str
-                        except Exception:
-                            continue
+                    print(f"  📅 NSE available expiries: {expiries[:5]}")
                     return expiries[0]
         except Exception as e:
-            print(f"  WARNING  Expiry fetch: {e}")
+            print(f"  ⚠️  Could not fetch expiry list: {e}")
         return None
 
-    def _fetch_for_expiry(self, session, headers, expiry):
-        api_url = (
-            f"https://www.nseindia.com/api/option-chain-v3"
-            f"?type=Indices&symbol={self.symbol}&expiry={expiry}"
-        )
+    def fetch_nse_option_chain_silent(self):
+        session, headers = self._make_nse_session()
+        real_expiry = self.fetch_available_expiries(session, headers)
+        if real_expiry:
+            print(f"  🗓️  Fetching option chain for NSE live expiry: {real_expiry}")
+            result = self._fetch_chain_for_expiry(session, headers, real_expiry)
+            if result:
+                return result
+            print(f"  ⚠️  Chain data empty for live expiry {real_expiry}. Trying fallback...")
+        computed_expiry = self.get_upcoming_expiry_wednesday()
+        if computed_expiry != real_expiry:
+            print(f"  🔄 Fallback computed expiry: {computed_expiry}")
+            result = self._fetch_chain_for_expiry(session, headers, computed_expiry)
+            if result:
+                return result
+        if real_expiry and real_expiry != computed_expiry:
+            print(f"  🔄 Last attempt with real_expiry: {real_expiry}")
+            result = self._fetch_chain_for_expiry(session, headers, real_expiry)
+            if result:
+                return result
+        print("  ❌ Option chain fetch failed after all attempts.")
+        return None
+
+    def _fetch_chain_for_expiry(self, session, headers, expiry):
+        api_url = (f"https://www.nseindia.com/api/option-chain-v3"
+                   f"?type=Indices&symbol={self.nse_symbol}&expiry={expiry}")
         for attempt in range(1, 3):
             try:
+                print(f"    Attempt {attempt}: expiry={expiry}")
                 resp = session.get(api_url, headers=headers, impersonate="chrome", timeout=30)
+                print(f"    HTTP {resp.status_code}")
                 if resp.status_code != 200:
-                    time.sleep(2)
-                    continue
+                    time.sleep(2); continue
                 json_data  = resp.json()
-                data       = json_data.get("records", {}).get("data", [])
+                data       = json_data.get('records', {}).get('data', [])
                 if not data:
-                    return None
-                underlying = json_data.get("records", {}).get("underlyingValue", 0)
-                step = 50 if self.symbol == "FINNIFTY" else 100
-                atm_strike = round(underlying / step) * step
-                lower_bound = underlying - 2000
-                upper_bound = underlying + 2000
+                    print(f"    ⚠️  Empty data for expiry={expiry}"); return None
                 rows = []
                 for item in data:
-                    strike = item.get("strikePrice")
-                    if strike is None or not (lower_bound <= strike <= upper_bound):
-                        continue
-                    ce = item.get("CE", {})
-                    pe = item.get("PE", {})
+                    strike = item.get('strikePrice')
+                    ce = item.get('CE', {}); pe = item.get('PE', {})
                     rows.append({
-                        "Strike":       strike,
-                        "CE_LTP":       ce.get("lastPrice", 0),
-                        "CE_OI":        ce.get("openInterest", 0),
-                        "CE_Vol":       ce.get("totalTradedVolume", 0),
-                        "PE_LTP":       pe.get("lastPrice", 0),
-                        "PE_OI":        pe.get("openInterest", 0),
-                        "PE_Vol":       pe.get("totalTradedVolume", 0),
-                        "CE_OI_Change": ce.get("changeinOpenInterest", 0),
-                        "PE_OI_Change": pe.get("changeinOpenInterest", 0),
-                        "CE_IV":        ce.get("impliedVolatility", 0),
-                        "PE_IV":        pe.get("impliedVolatility", 0),
-                        "CE_Delta":     ce.get("delta", 0),
-                        "PE_Delta":     pe.get("delta", 0),
-                        "CE_Theta":     ce.get("theta", 0),
-                        "PE_Theta":     pe.get("theta", 0),
-                        "CE_Gamma":     ce.get("gamma", 0),
-                        "PE_Gamma":     pe.get("gamma", 0),
-                        "CE_Vega":      ce.get("vega", 0),
-                        "PE_Vega":      pe.get("vega", 0),
+                        'Expiry': expiry, 'Strike': strike,
+                        'CE_LTP': ce.get('lastPrice', 0), 'CE_OI': ce.get('openInterest', 0),
+                        'CE_Vol': ce.get('totalTradedVolume', 0),
+                        'PE_LTP': pe.get('lastPrice', 0), 'PE_OI': pe.get('openInterest', 0),
+                        'PE_Vol': pe.get('totalTradedVolume', 0),
+                        'CE_OI_Change': ce.get('changeinOpenInterest', 0),
+                        'PE_OI_Change': pe.get('changeinOpenInterest', 0),
                     })
-                df = pd.DataFrame(rows).sort_values("Strike").reset_index(drop=True)
-                print(f"    OK {len(df)} strikes | Spot={underlying:.0f} ATM={atm_strike}")
-                return {"expiry": expiry, "df": df, "underlying": underlying, "atm_strike": atm_strike}
-            except Exception as e:
-                print(f"    FAIL Attempt {attempt}: {e}")
-                time.sleep(2)
-        return None
-
-    def fetch_multiple_expiries(self, session, headers, n=7):
-        """Fetch next n expiry dates directly from NSE API (includes weekly,
-           monthly, and quarterly expiries exactly as NSE lists them)."""
-
-        # ── Step 1: Get actual expiry list directly from NSE ───────
-        expiry_list = []
-        try:
-            url = f"https://www.nseindia.com/api/option-chain-v3?type=Indices&symbol={self.symbol}"
-            resp = session.get(url, headers=headers, impersonate="chrome", timeout=20)
-            if resp.status_code == 200:
-                all_exp = resp.json().get("records", {}).get("expiryDates", [])
-                today = today_ist()
-                for exp_str in all_exp:
-                    try:
-                        exp_dt = datetime.strptime(exp_str, "%d-%b-%Y").date()
-                        if exp_dt >= today:
-                            expiry_list.append(exp_str)
-                        if len(expiry_list) >= n:
-                            break
-                    except Exception:
-                        continue
-                print(f"  Expiry list from NSE API ({len(expiry_list)} expiries): {expiry_list}")
-            else:
-                print(f"  WARNING: NSE expiry list returned status {resp.status_code}")
-        except Exception as e:
-            print(f"  WARNING expiry list fetch: {e}")
-
-        # Fallback: if NSE API failed, generate last Tuesdays of months (BankNifty = monthly expiry)
-        if not expiry_list:
-            import calendar
-            from datetime import date as _date
-            print("  Falling back to generated last-Tuesday-of-month expiry list (BankNifty)...")
-            today = today_ist()
-
-            def last_tuesday_of_month(year, month):
-                last_day = calendar.monthrange(year, month)[1]
-                d = _date(year, month, last_day)
-                while d.weekday() != 1:
-                    d -= timedelta(days=1)
-                return d
-
-            year, month = today.year, today.month
-            attempts = 0
-            while len(expiry_list) < n and attempts < 24:
-                candidate = last_tuesday_of_month(year, month)
-                if candidate >= today:
-                    adjusted = get_prev_trading_day(candidate) if is_nse_holiday(candidate) else candidate
-                    exp_str = adjusted.strftime("%d-%b-%Y")
-                    if exp_str not in expiry_list:
-                        expiry_list.append(exp_str)
-                # Advance to next month
-                if month == 12:
-                    year += 1; month = 1
+                df_full    = pd.DataFrame(rows).sort_values('Strike').reset_index(drop=True)
+                underlying = json_data.get('records', {}).get('underlyingValue', 0)
+                atm_strike = round(underlying / 100) * 100
+                all_strikes = sorted(df_full['Strike'].unique())
+                if atm_strike in all_strikes:
+                    atm_idx = all_strikes.index(atm_strike)
                 else:
-                    month += 1
-                attempts += 1
-
-        print(f"  Final expiry list: {expiry_list}")
-
-        # ── Step 2: Fetch option chain for each expiry ─────────────
-        results = {}
-        for exp in expiry_list:
-            print(f"    Fetching expiry: {exp}")
-            data = self._fetch_for_expiry(session, headers, exp)
-            if data:
-                results[exp] = data
-                print(f"      OK: {exp}")
-            else:
-                print(f"      SKIP: {exp} not found on NSE (may be monthly/not listed yet)")
-            time.sleep(0.8)
-
-        print(f"  Successfully fetched {len(results)} of {len(expiry_list)} expiries")
-        return results, expiry_list
-
-    def fetch(self):
-        session, headers = self._make_session()
-
-        # ── Step 1: compute holiday-adjusted expiry ───────────────
-        expiry = self._current_or_next_last_tuesday_ist()
-
-        # ── Step 2: try to fetch with computed expiry ─────────────
-        result = self._fetch_for_expiry(session, headers, expiry)
-
-        # ── Step 3: fallback — ask NSE for actual expiry list ─────
-        if result is None:
-            print(f"  Computed expiry {expiry} not found on NSE. Trying API fallback...")
-            real_expiry = self._fetch_available_expiries(session, headers)
-            if real_expiry and real_expiry != expiry:
-                result = self._fetch_for_expiry(session, headers, real_expiry)
-
-        if result is None:
-            print("  ERROR: Option chain fetch failed for all expiries.")
-        # Also capture full expiry list for dropdown
-        self._cached_expiry_list = []
-        try:
-            url = f"https://www.nseindia.com/api/option-chain-v3?type=Indices&symbol={self.symbol}"
-            resp = session.get(url, headers=headers, impersonate="chrome", timeout=20)
-            if resp.status_code == 200:
-                all_exp = resp.json().get("records", {}).get("expiryDates", [])
-                today = today_ist()
-                for exp_str in all_exp:
-                    try:
-                        exp_dt = datetime.strptime(exp_str, "%d-%b-%Y").date()
-                        if exp_dt >= today:
-                            self._cached_expiry_list.append(exp_str)
-                            if len(self._cached_expiry_list) >= 7:
-                                break
-                    except Exception:
-                        continue
-                print(f"  Expiry list fetched: {self._cached_expiry_list}")
-        except Exception as e:
-            print(f"  WARNING expiry list: {e}")
-        return result, session, headers
-
-
-# =================================================================
-#  SECTION 1B -- INDIA VIX FETCHER
-# =================================================================
-
-def fetch_india_vix(nse_session=None, nse_headers=None):
-    if nse_session and nse_headers:
-        try:
-            resp = nse_session.get(
-                "https://www.nseindia.com/api/allIndices",
-                headers=nse_headers, impersonate="chrome", timeout=15)
-            if resp.status_code == 200:
-                for item in resp.json().get("data", []):
-                    if "INDIA VIX" in item.get("index", "").upper():
-                        last  = float(item.get("last", 0))
-                        prev  = float(item.get("previousClose", last))
-                        chg   = round(last - prev, 2)
-                        chg_p = round((chg / prev * 100), 2) if prev else 0
-                        return {"value": round(last,2), "prev_close": round(prev,2),
-                                "change": chg, "change_pct": chg_p,
-                                "high": float(item.get("high", last)),
-                                "low":  float(item.get("low",  last)), "status": "live"}
-        except Exception as e:
-            print(f"  WARNING VIX source1: {e}")
-
-    try:
-        hist = yf.Ticker("^INDIAVIX").history(period="2d")
-        if not hist.empty:
-            last  = float(hist.iloc[-1]["Close"])
-            prev  = float(hist.iloc[-2]["Close"]) if len(hist) > 1 else last
-            chg   = round(last - prev, 2)
-            chg_p = round((chg / prev * 100), 2) if prev else 0
-            return {"value": round(last,2), "prev_close": round(prev,2),
-                    "change": chg, "change_pct": chg_p,
-                    "high": float(hist.iloc[-1].get("High", last)),
-                    "low":  float(hist.iloc[-1].get("Low",  last)), "status": "live"}
-    except Exception as e:
-        print(f"  WARNING VIX source3 (yfinance): {e}")
-    return None
-
-
-def vix_label(v):
-    if   v < 12:  return "Extremely Low",  "#00c896", "rgba(0,200,150,.12)",  "rgba(0,200,150,.35)",  "Sell Premium"
-    elif v < 15:  return "Low",            "#4de8b8", "rgba(0,200,150,.08)",  "rgba(0,200,150,.25)",  "Sell Premium"
-    elif v < 20:  return "Normal",         "#6480ff", "rgba(100,128,255,.1)", "rgba(100,128,255,.3)", "Balanced"
-    elif v < 25:  return "Elevated",       "#ffd166", "rgba(255,209,102,.1)", "rgba(255,209,102,.3)", "Buy Premium"
-    elif v < 30:  return "High",           "#ff9a3c", "rgba(255,154,60,.1)",  "rgba(255,154,60,.3)",  "Buy Straddles"
-    else:         return "Extreme Fear",   "#ff6b6b", "rgba(255,107,107,.1)", "rgba(255,107,107,.3)", "Buy Puts/Hedge"
-
-
-# =================================================================
-#  SECTION 1C -- BLACK-SCHOLES CALCULATOR
-# =================================================================
-
-def _bs_greeks(S, K, T, r, sigma, option_type="CE"):
-    try:
-        if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
-            return {"delta": 0, "gamma": 0, "theta": 0, "vega": 0}
-        d1 = (np.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
-        d2 = d1 - sigma * np.sqrt(T)
-        nd1   = _norm.pdf(d1)
-        gamma = nd1 / (S * sigma * np.sqrt(T))
-        vega  = (S * nd1 * np.sqrt(T)) / 100
-        if option_type == "CE":
-            delta        = _norm.cdf(d1)
-            theta_annual = (-(S * nd1 * sigma) / (2 * np.sqrt(T))
-                            - r * K * np.exp(-r * T) * _norm.cdf(d2))
-        else:
-            delta        = _norm.cdf(d1) - 1
-            theta_annual = (-(S * nd1 * sigma) / (2 * np.sqrt(T))
-                            + r * K * np.exp(-r * T) * _norm.cdf(-d2))
-        return {
-            "delta": round(float(delta), 4),
-            "gamma": round(float(gamma), 6),
-            "theta": round(float(theta_annual / 365.0), 4),
-            "vega":  round(float(vega), 4),
-        }
-    except Exception:
-        return {"delta": 0, "gamma": 0, "theta": 0, "vega": 0}
-
-
-def _days_to_expiry_ist(expiry_str):
-    try:
-        today   = today_ist()
-        exp_dt  = datetime.strptime(expiry_str, "%d-%b-%Y").date()
-        days    = (exp_dt - today).days
-        return max(days, 1)
-    except Exception:
-        return 7
-
-
-def _compute_greeks_for_row(r, spot, expiry_str, risk_free=0.065, vix=18.0):
-    T = _days_to_expiry_ist(expiry_str) / 365.0
-    K = float(r["Strike"])
-    ce_iv_nse = float(r.get("CE_IV", 0) or 0)
-    pe_iv_nse = float(r.get("PE_IV", 0) or 0)
-    ce_iv = ce_iv_nse if ce_iv_nse > 0.5 else (pe_iv_nse if pe_iv_nse > 0.5 else vix)
-    pe_iv = pe_iv_nse if pe_iv_nse > 0.5 else (ce_iv_nse if ce_iv_nse > 0.5 else vix)
-    ce_g = _bs_greeks(spot, K, T, risk_free, ce_iv / 100.0, "CE")
-    pe_g = _bs_greeks(spot, K, T, risk_free, pe_iv / 100.0, "PE")
-    return ce_g, pe_g
-
-
-def extract_atm_greeks(df, atm_strike, underlying=None, expiry_str="", vix=18.0):
-    spot = underlying or float(atm_strike)
-    greeks_rows = []
-    for _, r in df.iterrows():
-        strike    = int(r["Strike"])
-        is_atm    = strike == int(atm_strike)
-        ce_iv_raw = round(float(r.get("CE_IV",  0) or 0), 2)
-        pe_iv_raw = round(float(r.get("PE_IV",  0) or 0), 2)
-        ce_ltp    = round(float(r.get("CE_LTP", 0) or 0), 2)
-        pe_ltp    = round(float(r.get("PE_LTP", 0) or 0), 2)
-        ce_g, pe_g = _compute_greeks_for_row(r, spot, expiry_str, vix=vix)
-        greeks_rows.append({
-            "strike":   strike,
-            "is_atm":   is_atm,
-            "ce_iv":    ce_iv_raw,
-            "pe_iv":    pe_iv_raw,
-            "ce_delta": ce_g["delta"],
-            "pe_delta": pe_g["delta"],
-            "ce_theta": ce_g["theta"],
-            "pe_theta": pe_g["theta"],
-            "ce_gamma": ce_g["gamma"],
-            "pe_gamma": pe_g["gamma"],
-            "ce_vega":  ce_g["vega"],
-            "pe_vega":  pe_g["vega"],
-            "ce_ltp":   ce_ltp,
-            "pe_ltp":   pe_ltp,
-        })
-    greeks_rows.sort(key=lambda x: x["strike"])
-    atm_row = next((g for g in greeks_rows if g["is_atm"]),
-                   greeks_rows[len(greeks_rows)//2] if greeks_rows else {})
-    atm_idx = next((i for i, g in enumerate(greeks_rows) if g["is_atm"]),
-                   len(greeks_rows)//2)
-    lo = max(0, atm_idx - 2)
-    hi = min(len(greeks_rows), atm_idx + 3)
-    table_5 = greeks_rows[lo:hi]
-    return {
-        "atm_greeks":   atm_row,
-        "greeks_table": table_5,
-        "all_strikes":  greeks_rows,
-    }
-
-
-# =================================================================
-#  SECTION 2 -- OPTION CHAIN ANALYSIS
-# =================================================================
-
-def analyze_option_chain(oc_data, vix=18.0):
-    if not oc_data:
+                    atm_idx = min(range(len(all_strikes)), key=lambda i: abs(all_strikes[i] - underlying))
+                    atm_strike = all_strikes[atm_idx]
+                lower_idx = max(0, atm_idx - 10); upper_idx = min(len(all_strikes) - 1, atm_idx + 10)
+                selected_strikes = all_strikes[lower_idx: upper_idx + 1]
+                df = df_full[df_full['Strike'].isin(selected_strikes)].reset_index(drop=True)
+                print(f"    ✅ Strikes: {len(df_full)} → ATM±10 filtered: {len(df)}")
+                return {'expiry': expiry, 'df': df, 'raw_data': data,
+                        'underlying': underlying, 'atm_strike': atm_strike}
+            except Exception as e:
+                print(f"    ❌ Attempt {attempt} error: {e}"); time.sleep(2)
         return None
-    df           = oc_data["df"]
-    total_ce_oi  = df["CE_OI"].sum()
-    total_pe_oi  = df["PE_OI"].sum()
-    total_ce_vol = df["CE_Vol"].sum()
-    total_pe_vol = df["PE_Vol"].sum()
-    pcr_oi       = total_pe_oi  / total_ce_oi  if total_ce_oi  > 0 else 0
-    pcr_vol      = total_pe_vol / total_ce_vol if total_ce_vol > 0 else 0
-    ce_chg       = int(df["CE_OI_Change"].sum())
-    pe_chg       = int(df["PE_OI_Change"].sum())
-    net_chg      = pe_chg + ce_chg
 
-    if   ce_chg > 0 and pe_chg < 0:
-        oi_dir, oi_sig, oi_icon, oi_cls = "Strong Bearish", "Call Build-up + Put Unwinding", "RED",    "bearish"
-    elif ce_chg < 0 and pe_chg > 0:
-        oi_dir, oi_sig, oi_icon, oi_cls = "Strong Bullish", "Put Build-up + Call Unwinding", "GREEN",  "bullish"
-    elif ce_chg > 0 and pe_chg > 0:
-        if   pe_chg > ce_chg * 1.5:
-            oi_dir, oi_sig, oi_icon, oi_cls = "Bullish",            "Put Build-up Dominant",      "GREEN",  "bullish"
-        elif ce_chg > pe_chg * 1.5:
-            oi_dir, oi_sig, oi_icon, oi_cls = "Bearish",            "Call Build-up Dominant",     "RED",    "bearish"
+    def analyze_option_chain_data(self, oc_data):
+        if not oc_data: return None
+        df = oc_data['df']
+        total_ce_oi  = df['CE_OI'].sum(); total_pe_oi  = df['PE_OI'].sum()
+        total_ce_vol = df['CE_Vol'].sum(); total_pe_vol = df['PE_Vol'].sum()
+        pcr_oi  = total_pe_oi  / total_ce_oi  if total_ce_oi  > 0 else 0
+        pcr_vol = total_pe_vol / total_ce_vol if total_ce_vol > 0 else 0
+        total_ce_oi_change = int(df['CE_OI_Change'].sum())
+        total_pe_oi_change = int(df['PE_OI_Change'].sum())
+        net_oi_change = total_ce_oi_change - total_pe_oi_change
+        if   total_ce_oi_change > 0 and total_pe_oi_change < 0:
+            oi_direction,oi_signal,oi_icon,oi_class="Strong Bearish","Call Build-up + Put Unwinding","🔴","bearish"
+        elif total_ce_oi_change < 0 and total_pe_oi_change > 0:
+            oi_direction,oi_signal,oi_icon,oi_class="Strong Bullish","Put Build-up + Call Unwinding","🟢","bullish"
+        elif total_ce_oi_change > 0 and total_pe_oi_change > 0:
+            if   total_pe_oi_change > total_ce_oi_change * 1.5:
+                oi_direction,oi_signal,oi_icon,oi_class="Bullish","Put Build-up Dominant","🟢","bullish"
+            elif total_ce_oi_change > total_pe_oi_change * 1.5:
+                oi_direction,oi_signal,oi_icon,oi_class="Bearish","Call Build-up Dominant","🔴","bearish"
+            else:
+                oi_direction,oi_signal,oi_icon,oi_class="Neutral (High Vol)","Both Calls & Puts Building","🟡","neutral"
+        elif total_ce_oi_change < 0 and total_pe_oi_change < 0:
+            oi_direction,oi_signal,oi_icon,oi_class="Neutral (Unwinding)","Both Calls & Puts Unwinding","🟡","neutral"
         else:
-            oi_dir, oi_sig, oi_icon, oi_cls = "Neutral (High Vol)", "Both Calls & Puts Building", "YELLOW", "neutral"
-    elif ce_chg < 0 and pe_chg < 0:
-        oi_dir, oi_sig, oi_icon, oi_cls = "Neutral (Unwinding)", "Both Calls & Puts Unwinding", "YELLOW", "neutral"
-    else:
-        if   net_chg > 0: oi_dir, oi_sig, oi_icon, oi_cls = "Moderately Bullish", "Net Put Accumulation",  "GREEN",  "bullish"
-        elif net_chg < 0: oi_dir, oi_sig, oi_icon, oi_cls = "Moderately Bearish", "Net Call Accumulation", "RED",    "bearish"
-        else:              oi_dir, oi_sig, oi_icon, oi_cls = "Neutral",            "Balanced OI Changes",   "YELLOW", "neutral"
+            if   net_oi_change > 0: oi_direction,oi_signal,oi_icon,oi_class="Moderately Bearish","Net Call Accumulation","🔴","bearish"
+            elif net_oi_change < 0: oi_direction,oi_signal,oi_icon,oi_class="Moderately Bullish","Net Put Accumulation","🟢","bullish"
+            else:                   oi_direction,oi_signal,oi_icon,oi_class="Neutral","Balanced OI Changes","🟡","neutral"
+        max_ce_oi_row = df.loc[df['CE_OI'].idxmax()]; max_pe_oi_row = df.loc[df['PE_OI'].idxmax()]
 
-    max_ce_row   = df.loc[df["CE_OI"].idxmax()]
-    max_pe_row   = df.loc[df["PE_OI"].idxmax()]
-    df["pain"]   = abs(df["CE_OI"] - df["PE_OI"])
-    max_pain_row = df.loc[df["pain"].idxmin()]
-    top_ce = df.nlargest(5, "CE_OI")[["Strike", "CE_OI", "CE_LTP"]].to_dict("records")
-    top_pe = df.nlargest(5, "PE_OI")[["Strike", "PE_OI", "PE_LTP"]].to_dict("records")
+        # ── Max Pain: correct industry formula ──────────────────────────────
+        # For each candidate expiry price K, calculate total intrinsic payout
+        # to option holders:
+        #   CE payout at K = Σ max(0, K - strike) × CE_OI   for all strikes
+        #   PE payout at K = Σ max(0, strike - K) × PE_OI   for all strikes
+        # Max pain = strike K where total payout is MINIMUM
+        # (i.e., option writers lose the least → max pain for buyers)
+        strikes   = df['Strike'].values
+        ce_oi_arr = df['CE_OI'].values
+        pe_oi_arr = df['PE_OI'].values
+        min_payout    = float('inf')
+        max_pain_strike = int(df['Strike'].iloc[len(df)//2])   # fallback: middle strike
 
-    strikes_data = []
-    for _, row in df.iterrows():
-        strikes_data.append({
-            "strike": int(row["Strike"]),
-            "ce_ltp": float(row["CE_LTP"]),
-            "pe_ltp": float(row["PE_LTP"]),
-            "ce_iv":  float(row.get("CE_IV", 15)),
-            "pe_iv":  float(row.get("PE_IV", 15)),
-            "ce_oi":  int(row["CE_OI"]),
-            "pe_oi":  int(row["PE_OI"]),
-        })
+        for k in strikes:
+            ce_payout = sum(max(0, k - s) * oi for s, oi in zip(strikes, ce_oi_arr))
+            pe_payout = sum(max(0, s - k) * oi for s, oi in zip(strikes, pe_oi_arr))
+            total_payout = ce_payout + pe_payout
+            if total_payout < min_payout:
+                min_payout = total_payout
+                max_pain_strike = int(k)
 
-    raw_total = int(total_pe_oi) + int(total_ce_oi)
-    raw_total = raw_total if raw_total > 0 else 1
-    bull_pct  = round(int(total_pe_oi) / raw_total * 100)
-    bear_pct  = 100 - bull_pct
+        df['Total_OI'] = df['CE_OI'] + df['PE_OI']
+        return {
+            'expiry': oc_data['expiry'], 'underlying_value': oc_data['underlying'],
+            'atm_strike': oc_data['atm_strike'],
+            'pcr_oi': round(pcr_oi,3), 'pcr_volume': round(pcr_vol,3),
+            'total_ce_oi': int(total_ce_oi), 'total_pe_oi': int(total_pe_oi),
+            'max_ce_oi_strike': int(max_ce_oi_row['Strike']), 'max_ce_oi_value': int(max_ce_oi_row['CE_OI']),
+            'max_pe_oi_strike': int(max_pe_oi_row['Strike']), 'max_pe_oi_value': int(max_pe_oi_row['PE_OI']),
+            'max_pain': max_pain_strike,
+            'total_ce_oi_change': total_ce_oi_change, 'total_pe_oi_change': total_pe_oi_change,
+            'net_oi_change': net_oi_change,
+            'oi_direction': oi_direction, 'oi_signal': oi_signal,
+            'oi_icon': oi_icon, 'oi_class': oi_class, 'df': df,
+        }
 
-    if   pcr_oi > 1.5:
-        raw_oi_dir = "STRONG BULLISH"; raw_oi_sig = "Heavy Put Writing — Strong Support Floor"; raw_oi_cls = "bullish"
-    elif pcr_oi > 1.2:
-        raw_oi_dir = "BULLISH";        raw_oi_sig = "Put OI > Call OI — Bulls in Control";      raw_oi_cls = "bullish"
-    elif pcr_oi < 0.5:
-        raw_oi_dir = "STRONG BEARISH"; raw_oi_sig = "Heavy Call Writing — Strong Resistance Cap"; raw_oi_cls = "bearish"
-    elif pcr_oi < 0.7:
-        raw_oi_dir = "BEARISH";        raw_oi_sig = "Call OI > Put OI — Bears in Control";      raw_oi_cls = "bearish"
-    else:
-        if int(total_pe_oi) >= int(total_ce_oi):
-            raw_oi_dir = "CAUTIOUSLY BULLISH"; raw_oi_sig = "Balanced OI — Slight Put Dominance"; raw_oi_cls = "bullish"
-        else:
-            raw_oi_dir = "CAUTIOUSLY BEARISH"; raw_oi_sig = "Balanced OI — Slight Call Dominance"; raw_oi_cls = "bearish"
-
-    chg_bull_force = (abs(pe_chg) if pe_chg > 0 else 0) + (abs(ce_chg) if ce_chg < 0 else 0)
-    chg_bear_force = (abs(ce_chg) if ce_chg > 0 else 0) + (abs(pe_chg) if pe_chg < 0 else 0)
-
-    chg_total = chg_bull_force + chg_bear_force
-    chg_total = chg_total if chg_total > 0 else 1
-    chg_bull_pct = round(chg_bull_force / chg_total * 100)
-    chg_bear_pct = 100 - chg_bull_pct
-
-    atm_strike = oc_data["atm_strike"]
-    greeks = extract_atm_greeks(df, atm_strike,
-                                underlying=oc_data["underlying"],
-                                expiry_str=oc_data["expiry"],
-                                vix=vix)
-
-    # Merge BS-computed greeks into strikes_data so JS STRIKE_MAP has delta/theta/vega
-    _g_by_strike = {g["strike"]: g for g in greeks["all_strikes"]}
-    for _sd in strikes_data:
-        _g = _g_by_strike.get(_sd["strike"], {})
-        _sd["ce_delta"] = round(_g.get("ce_delta", 0.50),  4)
-        _sd["pe_delta"] = round(_g.get("pe_delta", -0.50), 4)
-        _sd["ce_theta"] = round(_g.get("ce_theta", 0.0),   4)
-        _sd["pe_theta"] = round(_g.get("pe_theta", 0.0),   4)
-        _sd["ce_vega"]  = round(_g.get("ce_vega",  0.0),   4)
-        _sd["pe_vega"]  = round(_g.get("pe_vega",  0.0),   4)
-
-    return {
-        "expiry":          oc_data["expiry"],
-        "underlying":      oc_data["underlying"],
-        "atm_strike":      atm_strike,
-        "pcr_oi":          round(pcr_oi, 3),
-        "pcr_vol":         round(pcr_vol, 3),
-        "total_ce_oi":     int(total_ce_oi),
-        "total_pe_oi":     int(total_pe_oi),
-        "max_ce_strike":   int(max_ce_row["Strike"]),
-        "max_ce_oi":       int(max_ce_row["CE_OI"]),
-        "max_pe_strike":   int(max_pe_row["Strike"]),
-        "max_pe_oi":       int(max_pe_row["PE_OI"]),
-        "max_pain":        int(max_pain_row["Strike"]),
-        "ce_chg":          ce_chg,
-        "pe_chg":          pe_chg,
-        "net_chg":         net_chg,
-        "oi_dir":          oi_dir,
-        "oi_sig":          oi_sig,
-        "oi_icon":         oi_icon,
-        "oi_cls":          oi_cls,
-        "top_ce":          top_ce,
-        "top_pe":          top_pe,
-        "strikes_data":    strikes_data,
-        "bull_pct":        bull_pct,
-        "bear_pct":        bear_pct,
-        "bull_force":      int(total_pe_oi),
-        "bear_force":      int(total_ce_oi),
-        "raw_oi_dir":      raw_oi_dir,
-        "raw_oi_sig":      raw_oi_sig,
-        "raw_oi_cls":      raw_oi_cls,
-        "chg_bull_force":  chg_bull_force,
-        "chg_bear_force":  chg_bear_force,
-        "chg_bull_pct":    chg_bull_pct,
-        "chg_bear_pct":    chg_bear_pct,
-        "atm_greeks":      greeks["atm_greeks"],
-        "greeks_table":    greeks["greeks_table"],
-        "all_strikes":     greeks["all_strikes"],
-    }
-
-
-# =================================================================
-#  SECTION 3 -- TECHNICAL ANALYSIS
-# =================================================================
-
-def get_technical_data(yf_ticker="^NSEBANK"):
-    try:
-        nifty = yf.Ticker(yf_ticker)
-        df    = nifty.history(period="1y")
-        if df.empty:
-            return None
-        df["SMA_20"]  = df["Close"].rolling(20).mean()
-        df["SMA_50"]  = df["Close"].rolling(50).mean()
-        df["SMA_200"] = df["Close"].rolling(200).mean()
-        delta = df["Close"].diff()
-        gain  = delta.where(delta > 0, 0).rolling(14).mean()
-        loss  = (-delta.where(delta < 0, 0)).rolling(14).mean()
-        df["RSI"]    = 100 - (100 / (1 + gain / loss))
-        df["EMA_12"] = df["Close"].ewm(span=12, adjust=False).mean()
-        df["EMA_26"] = df["Close"].ewm(span=26, adjust=False).mean()
-        df["MACD"]   = df["EMA_12"] - df["EMA_26"]
-        df["Signal"] = df["MACD"].ewm(span=9, adjust=False).mean()
-        latest = df.iloc[-1]
-        cp     = latest["Close"]
-
-        s1 = s2 = r1 = r2 = None
+    def get_technical_data(self):
         try:
-            df_1h = nifty.history(interval="1h", period="60d")
-            if not df_1h.empty:
-                recent_1h = df_1h.tail(120)
-                highs = sorted(recent_1h["High"].values)
-                lows  = sorted(recent_1h["Low"].values)
-                res_c = [h for h in highs if cp < h <= cp + 2000]
-                sup_c = [l for l in lows  if cp - 2000 <= l < cp]
-                if len(res_c) >= 4:
-                    r1 = round(float(np.percentile(res_c, 40)) / 100) * 100
+            print("Calculating technical indicators...")
+            nifty = yf.Ticker(self.yf_symbol)
+            df = nifty.history(period="1y")
+            if df.empty: print("Warning: Failed to fetch historical data"); return None
+            df['SMA_20']  = df['Close'].rolling(20).mean()
+            df['SMA_50']  = df['Close'].rolling(50).mean()
+            df['SMA_200'] = df['Close'].rolling(200).mean()
+            delta = df['Close'].diff()
+            gain  = delta.where(delta > 0, 0).rolling(14).mean()
+            loss  = (-delta.where(delta < 0, 0)).rolling(14).mean()
+            df['RSI']    = 100 - (100 / (1 + gain / loss))
+            df['EMA_12'] = df['Close'].ewm(span=12, adjust=False).mean()
+            df['EMA_26'] = df['Close'].ewm(span=26, adjust=False).mean()
+            df['MACD']   = df['EMA_12'] - df['EMA_26']
+            df['Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
+
+            # ── Use last non-NaN row for MACD/Signal (handles mid-session NaN) ──
+            df_clean = df.dropna(subset=['MACD', 'Signal'])
+            latest = df.iloc[-1]
+            macd_val   = float(df_clean['MACD'].iloc[-1])   if not df_clean.empty else float('nan')
+            signal_val = float(df_clean['Signal'].iloc[-1]) if not df_clean.empty else float('nan')
+            # Previous row for histogram slope (early crossover detection)
+            macd_prev_val   = float(df_clean['MACD'].iloc[-2])   if len(df_clean) >= 2 else macd_val
+            signal_prev_val = float(df_clean['Signal'].iloc[-2]) if len(df_clean) >= 2 else signal_val
+            current_price = latest['Close']
+            print("  Fetching 1H candles for Key Levels (tiered lookback: 6M → 1Y → wide window)...")
+            from datetime import datetime, timedelta
+
+            end_date  = datetime.today()
+            start_6m  = end_date - timedelta(days=180)
+            start_1yr = end_date - timedelta(days=365)
+
+            s1 = s2 = r1 = r2 = None
+
+            def _find_levels(highs, lows, price, window):
+                res_c = [h for h in highs if price < h <= price + window]
+                sup_c = [l for l in lows  if price - window <= l < price]
+                return res_c, sup_c
+
+            # Step 1: 6 months of 1H data
+            try:
+                df_6m = nifty.history(interval="1h", start=start_6m, end=end_date)
+                if not df_6m.empty:
+                    highs_6m = sorted(df_6m['High'].values)
+                    lows_6m  = sorted(df_6m['Low'].values)
+                    res_c, sup_c = _find_levels(highs_6m, lows_6m, current_price, 600)
+                    print(f"  6M 1H: {len(df_6m)} candles | res_c={len(res_c)} sup_c={len(sup_c)}")
+                else:
+                    res_c, sup_c = [], []
+            except Exception as e:
+                print(f"  ⚠️  6M 1H fetch failed: {e}")
+                res_c, sup_c = [], []
+
+            # Step 2: expand to 1 year if not enough
+            if len(res_c) < 2 or len(sup_c) < 2:
+                print("  🔄 6M insufficient — expanding to 1 year")
+                try:
+                    df_1yr = nifty.history(interval="1h", start=start_1yr, end=end_date)
+                    if not df_1yr.empty:
+                        highs_1yr = sorted(df_1yr['High'].values)
+                        lows_1yr  = sorted(df_1yr['Low'].values)
+                        res_c, sup_c = _find_levels(highs_1yr, lows_1yr, current_price, 600)
+                        print(f"  1Y 1H: {len(df_1yr)} candles | res_c={len(res_c)} sup_c={len(sup_c)}")
+                    else:
+                        res_c, sup_c = [], []
+                except Exception as e:
+                    print(f"  ⚠️  1Y 1H fetch failed: {e}")
+                    res_c, sup_c = [], []
+
+            # Step 3: widen window to ±500 on same 1Y data
+            if len(res_c) < 2 or len(sup_c) < 2:
+                print("  🔄 Widening window to ±500 on 1Y data")
+                try:
+                    res_c, sup_c = _find_levels(highs_1yr, lows_1yr, current_price, 1000)
+                    print(f"  Wide window | res_c={len(res_c)} sup_c={len(sup_c)}")
+                except Exception:
+                    res_c, sup_c = [], []
+
+            # Calculate levels — no hardcoding, N/A if genuinely nothing found
+            if len(res_c) >= 2:
+                r1 = round(float(np.percentile(res_c, 25)) / 100) * 100
+                r2 = round(float(np.percentile(res_c, 65)) / 100) * 100
+                if r1 <= current_price:
+                    r1 = round(float(np.percentile(res_c, 50)) / 100) * 100
+                if r2 and r1 and r2 <= r1:
                     r2 = round(float(np.percentile(res_c, 80)) / 100) * 100
-                if len(sup_c) >= 4:
-                    s1 = round(float(np.percentile(sup_c, 70)) / 100) * 100
+            else:
+                print("  ⚠️  No resistance levels found — will show N/A")
+
+            if len(sup_c) >= 2:
+                s1 = round(float(np.percentile(sup_c, 75)) / 100) * 100
+                s2 = round(float(np.percentile(sup_c, 35)) / 100) * 100
+                if s1 >= current_price:
+                    s1 = round(float(np.percentile(sup_c, 50)) / 100) * 100
+                if s2 and s1 and s2 >= s1:
                     s2 = round(float(np.percentile(sup_c, 20)) / 100) * 100
-                if r1 and r1 <= cp:         r1 = round((cp + 200) / 100) * 100
-                if r2 and r1 and r2 <= r1:  r2 = r1 + 300
-                if s1 and s1 >= cp:         s1 = round((cp - 200) / 100) * 100
-                if s2 and s1 and s2 >= s1:  s2 = s1 - 300
+            else:
+                print("  ⚠️  No support levels found — will show N/A")
+
+            print(f"  ✓ Final Levels | S2={s2} S1={s1} | Price={current_price:.0f} | R1={r1} R2={r2}")
+
+            # Assign to technical dict — None means N/A, no fallback invented
+            resistance        = r1
+            support           = s1
+            strong_resistance = r2
+            strong_support    = s2
+            # ── Previous candle OHLC for pivot point calculation ───────────────
+            prev_row   = df.iloc[-2] if len(df) >= 2 else latest
+            prev_high  = float(prev_row['High'])
+            prev_low   = float(prev_row['Low'])
+            prev_close = float(prev_row['Close'])
+
+            technical = {
+                'current_price':    current_price,
+                'sma_20':           latest['SMA_20'],
+                'sma_50':           latest['SMA_50'],
+                'sma_200':          latest['SMA_200'],
+                'rsi':              latest['RSI'],
+                'macd':             macd_val,
+                'signal':           signal_val,
+                'macd_prev':        macd_prev_val,
+                'signal_prev':      signal_prev_val,
+                'resistance':       resistance,
+                'support':          support,
+                'strong_resistance':strong_resistance,
+                'strong_support':   strong_support,
+                'prev_high':        prev_high,
+                'prev_low':         prev_low,
+                'prev_close':       prev_close,
+            }
+            print(f"✓ Technical | Price: {technical['current_price']:.2f} | RSI: {technical['rsi']:.1f}")
+            return technical
         except Exception as e:
-            print(f"  WARNING 1H data: {e}")
+            print(f"Technical error: {e}"); return None
 
-        recent_d   = df.tail(60)
-        resistance = r1 if r1 else recent_d["High"].quantile(0.90)
-        support    = s1 if s1 else recent_d["Low"].quantile(0.10)
-        strong_res = r2 if r2 else resistance + 400
-        strong_sup = s2 if s2 else support - 400
-
-        df["log_ret"] = np.log(df["Close"] / df["Close"].shift(1))
-        hv = df["log_ret"].tail(20).std() * np.sqrt(252) * 100
-
-        return {
-            "price":       cp,
-            "sma20":       latest["SMA_20"],
-            "sma50":       latest["SMA_50"],
-            "sma200":      latest["SMA_200"],
-            "rsi":         latest["RSI"],
-            "macd":        latest["MACD"],
-            "signal_line": latest["Signal"],
-            "support":     support,
-            "resistance":  resistance,
-            "strong_sup":  strong_sup,
-            "strong_res":  strong_res,
-            "hv":          round(float(hv), 2),
-        }
-    except Exception as e:
-        print(f"  ERROR Technical: {e}")
+    def calculate_smart_stop_loss(self, current_price, support, resistance, bias):
+        if bias == "BULLISH": return round(max(support - 50, current_price - 300), 0)
+        elif bias == "BEARISH": return round(min(resistance + 50, current_price + 300), 0)
         return None
 
-
-# =================================================================
-#  SECTION 4 -- MARKET DIRECTION SCORING
-# =================================================================
-
-def compute_market_direction(tech, oc_analysis):
-    if not tech:
-        return {"bias": "UNKNOWN", "confidence": "LOW", "bull": 0, "bear": 0, "diff": 0, "bias_cls": "neutral"}
-
-    cp   = tech["price"]
-    bull = bear = 0
-
-    for sma in ["sma20", "sma50", "sma200"]:
-        if cp > tech[sma]: bull += 1
-        else:               bear += 1
-
-    rsi = tech["rsi"]
-    if   rsi > 70: bear += 1
-    elif rsi < 30: bull += 2
-
-    if tech["macd"] > tech["signal_line"]: bull += 1
-    else:                                   bear += 1
-
-    if oc_analysis:
-        pcr = oc_analysis["pcr_oi"]
-        if   pcr > 1.2: bull += 2
-        elif pcr < 0.7: bear += 2
-        mp = oc_analysis["max_pain"]
-        if   cp > mp + 400: bear += 1
-        elif cp < mp - 400: bull += 1
-
-    diff = bull - bear
-
-    if   diff >= 3:  bias, bias_cls = "BULLISH",  "bullish"; confidence = "HIGH" if diff >= 4 else "MEDIUM"
-    elif diff <= -3: bias, bias_cls = "BEARISH",  "bearish"; confidence = "HIGH" if diff <= -4 else "MEDIUM"
-    else:            bias, bias_cls = "SIDEWAYS", "neutral"; confidence = "MEDIUM"
-
-    return {"bias": bias, "bias_cls": bias_cls, "confidence": confidence,
-            "bull": bull, "bear": bear, "diff": diff}
-
-
-# =================================================================
-#  SECTION 5 -- HELPERS
-# =================================================================
-
-def _cls_color(cls):
-    return "#00c896" if cls == "bullish" else ("#ff6b6b" if cls == "bearish" else "#6480ff")
-
-def _cls_bg(cls):
-    return ("rgba(0,200,150,.08)"   if cls == "bullish" else
-            "rgba(255,107,107,.08)" if cls == "bearish" else "rgba(100,128,255,.08)")
-
-def _cls_bdr(cls):
-    return ("rgba(0,200,150,.22)"   if cls == "bullish" else
-            "rgba(255,107,107,.22)" if cls == "bearish" else "rgba(100,128,255,.22)")
-
-def _fmt_chg_oi(n):
-    if abs(n) >= 1_000_000: return f"{'+' if n > 0 else ''}{n / 1_000_000:.1f}M"
-    if abs(n) >= 1_000:     return f"{'+' if n > 0 else ''}{n / 1_000:.0f}K"
-    return f"{n:+,}"
-
-
-# =================================================================
-#  SECTION 5A -- OPTION GREEKS PANEL
-# =================================================================
-
-def _delta_bar_html(delta_val, is_ce=True):
-    pct = abs(delta_val) * 100
-    col = "#00c896" if is_ce else "#ff6b6b"
-    return (
-        f'<div style="display:flex;align-items:center;gap:5px;">'
-        f'<div style="width:34px;height:3px;background:rgba(255,255,255,.10);border-radius:2px;overflow:hidden;">'
-        f'<div style="width:{pct:.0f}%;height:100%;background:{col};border-radius:2px;"></div></div>'
-        f'<span style="font-family:\'DM Mono\',monospace;font-size:15.9px;font-weight:700;color:{col};">'
-        f'{delta_val:+.3f}</span></div>'
-    )
-
-
-def build_greeks_sidebar_html(oc_analysis):
-    if not oc_analysis:
-        return '<div style="padding:14px 12px;font-size:15.9px;color:rgba(255,255,255,.68);text-align:center;">Greeks unavailable.</div>'
-
-    g    = oc_analysis.get("atm_greeks", {})
-    atm  = oc_analysis.get("atm_strike", 0)
-    exp  = oc_analysis.get("expiry", "N/A")
-    all_rows = oc_analysis.get("all_strikes", oc_analysis.get("greeks_table", []))
-
-    if not g:
-        return '<div style="padding:14px 12px;font-size:15.9px;color:rgba(255,255,255,.68);text-align:center;">Greeks not computed yet.</div>'
-
-    ce_iv    = g.get("ce_iv",    15.0)
-    pe_iv    = g.get("pe_iv",    15.0)
-    ce_delta = g.get("ce_delta", 0.5)
-    pe_delta = g.get("pe_delta", -0.5)
-    ce_theta = g.get("ce_theta", 0.0)
-    pe_theta = g.get("pe_theta", 0.0)
-    ce_vega  = g.get("ce_vega",  0.0)
-    pe_vega  = g.get("pe_vega",  0.0)
-    ce_ltp   = g.get("ce_ltp",   0.0)
-    pe_ltp   = g.get("pe_ltp",   0.0)
-
-    iv_skew  = round(pe_iv - ce_iv, 2)
-    skew_col = "#ff6b6b" if iv_skew > 1.5 else ("#00c896" if iv_skew < -1.5 else "#6480ff")
-    skew_txt = f"PE Skew +{iv_skew:.1f}" if iv_skew > 0 else f"CE Skew {iv_skew:.1f}"
-
-    iv_avg    = (ce_iv + pe_iv) / 2
-    iv_pct    = min(100, max(0, (iv_avg / 60) * 100))
-    iv_col    = "#ff6b6b" if iv_avg > 25 else "#ffd166" if iv_avg > 18 else "#00c896"
-    iv_regime = "High IV · Buy Premium" if iv_avg > 25 else "Normal IV · Balanced" if iv_avg > 15 else "Low IV · Sell Premium"
-
-    def tfmt(t): return f"&#8377;{abs(t):.2f}" if abs(t) >= 0.01 else f"{t:.4f}"
-    def vfmt(v): return f"{v:.4f}" if abs(v) >= 0.0001 else "&#8212;"
-
-    otm_ce_opts = ""
-    atm_opt     = ""
-    otm_pe_opts = ""
-    for row in sorted(all_rows, key=lambda x: x["strike"], reverse=True):
-        s      = int(row["strike"])
-        is_atm = row["is_atm"]
-        dist   = abs(s - atm) // 100
-        if is_atm:
-            label   = f"\u2605  ATM  \u20b9{s:,}"
-            atm_opt = f'<option value="{s}" selected>{label}</option>\n'
-        elif s > atm:
-            label       = f"\u25b2  CE+{dist}  \u20b9{s:,}"
-            otm_ce_opts += f'<option value="{s}">{label}</option>\n'
+    def generate_analysis_data(self, technical, option_analysis):
+        if not technical:
+            self.log("⚠️  Technical data unavailable"); return
+        current    = technical['current_price']
+        support    = technical['support']
+        resistance = technical['resistance']
+        ist_now    = datetime.now(pytz.timezone('Asia/Kolkata'))
+        bullish_score = bearish_score = 0
+        for sma in ['sma_20','sma_50','sma_200']:
+            if current > technical[sma]: bullish_score += 1
+            else: bearish_score += 1
+        rsi = technical['rsi']
+        if   rsi > 70: bearish_score += 1
+        elif rsi < 30: bullish_score += 2
+        # ── MACD: histogram slope fires BEFORE full crossover ──────────────────
+        macd_hist      = technical['macd']      - technical['signal']
+        macd_hist_prev = technical['macd_prev'] - technical['signal_prev']
+        if technical['macd'] > technical['signal']:
+            bullish_score += 1          # full crossover — confirmed bull
+        elif macd_hist > macd_hist_prev:
+            bullish_score += 1          # histogram building — early bull momentum
         else:
-            label       = f"\u25bc  PE-{dist}  \u20b9{s:,}"
-            otm_pe_opts += f'<option value="{s}">{label}</option>\n'
+            bearish_score += 1
+        if option_analysis:
+            pcr = option_analysis['pcr_oi']; max_pain = option_analysis['max_pain']
+            if   pcr > 1.1: bullish_score += 2
+            elif pcr < 0.9: bearish_score += 2
+            if   current > max_pain+100: bearish_score += 1
+            elif current < max_pain-100: bullish_score += 1
+        score_diff = bullish_score - bearish_score
+        print(f"  📊 Bullish: {bullish_score} | Bearish: {bearish_score} | Diff: {score_diff} | MACD hist: {macd_hist:.2f} prev: {macd_hist_prev:.2f}")
+        if   score_diff >= 3:  bias,bias_icon,bias_class="BULLISH","📈","bullish";    confidence="HIGH" if score_diff >= 4 else "MEDIUM"
+        elif score_diff == 2:  bias,bias_icon,bias_class="WATCH BULL","⚡","watchbull"; confidence="MEDIUM"
+        elif score_diff == -2: bias,bias_icon,bias_class="WATCH BEAR","⚠️","watchbear"; confidence="MEDIUM"
+        elif score_diff <= -3: bias,bias_icon,bias_class="BEARISH","📉","bearish";    confidence="HIGH" if score_diff <= -4 else "MEDIUM"
+        else:                  bias,bias_icon,bias_class="SIDEWAYS","↔️","sideways";   confidence="LOW"
+        if   rsi > 70: rsi_status,rsi_badge,rsi_icon="Overbought","bearish","🔴"
+        elif rsi < 30: rsi_status,rsi_badge,rsi_icon="Oversold","bullish","🟢"
+        else:          rsi_status,rsi_badge,rsi_icon="Neutral","neutral","🟡"
+        macd_bullish = technical['macd'] > technical['signal']
+        if option_analysis:
+            pcr = option_analysis['pcr_oi']
+            if   pcr > 1.1: pcr_status,pcr_badge,pcr_icon="Bullish","bullish","🟢"
+            elif pcr < 0.9: pcr_status,pcr_badge,pcr_icon="Bearish","bearish","🔴"
+            else:           pcr_status,pcr_badge,pcr_icon="Neutral","neutral","🟡"
+        else:
+            pcr_status,pcr_badge,pcr_icon="N/A","neutral","🟡"
+        if option_analysis:
+            max_ce_strike=option_analysis['max_ce_oi_strike']; max_pe_strike=option_analysis['max_pe_oi_strike']
+            atm_strike=option_analysis['atm_strike']
+        else:
+            atm_strike=int(current/100)*100; max_ce_strike=atm_strike+400; max_pe_strike=atm_strike-400
+        if bias == "BULLISH":
+            mid=((support+resistance)/2); entry_low=current-100 if current>mid else current-50
+            entry_high=current-50 if current>mid else current; target_1=resistance; target_2=max_ce_strike
+            stop_loss=self.calculate_smart_stop_loss(current,support,resistance,"BULLISH")
+        elif bias == "BEARISH":
+            mid=((support+resistance)/2); entry_low=current
+            entry_high=current+100 if current<mid else current+50; target_1=support; target_2=max_pe_strike
+            stop_loss=self.calculate_smart_stop_loss(current,support,resistance,"BEARISH")
+        else:
+            entry_low=support; entry_high=resistance; target_1=resistance; target_2=support; stop_loss=None
+        if stop_loss and bias != "SIDEWAYS":
+            risk_points=abs(current-stop_loss); reward_points=abs(target_1-current)
+            risk_reward_ratio=round(reward_points/risk_points,2) if risk_points>0 else 0
+        else:
+            risk_points=reward_points=risk_reward_ratio=0
+        rsi_pct=min(100,max(0,rsi))
+        def sma_bar(sma_val):
+            diff=(current-sma_val)/sma_val*100; return min(100,max(0,50+diff*10))
+        macd_val=technical['macd']; macd_pct=min(100,max(0,50+macd_val*2))
+        pcr_pct=min(100,max(0,(option_analysis['pcr_oi']/2*100))) if option_analysis else 50
+        if option_analysis:
+            rng=resistance-support if resistance!=support else 1
+            mp_pct=min(100,max(0,(option_analysis['max_pain']-support)/rng*100))
+            total_oi=option_analysis['total_ce_oi']+option_analysis['total_pe_oi']
+            ce_oi_pct=min(100,max(0,option_analysis['total_ce_oi']/total_oi*100)) if total_oi>0 else 50
+            pe_oi_pct=100-ce_oi_pct
+        else:
+            mp_pct=ce_oi_pct=pe_oi_pct=50
+        fii_dii_raw  = fetch_fii_dii_data()
+        fii_dii_summ = compute_fii_dii_summary(fii_dii_raw)
+        self.html_data = {
+            'timestamp': ist_now.strftime('%d-%b-%Y %H:%M IST'),
+            'current_price': current, 'expiry': option_analysis['expiry'] if option_analysis else 'N/A',
+            'atm_strike': atm_strike, 'bias': bias, 'bias_icon': bias_icon, 'bias_class': bias_class,
+            'confidence': confidence, 'bullish_score': bullish_score, 'bearish_score': bearish_score,
+            'rsi': rsi, 'rsi_pct': rsi_pct, 'rsi_status': rsi_status, 'rsi_badge': rsi_badge, 'rsi_icon': rsi_icon,
+            'sma_20': technical['sma_20'], 'sma_20_above': current>technical['sma_20'], 'sma_20_pct': sma_bar(technical['sma_20']),
+            'sma_50': technical['sma_50'], 'sma_50_above': current>technical['sma_50'], 'sma_50_pct': sma_bar(technical['sma_50']),
+            'sma_200': technical['sma_200'], 'sma_200_above': current>technical['sma_200'], 'sma_200_pct': sma_bar(technical['sma_200']),
+            'macd': technical['macd'], 'macd_signal': technical['signal'], 'macd_bullish': macd_bullish, 'macd_pct': macd_pct,
+            'pcr': option_analysis['pcr_oi'] if option_analysis else 0, 'pcr_pct': pcr_pct,
+            'pcr_status': pcr_status, 'pcr_badge': pcr_badge, 'pcr_icon': pcr_icon,
+            'max_pain': option_analysis['max_pain'] if option_analysis else 0, 'max_pain_pct': mp_pct,
+            'max_ce_oi': max_ce_strike, 'max_pe_oi': max_pe_strike,
+            'ce_oi_pct': ce_oi_pct, 'pe_oi_pct': pe_oi_pct,
+            'total_ce_oi_change': option_analysis['total_ce_oi_change'] if option_analysis else 0,
+            'total_pe_oi_change': option_analysis['total_pe_oi_change'] if option_analysis else 0,
+            'net_oi_change': option_analysis['net_oi_change'] if option_analysis else 0,
+            'oi_direction': option_analysis['oi_direction'] if option_analysis else 'N/A',
+            'oi_signal': option_analysis['oi_signal'] if option_analysis else 'N/A',
+            'oi_icon': option_analysis['oi_icon'] if option_analysis else '🟡',
+            'oi_class': option_analysis['oi_class'] if option_analysis else 'neutral',
+            'support': support, 'resistance': resistance,
+            'strong_support': technical['strong_support'], 'strong_resistance': technical['strong_resistance'],
+            'strategy_type': bias, 'entry_low': entry_low, 'entry_high': entry_high,
+            'target_1': target_1, 'target_2': target_2, 'stop_loss': stop_loss,
+            'risk_points': int(risk_points), 'reward_points': int(reward_points),
+            'risk_reward_ratio': risk_reward_ratio,
+            'has_option_data': option_analysis is not None,
+            'df': option_analysis['df'] if option_analysis else None,
+            'fii_dii_data': fii_dii_raw, 'fii_dii_summ': fii_dii_summ,
+            'prev_high':  technical.get('prev_high', 0),
+            'prev_low':   technical.get('prev_low', 0),
+            'prev_close': technical.get('prev_close', 0),
+        }
 
-    dropdown_options = (
-        f'<optgroup label="\u2500 OTM CALLS (CE) \u2500">{otm_ce_opts}</optgroup>'
-        f'<optgroup label="\u2500 ATM \u2500">{atm_opt}</optgroup>'
-        f'<optgroup label="\u2500 OTM PUTS (PE) \u2500">{otm_pe_opts}</optgroup>'
-    )
+    def _bar_color_class(self, badge):
+        return {'bullish':'bar-teal','bearish':'bar-red','neutral':'bar-gold'}.get(badge,'bar-teal')
 
-    return f"""
-<div class="greeks-panel" id="greeksPanelInner">
-  <div class="greeks-title">
-    &#9652; OPTION GREEKS
-    <span class="greeks-expiry-tag">{exp}</span>
-  </div>
-  <div class="greeks-strike-wrap">
-    <select class="greeks-strike-select" id="greeksStrikeSelect"
-            onchange="greeksUpdateStrike(this.value)">
-      {dropdown_options}
-    </select>
-  </div>
-  <div class="greeks-atm-badge" id="greeksAtmBadge">
-    <span style="font-size:12.3px;font-weight:700;color:rgba(138,160,255,.9);" id="greeksStrikeTypeLabel">ATM</span>
-    <span class="greeks-atm-strike" id="greeksStrikeLabel">&#8377;{atm:,}</span>
-    <span style="font-size:11.6px;color:rgba(255,255,255,.2);">|</span>
-    <span style="font-size:12.3px;color:rgba(0,200,220,.8);" id="greeksCeLtp">CE &#8377;{ce_ltp:.1f}</span>
-    <span style="font-size:11.6px;color:rgba(255,255,255,.62);">/</span>
-    <span style="font-size:12.3px;color:rgba(255,107,107,.8);" id="greeksPeLtp">PE &#8377;{pe_ltp:.1f}</span>
-  </div>
-  <div class="greeks-row">
-    <div style="display:flex;flex-direction:column;">
-      <span class="greek-name">&#916; Delta</span>
-      <span class="greek-sub">CE / PE</span>
-    </div>
-    <div style="display:flex;flex-direction:column;gap:3px;align-items:flex-end;" id="greeksDeltaWrap">
-      {_delta_bar_html(ce_delta, True)}
-      {_delta_bar_html(pe_delta, False)}
-    </div>
-  </div>
-  <div class="greeks-row">
-    <div style="display:flex;flex-direction:column;">
-      <span class="greek-name">&#963; IV</span>
-      <span class="greek-sub" id="greeksSkewLbl" style="color:{skew_col};font-weight:700;">{skew_txt}</span>
-    </div>
-    <div style="display:flex;flex-direction:column;align-items:flex-end;gap:3px;">
-      <div style="display:flex;align-items:center;gap:6px;">
-        <span style="font-size:12.3px;color:rgba(0,200,220,.85);">CE</span>
-        <span style="font-family:'DM Mono',monospace;font-size:18.8px;font-weight:700;color:#00c8e0;" id="greeksIvCe">{ce_iv:.1f}%</span>
-      </div>
-      <div style="display:flex;align-items:center;gap:6px;">
-        <span style="font-size:12.3px;color:rgba(255,144,144,.85);">PE</span>
-        <span style="font-family:'DM Mono',monospace;font-size:18.8px;font-weight:700;color:#ff9090;" id="greeksIvPe">{pe_iv:.1f}%</span>
-      </div>
-    </div>
-  </div>
-  <div class="greeks-row">
-    <div style="display:flex;flex-direction:column;">
-      <span class="greek-name">&#920; Theta</span>
-      <span class="greek-sub">per day</span>
-    </div>
-    <div style="display:flex;flex-direction:column;align-items:flex-end;gap:3px;">
-      <div style="display:flex;align-items:center;gap:6px;">
-        <span style="font-size:12.3px;color:rgba(0,200,220,.85);">CE</span>
-        <span style="font-family:'DM Mono',monospace;font-size:15.9px;font-weight:700;color:#ff9090;" id="greeksThetaCe">{tfmt(ce_theta)}</span>
-      </div>
-      <div style="display:flex;align-items:center;gap:6px;">
-        <span style="font-size:12.3px;color:rgba(255,144,144,.85);">PE</span>
-        <span style="font-family:'DM Mono',monospace;font-size:15.9px;font-weight:700;color:#ff9090;" id="greeksThetaPe">{tfmt(pe_theta)}</span>
-      </div>
-    </div>
-  </div>
-  <div class="greeks-row">
-    <div style="display:flex;flex-direction:column;">
-      <span class="greek-name">&#957; Vega</span>
-      <span class="greek-sub">per 1% IV</span>
-    </div>
-    <div style="display:flex;flex-direction:column;align-items:flex-end;gap:3px;">
-      <div style="display:flex;align-items:center;gap:6px;">
-        <span style="font-size:12.3px;color:rgba(0,200,220,.85);">CE</span>
-        <span style="font-family:'DM Mono',monospace;font-size:15.9px;font-weight:700;color:#8aa0ff;" id="greeksVegaCe">{vfmt(ce_vega)}</span>
-      </div>
-      <div style="display:flex;align-items:center;gap:6px;">
-        <span style="font-size:12.3px;color:rgba(255,144,144,.85);">PE</span>
-        <span style="font-family:'DM Mono',monospace;font-size:15.9px;font-weight:700;color:#8aa0ff;" id="greeksVegaPe">{vfmt(pe_vega)}</span>
-      </div>
-    </div>
-  </div>
-  <div class="iv-bar-wrap">
-    <span class="iv-bar-label">IV Avg</span>
-    <div class="iv-bar-track">
-      <div class="iv-bar-fill" id="greeksIvBar"
-           style="width:{iv_pct:.1f}%;background:{iv_col};box-shadow:0 0 6px {iv_col}88;"></div>
-    </div>
-    <span class="iv-bar-num" id="greeksIvAvg" style="color:{iv_col};">{iv_avg:.1f}%</span>
-  </div>
-  <div style="font-size:12.3px;text-align:center;margin-top:6px;font-weight:700;letter-spacing:.5px;color:{iv_col};"
-       id="greeksIvRegime">{iv_regime}</div>
-</div>
-"""
+    def _stat_card(self, icon, label, value, badge_text, badge_class, bar_pct, bar_type, sub_text=""):
+        tag_map = {'bullish':('tag-bull','#00e5ff'),'bearish':('tag-bear','#ff5252'),'neutral':('tag-neu','#ffb74d')}
+        tag_cls,_ = tag_map.get(badge_class, tag_map['neutral'])
+        border_color = {'bullish':'rgba(0,229,255,0.35)','bearish':'rgba(255,82,82,0.35)'}.get(badge_class,'rgba(255,183,77,0.25)')
+        top_color = {'bullish':'#00e5ff','bearish':'#ff5252'}.get(badge_class,'#ffb74d')
 
-
-def build_greeks_table_html(oc_analysis):
-    if not oc_analysis:
-        return ""
-    rows = oc_analysis.get("greeks_table", [])
-    atm  = oc_analysis.get("atm_strike", 0)
-    exp  = oc_analysis.get("expiry", "N/A")
-    spot = oc_analysis.get("underlying", 0)
-    if not rows:
-        return ""
-
-    def atm_tag_html(is_atm):
-        if not is_atm: return ""
-        return '<span style="font-size:11.6px;background:rgba(100,128,255,.25);color:#8aa0ff;padding:1px 5px;border-radius:4px;margin-left:4px;font-weight:700;">ATM</span>'
-
-    def delta_iv_row(g):
-        is_atm   = g["is_atm"]
-        row_cls  = 'style="background:rgba(100,128,255,.06);border-left:3px solid rgba(100,128,255,.45);"' if is_atm else ""
-        sc       = 'style="color:#8aa0ff;"' if is_atm else ""
-        ce_d_col = "#00c896" if g["ce_delta"] >= 0.5 else "#ffd166" if g["ce_delta"] >= 0.35 else "#ff9090"
-        pe_d_col = "#ff6b6b" if g["pe_delta"] <= -0.5 else "#ffd166" if g["pe_delta"] <= -0.35 else "#4de8b8"
-        ce_iv_c  = "#ff6b6b" if g["ce_iv"] > 25 else "#ffd166" if g["ce_iv"] > 18 else "#00c896"
-        pe_iv_c  = "#ff6b6b" if g["pe_iv"] > 25 else "#ffd166" if g["pe_iv"] > 18 else "#00c896"
-        return (
-            f'<div class="greeks-tbl-row" {row_cls}>'
-            f'<div class="greeks-tbl-strike" {sc}>&#8377;{g["strike"]:,}{atm_tag_html(is_atm)}</div>'
-            f'<div class="greeks-tbl-cell" style="color:{ce_d_col};">{g["ce_delta"]:+.3f}</div>'
-            f'<div class="greeks-tbl-cell" style="color:{pe_d_col};">{g["pe_delta"]:+.3f}</div>'
-            f'<div class="greeks-tbl-cell" style="color:{ce_iv_c};">{g["ce_iv"]:.1f}%</div>'
-            f'<div class="greeks-tbl-cell" style="color:{pe_iv_c};">{g["pe_iv"]:.1f}%</div>'
-            f'</div>'
-        )
-
-    def theta_vega_row(g):
-        is_atm   = g["is_atm"]
-        row_cls  = 'style="background:rgba(100,128,255,.06);border-left:3px solid rgba(100,128,255,.45);"' if is_atm else ""
-        sc       = 'style="color:#8aa0ff;"' if is_atm else ""
-        tfmt = lambda t: f"&#8377;{abs(t):.2f}" if abs(t) >= 0.01 else f"{t:.4f}"
-        vfmt = lambda v: f"{v:.4f}" if abs(v) >= 0.0001 else "&#8212;"
-        return (
-            f'<div class="greeks-tbl-row" {row_cls}>'
-            f'<div class="greeks-tbl-strike" {sc}>&#8377;{g["strike"]:,}{atm_tag_html(is_atm)}</div>'
-            f'<div class="greeks-tbl-cell" style="color:#ff9090;">{tfmt(g["ce_theta"])}</div>'
-            f'<div class="greeks-tbl-cell" style="color:#ff9090;">{tfmt(g["pe_theta"])}</div>'
-            f'<div class="greeks-tbl-cell" style="color:#8aa0ff;">{vfmt(g["ce_vega"])}</div>'
-            f'<div class="greeks-tbl-cell" style="color:#8aa0ff;">{vfmt(g["pe_vega"])}</div>'
-            f'</div>'
-        )
-
-    dv_rows = "".join(delta_iv_row(g) for g in rows)
-    tv_rows = "".join(theta_vega_row(g) for g in rows)
-
-    return f"""
-<div class="greeks-table-section" id="greeksTable">
-  <div class="sec-title" style="color:#8aa0ff;border-color:rgba(100,128,255,.18);">
-    OPTION GREEKS &nbsp;&middot;&nbsp; ATM &#177;2 STRIKES
-    <span class="sec-sub">Live from NSE &middot; {exp} &middot; Spot &#8377;{spot:,.0f}</span>
-  </div>
-  <div class="greeks-table-wrap">
-    <div>
-      <div style="font-size:13.8px;font-weight:700;color:rgba(100,128,255,.75);margin-bottom:10px;letter-spacing:1.5px;text-transform:uppercase;display:flex;align-items:center;gap:8px;">
-        <span style="width:3px;height:14px;background:#6480ff;border-radius:2px;display:inline-block;"></span>
-        &#916; DELTA &amp; &#963; IMPLIED VOLATILITY
-      </div>
-      <div class="greeks-tbl">
-        <div class="greeks-tbl-head">
-          <div class="greeks-tbl-head-label" style="text-align:left;">Strike</div>
-          <div class="greeks-tbl-head-label" style="color:rgba(0,200,150,.65);">CE &#916;</div>
-          <div class="greeks-tbl-head-label" style="color:rgba(255,107,107,.65);">PE &#916;</div>
-          <div class="greeks-tbl-head-label" style="color:rgba(0,200,220,.65);">CE IV</div>
-          <div class="greeks-tbl-head-label" style="color:rgba(255,144,144,.65);">PE IV</div>
-        </div>
-        {dv_rows}
-      </div>
-    </div>
-    <div>
-      <div style="font-size:13.8px;font-weight:700;color:rgba(255,107,107,.75);margin-bottom:10px;letter-spacing:1.5px;text-transform:uppercase;display:flex;align-items:center;gap:8px;">
-        <span style="width:3px;height:14px;background:#ff6b6b;border-radius:2px;display:inline-block;"></span>
-        &#920; THETA (Day Decay) &amp; &#957; VEGA
-      </div>
-      <div class="greeks-tbl">
-        <div class="greeks-tbl-head">
-          <div class="greeks-tbl-head-label" style="text-align:left;">Strike</div>
-          <div class="greeks-tbl-head-label" style="color:rgba(0,200,220,.65);">CE &#920;</div>
-          <div class="greeks-tbl-head-label" style="color:rgba(255,144,144,.65);">PE &#920;</div>
-          <div class="greeks-tbl-head-label" style="color:rgba(138,160,255,.65);">CE &#957;</div>
-          <div class="greeks-tbl-head-label" style="color:rgba(138,160,255,.65);">PE &#957;</div>
-        </div>
-        {tv_rows}
-      </div>
-    </div>
-  </div>
-</div>
-"""
-
-
-# =================================================================
-#  SECTION 5B -- HERO
-# =================================================================
-
-def build_dual_gauge_hero(oc, tech, md, ts, instrument="BANKNIFTY"):
-    if oc:
-        chg_bull = oc["chg_bull_force"]; chg_bear = oc["chg_bear_force"]
-        bull_pct = oc["chg_bull_pct"]; bear_pct = oc["chg_bear_pct"]; pcr = oc["pcr_oi"]
-        oi_dir = oc["raw_oi_dir"]; oi_sig = oc["raw_oi_sig"]; oi_cls = oc["raw_oi_cls"]
-        bull_label = _fmt_chg_oi(chg_bull); bear_label = _fmt_chg_oi(chg_bear)
-        expiry = oc["expiry"]; underlying = oc["underlying"]; atm = oc["atm_strike"]; max_pain = oc["max_pain"]
-    else:
-        chg_bull = chg_bear = 0; bull_pct = bear_pct = 50; pcr = 1.0
-        oi_sig = "NSE data unavailable"; oi_dir = "UNKNOWN"; oi_cls = "neutral"
-        expiry = "N/A"; underlying = 0; atm = 0; max_pain = 0
-        bull_label = "N/A"; bear_label = "N/A"
-
-    cp = tech["price"] if tech else 0
-    bias = md["bias"]; conf = md["confidence"]; bull_sc = md["bull"]; bear_sc = md["bear"]; diff = md["diff"]
-    dir_col = _cls_color(oi_cls)
-    pcr_col = "#00c896" if pcr > 1.2 else ("#ff6b6b" if pcr < 0.7 else "#6480ff")
-    b_col = _cls_color(md.get("bias_cls", "neutral"))
-    b_bg = _cls_bg(md.get("bias_cls", "neutral")); b_bdr = _cls_bdr(md.get("bias_cls", "neutral"))
-    C = 263.9
-    def clamp(v, lo=10, hi=97): return max(lo, min(hi, v))
-    bull_offset = C * (1 - clamp(bull_pct) / 100); bear_offset = C * (1 - clamp(bear_pct) / 100)
-    oi_bar_w = clamp(bull_pct); bear_bar_w = clamp(bear_pct)
-    b_arrow = "▲" if bias == "BULLISH" else ("▼" if bias == "BEARISH" else "◆")
-    glow_rgb = ("0,200,150" if dir_col == "#00c896" else "255,107,107" if dir_col == "#ff6b6b" else "100,128,255")
-
-    return f"""
-<div class="hero" id="heroWidget">
-  <div class="h-gauges">
-    <div class="gauge-wrap">
-      <svg width="100" height="100" viewBox="0 0 100 100">
-        <circle cx="50" cy="50" r="42" fill="none" stroke="rgba(255,255,255,.18)" stroke-width="7"/>
-        <circle cx="50" cy="50" r="42" fill="none" stroke="url(#bull-g)" stroke-width="7"
-          stroke-linecap="round" stroke-dasharray="{C}" stroke-dashoffset="{bull_offset:.1f}"
-          style="transform:rotate(-90deg);transform-origin:50px 50px;transition:stroke-dashoffset 1s ease;"/>
-        <defs><linearGradient id="bull-g" x1="0%" y1="0%" x2="100%" y2="0%">
-          <stop offset="0%" stop-color="#00c896"/><stop offset="100%" stop-color="#4de8b8"/>
-        </linearGradient></defs>
-      </svg>
-      <div class="gauge-inner">
-        <div class="g-val" style="color:#00c896;">{bull_label}</div>
-        <div class="g-lbl">CHG BULL</div>
-      </div>
-    </div>
-    <div class="gauge-sep"></div>
-    <div class="gauge-wrap">
-      <svg width="100" height="100" viewBox="0 0 100 100">
-        <circle cx="50" cy="50" r="42" fill="none" stroke="rgba(255,255,255,.18)" stroke-width="7"/>
-        <circle cx="50" cy="50" r="42" fill="none" stroke="url(#bear-g)" stroke-width="7"
-          stroke-linecap="round" stroke-dasharray="{C}" stroke-dashoffset="{bear_offset:.1f}"
-          style="transform:rotate(-90deg);transform-origin:50px 50px;transition:stroke-dashoffset 1s ease;"/>
-        <defs><linearGradient id="bear-g" x1="0%" y1="0%" x2="100%" y2="0%">
-          <stop offset="0%" stop-color="#ff6b6b"/><stop offset="100%" stop-color="#ff9090"/>
-        </linearGradient></defs>
-      </svg>
-      <div class="gauge-inner">
-        <div class="g-val" style="color:#ff6b6b;">{bear_label}</div>
-        <div class="g-lbl">CHG BEAR</div>
-      </div>
-    </div>
-  </div>
-  <div class="h-mid">
-    <div class="h-eyebrow">OI NET SIGNAL · {expiry} · SPOT ₹{underlying:,.0f}</div>
-    <div class="h-signal" style="color:{dir_col};text-shadow:0 0 20px rgba({glow_rgb},.6),0 0 40px rgba({glow_rgb},.3);font-size:31.9px;font-weight:900;letter-spacing:1px;">{oi_dir}</div>
-    <div class="h-sub">{oi_sig} · PCR <span style="color:{pcr_col};font-weight:700;">{pcr:.3f}</span></div>
-    <div class="h-divider"></div>
-    <div class="pill-row">
-      <div class="pill-dot" style="background:#00c896;box-shadow:0 0 5px rgba(0,200,150,.5);"></div>
-      <div class="pill-lbl">BULL STRENGTH</div>
-      <div class="pill-track"><div class="pill-fill" style="width:{oi_bar_w}%;background:linear-gradient(90deg,#00c896,#4de8b8);"></div></div>
-      <div class="pill-num" style="color:#00c896;">{bull_pct}%</div>
-    </div>
-    <div class="pill-row">
-      <div class="pill-dot" style="background:#ff6b6b;box-shadow:0 0 5px rgba(255,107,107,.4);"></div>
-      <div class="pill-lbl">BEAR STRENGTH</div>
-      <div class="pill-track"><div class="pill-fill" style="width:{bear_bar_w}%;background:linear-gradient(90deg,#ff6b6b,#ff9090);"></div></div>
-      <div class="pill-num" style="color:#ff6b6b;">{bear_pct}%</div>
-    </div>
-  </div>
-  <div class="h-stats">
-    <div class="h-stat-row">
-      <div class="h-stat"><div class="h-stat-lbl" data-stat="spot">{instrument} SPOT</div><div class="h-stat-val" data-stat="spot" style="color:rgba(255,255,255,.85);">&#8377;{cp:,.2f}</div></div>
-      <div class="h-stat"><div class="h-stat-lbl">ATM STRIKE</div><div class="h-stat-val" data-stat="atm" style="color:#00c896;">&#8377;{atm:,}</div></div>
-      <div class="h-stat"><div class="h-stat-lbl">EXPIRY</div><div class="h-stat-val" data-stat="expiry" style="color:#00c8e0;">{expiry}</div></div>
-      <div class="h-stat"><div class="h-stat-lbl">PCR (OI)</div><div class="h-stat-val" data-stat="pcr" style="color:{pcr_col};">{pcr:.3f}</div></div>
-      <div class="h-stat"><div class="h-stat-lbl">MAX PAIN</div><div class="h-stat-val" data-stat="maxpain" style="color:#ffd166;">&#8377;{max_pain:,}</div></div>
-    </div>
-    <div class="h-stat-bottom">
-      <div class="h-bias-row">
-        <span class="h-chip" style="background:{b_bg};color:{b_col};border:1px solid {b_bdr};">{b_arrow}&nbsp;{bias}</span>
-        <span class="h-chip" style="background:rgba(255,209,102,.1);color:#ffd166;border:1px solid rgba(255,209,102,.3);">{conf}&nbsp;CONF</span>
-        <span class="h-score">Bull&nbsp;{bull_sc} · Bear&nbsp;{bear_sc} · Diff&nbsp;{diff:+d}</span>
-      </div>
-      <div class="h-ts" id="lastUpdatedTs">{ts}</div>
-    </div>
-  </div>
-</div>
-"""
-
-
-# =================================================================
-#  SECTION 5C -- OI DASHBOARD
-# =================================================================
-
-def build_oi_html(oc):
-    ce  = oc["ce_chg"]; pe = oc["pe_chg"]
-    expiry = oc["expiry"]; oi_dir = oc["oi_dir"]; oi_sig = oc["oi_sig"]; oi_cls = oc["oi_cls"]
-    pcr = oc["pcr_oi"]; total_ce = oc["total_ce_oi"]; total_pe = oc["total_pe_oi"]
-    max_ce_s = oc["max_ce_strike"]; max_pe_s = oc["max_pe_strike"]; max_pain = oc["max_pain"]
-    underlying = oc["underlying"]
-
-    dir_col = _cls_color(oi_cls); dir_bg = _cls_bg(oi_cls); dir_bdr = _cls_bdr(oi_cls)
-    pcr_col = "#00c896" if pcr > 1.2 else ("#ff6b6b" if pcr < 0.7 else "#6480ff")
-
-    ce_col   = "#00c896" if ce < 0 else "#ff6b6b"
-    ce_label = "Call Unwinding ↓ (Bullish)" if ce < 0 else "Call Build-up ↑ (Bearish)"
-    ce_fmt   = _fmt_chg_oi(ce)
-    pe_col   = "#00c896" if pe > 0 else "#ff6b6b"
-    pe_label = "Put Build-up ↑ (Bullish)" if pe > 0 else "Put Unwinding ↓ (Bearish)"
-    pe_fmt   = _fmt_chg_oi(pe)
-
-    bull_force = (abs(pe) if pe > 0 else 0) + (abs(ce) if ce < 0 else 0)
-    bear_force = (abs(ce) if ce > 0 else 0) + (abs(pe) if pe < 0 else 0)
-    net_diff       = bull_force - bear_force
-    net_is_bullish = net_diff >= 0
-    net_col        = "#00c896" if net_is_bullish else "#ff6b6b"
-    net_label      = "Net Bullish Flow" if net_is_bullish else "Net Bearish Flow"
-    net_fmt        = _fmt_chg_oi(net_diff)
-
-    total_abs  = abs(ce) + abs(pe) or 1
-    ce_pct     = round(abs(ce) / total_abs * 100)
-    ce_bullish = ce < 0
-    ce_pct_display = f"+{ce_pct}%" if ce_bullish else f"−{ce_pct}%"
-    ce_bar_col = "#00c896" if ce_bullish else "#ff6b6b"
-    pe_pct     = round(abs(pe) / total_abs * 100)
-    pe_bullish = pe > 0
-    pe_pct_display = f"+{pe_pct}%" if pe_bullish else f"−{pe_pct}%"
-    pe_bar_col = "#00c896" if pe_bullish else "#ff6b6b"
-
-    total_f    = bull_force + bear_force or 1
-    bull_pct   = round(bull_force / total_f * 100)
-    bear_pct   = 100 - bull_pct
-    net_pct    = round(abs(net_diff) / total_f * 100) if total_f > 0 else 0
-    net_pct    = max(5, min(95, net_pct))
-    net_bar_col     = "#00c896" if net_is_bullish else "#ff6b6b"
-    net_pct_display = f"+{net_pct}%" if net_is_bullish else f"−{net_pct}%"
-
-    dir_card = f"""
-<div style="display:flex;align-items:stretch;flex-wrap:wrap;border:1px solid {dir_bdr};border-radius:14px;
-  background:{dir_bg};overflow:hidden;margin-bottom:16px;">
-  <div style="padding:18px 24px;min-width:140px;border-right:1px solid rgba(255,255,255,.07);
-    display:flex;flex-direction:column;justify-content:center;flex-shrink:0;flex:0 0 auto;">
-    <div style="font-size:12.3px;letter-spacing:2px;text-transform:uppercase;color:rgba(255,255,255,.65);margin-bottom:7px;">OI CHANGE DIRECTION</div>
-    <div style="font-size:30.4px;font-weight:700;color:{dir_col};line-height:1.1;margin-bottom:5px;">{oi_dir}</div>
-    <div style="font-size:15.2px;color:{dir_col};opacity:.7;">{oi_sig}</div>
-    <div style="margin-top:10px;font-family:'DM Mono',monospace;font-size:14.5px;color:rgba(255,255,255,.68);">PCR &nbsp;<span style="color:{pcr_col};font-weight:700;">{pcr:.3f}</span></div>
-  </div>
-  <div style="display:flex;flex:1;align-items:stretch;">
-    <div style="flex:1;display:flex;flex-direction:column;justify-content:center;padding:16px 20px;border-right:1px solid rgba(255,255,255,.05);gap:5px;">
-      <div style="font-size:12.3px;letter-spacing:1.8px;text-transform:uppercase;color:rgba(255,255,255,.65);white-space:nowrap;">CE OI Change</div>
-      <div style="font-family:'DM Mono',monospace;font-size:31.9px;font-weight:700;color:{ce_col};line-height:1;">{ce_fmt}</div>
-      <div style="font-size:14.5px;color:rgba(255,255,255,.68);white-space:nowrap;">{ce_label}</div>
-      <div style="display:flex;align-items:center;gap:8px;margin-top:3px;">
-        <div style="flex:1;height:5px;background:rgba(255,255,255,.07);border-radius:3px;overflow:hidden;"><div style="width:{ce_pct}%;height:100%;border-radius:3px;background:{ce_bar_col};"></div></div>
-        <div style="font-family:'DM Mono',monospace;font-size:14.5px;font-weight:700;color:{ce_bar_col};min-width:38px;text-align:right;">{ce_pct_display}</div>
-      </div>
-    </div>
-    <div style="flex:1;display:flex;flex-direction:column;justify-content:center;padding:16px 20px;border-right:1px solid rgba(255,255,255,.05);gap:5px;">
-      <div style="font-size:12.3px;letter-spacing:1.8px;text-transform:uppercase;color:rgba(255,255,255,.65);white-space:nowrap;">PE OI Change</div>
-      <div style="font-family:'DM Mono',monospace;font-size:31.9px;font-weight:700;color:{pe_col};line-height:1;">{pe_fmt}</div>
-      <div style="font-size:14.5px;color:rgba(255,255,255,.68);white-space:nowrap;">{pe_label}</div>
-      <div style="display:flex;align-items:center;gap:8px;margin-top:3px;">
-        <div style="flex:1;height:5px;background:rgba(255,255,255,.07);border-radius:3px;overflow:hidden;"><div style="width:{pe_pct}%;height:100%;border-radius:3px;background:{pe_bar_col};"></div></div>
-        <div style="font-family:'DM Mono',monospace;font-size:14.5px;font-weight:700;color:{pe_bar_col};min-width:38px;text-align:right;">{pe_pct_display}</div>
-      </div>
-    </div>
-    <div style="flex:1;display:flex;flex-direction:column;justify-content:center;padding:16px 20px;gap:5px;">
-      <div style="font-size:12.3px;letter-spacing:1.8px;text-transform:uppercase;color:rgba(255,255,255,.65);white-space:nowrap;">Net OI Change</div>
-      <div style="font-family:'DM Mono',monospace;font-size:31.9px;font-weight:700;color:{net_col};line-height:1;">{net_fmt}</div>
-      <div style="font-size:14.5px;color:rgba(255,255,255,.68);white-space:nowrap;">{net_label}</div>
-      <div style="display:flex;align-items:center;gap:8px;margin-top:3px;">
-        <div style="flex:1;height:5px;background:rgba(255,255,255,.07);border-radius:3px;overflow:hidden;"><div style="width:{net_pct}%;height:100%;border-radius:3px;background:{net_bar_col};box-shadow:0 0 8px {net_bar_col}66;"></div></div>
-        <div style="font-family:'DM Mono',monospace;font-size:14.5px;font-weight:700;color:{net_bar_col};min-width:38px;text-align:right;">{net_pct_display}</div>
-      </div>
-    </div>
-  </div>
-</div>"""
-
-    snapshot_table = (
-        f'<div class="oi-ticker-table">'
-        f'<div class="oi-ticker-hdr" style="background:rgba(100,128,255,.05);border-bottom:1px solid rgba(100,128,255,.1);">'
-        f'<div class="oi-ticker-hdr-label" style="color:rgba(100,128,255,.8);">&#9632; OI SNAPSHOT</div>'
-        f'<div class="oi-ticker-hdr-cell">Total CE OI</div><div class="oi-ticker-hdr-cell">Total PE OI</div>'
-        f'<div class="oi-ticker-hdr-cell">PCR (OI)</div><div class="oi-ticker-hdr-cell">Max CE</div>'
-        f'<div class="oi-ticker-hdr-cell">Max PE</div></div>'
-        f'<div class="oi-ticker-row">'
-        f'<div class="oi-ticker-metric">Snapshot</div>'
-        f'<div class="oi-ticker-cell" style="color:#ff6b6b;font-family:\'DM Mono\',monospace;font-weight:700;font-size:21.8px;">{total_ce:,}</div>'
-        f'<div class="oi-ticker-cell" style="color:#00c896;font-family:\'DM Mono\',monospace;font-weight:700;font-size:21.8px;">{total_pe:,}</div>'
-        f'<div class="oi-ticker-cell" style="color:{pcr_col};font-family:\'DM Mono\',monospace;font-weight:700;font-size:21.8px;">{pcr:.3f}</div>'
-        f'<div class="oi-ticker-cell" style="color:#ff6b6b;font-family:\'DM Mono\',monospace;font-weight:700;font-size:21.8px;">&#8377;{max_ce_s:,}</div>'
-        f'<div class="oi-ticker-cell" style="color:#00c896;font-family:\'DM Mono\',monospace;font-weight:700;font-size:21.8px;">&#8377;{max_pe_s:,}</div>'
-        f'</div>'
-        f'<div style="display:flex;align-items:center;justify-content:space-between;padding:10px 18px;border-top:1px solid rgba(255,255,255,.04);flex-wrap:wrap;gap:10px;">'
-        f'<div style="display:flex;align-items:center;gap:10px;">'
-        f'<span style="font-size:13px;letter-spacing:1.5px;text-transform:uppercase;color:rgba(255,255,255,.68);">MAX PAIN</span>'
-        f'<span style="font-family:\'DM Mono\',monospace;font-size:26.1px;font-weight:700;color:#6480ff;">&#8377;{max_pain:,}</span>'
-        f'<span style="font-size:14.5px;color:rgba(100,128,255,.6);">Option writers\' target</span></div>'
-        f'</div></div>'
-    )
-
-    return (
-        f'<div class="section"><div class="sec-title">OPEN INTEREST DASHBOARD'
-        f'<span class="sec-sub">Spot ±2000 pts · Expiry: {expiry} · Spot: &#8377;{underlying:,.2f}</span></div>'
-        + dir_card + snapshot_table + "</div>"
-    )
-
-
-def build_key_levels_html(tech, oc):
-    cp = tech["price"]; ss = tech["strong_sup"]; s1 = tech["support"]
-    r1 = tech["resistance"]; sr = tech["strong_res"]; rng = sr - ss or 1
-    def pct(v): return round(max(3, min(97, (v - ss) / rng * 100)), 1)
-    cp_pct = pct(cp); pts_r = int(r1 - cp); pts_s = int(cp - s1)
-    mp_html = ""
-    if oc:
-        mp_p = pct(oc["max_pain"]); mp = oc["max_pain"]
-        mp_html = (f'<div class="kl-node" style="left:{mp_p}%;top:0;transform:translateX(-50%);">'
-                   f'<div class="kl-dot" style="background:#6480ff;box-shadow:0 0 8px rgba(100,128,255,.5);margin:0 auto 4px;"></div>'
-                   f'<div class="kl-lbl" style="color:#6480ff;">Max Pain</div>'
-                   f'<div class="kl-val" style="color:#8aa0ff;">&#8377;{mp:,}</div></div>')
-    return (
-        f'<div class="section"><div class="sec-title">KEY LEVELS'
-        f'<span class="sec-sub">1H Candles · Last 120 bars · Rounded to 100</span></div>'
-        f'<div class="kl-zone-labels"><span style="color:#00c896;">SUPPORT ZONE</span><span style="color:#ff6b6b;">RESISTANCE ZONE</span></div>'
-        f'<div style="position:relative;height:58px;">'
-        f'<div class="kl-node" style="left:3%;bottom:0;transform:translateX(-50%);"><div class="kl-lbl" style="color:#00a07a;">Strong Sup</div><div class="kl-val" style="color:#00c896;">&#8377;{ss:,.0f}</div><div class="kl-dot" style="background:#00a07a;margin:5px auto 0;"></div></div>'
-        f'<div class="kl-node" style="left:22%;bottom:0;transform:translateX(-50%);"><div class="kl-lbl" style="color:#00c896;">Support</div><div class="kl-val" style="color:#4de8b8;">&#8377;{s1:,.0f}</div><div class="kl-dot" style="background:#00c896;box-shadow:0 0 8px rgba(0,200,150,.5);margin:5px auto 0;"></div></div>'
-        f'<div style="position:absolute;left:{cp_pct}%;bottom:6px;transform:translateX(-50%);background:linear-gradient(90deg,#00c896,#6480ff);color:#fff;font-size:15.9px;font-weight:700;padding:3px 14px;border-radius:20px;white-space:nowrap;box-shadow:0 2px 14px rgba(0,200,150,.35);z-index:10;">NOW &#8377;{cp:,.0f}</div>'
-        f'<div class="kl-node" style="left:75%;bottom:0;transform:translateX(-50%);"><div class="kl-lbl" style="color:#ff6b6b;">Resistance</div><div class="kl-val" style="color:#ff9090;">&#8377;{r1:,.0f}</div><div class="kl-dot" style="background:#ff6b6b;box-shadow:0 0 8px rgba(255,107,107,.5);margin:5px auto 0;"></div></div>'
-        f'<div class="kl-node" style="left:95%;bottom:0;transform:translateX(-50%);"><div class="kl-lbl" style="color:#cc4040;">Strong Res</div><div class="kl-val" style="color:#ff6b6b;">&#8377;{sr:,.0f}</div><div class="kl-dot" style="background:#cc4040;margin:5px auto 0;"></div></div>'
-        f'</div>'
-        f'<div class="kl-gradient-bar"><div class="kl-price-tick" style="left:{cp_pct}%;"></div></div>'
-        f'<div style="position:relative;height:54px;">{mp_html}</div>'
-        f'<div class="kl-dist-row">'
-        f'<div class="kl-dist-box" style="border-color:rgba(255,107,107,.18);"><span style="color:var(--muted);">To Resistance</span><span style="color:#ff6b6b;font-weight:700;">+{pts_r:,} pts</span></div>'
-        f'<div class="kl-dist-box" style="border-color:rgba(0,200,150,.18);"><span style="color:var(--muted);">To Support</span><span style="color:#00c896;font-weight:700;">-{pts_s:,} pts</span></div>'
-        f'</div></div>'
-    )
-
-
-def build_strikes_html(oc):
-    if not oc or (not oc["top_ce"] and not oc["top_pe"]): return ""
-    def ce_rows(rows):
-        o = ""
-        for i, r in enumerate(rows, 1):
-            o += (f"<tr><td>{i}</td><td><b>&#8377;{int(r['Strike']):,}</b></td>"
-                  f"<td>{int(r['CE_OI']):,}</td>"
-                  f"<td style=\"color:#00c8e0;font-weight:700;\">&#8377;{r['CE_LTP']:.2f}</td></tr>")
-        return o
-    def pe_rows(rows):
-        o = ""
-        for i, r in enumerate(rows, 1):
-            o += (f"<tr><td>{i}</td><td><b>&#8377;{int(r['Strike']):,}</b></td>"
-                  f"<td>{int(r['PE_OI']):,}</td>"
-                  f"<td style=\"color:#ff6b6b;font-weight:700;\">&#8377;{r['PE_LTP']:.2f}</td></tr>")
-        return o
-    return (
-        f'<div class="section"><div class="sec-title">TOP 5 STRIKES BY OPEN INTEREST'
-        f'<span class="sec-sub">Spot ±2000 pts · Top 5 CE + PE</span></div>'
-        f'<div class="strikes-wrap">'
-        f'<div><div class="strikes-head" style="color:#00c8e0;">▲ CALL Options (CE)</div>'
-        f'<table class="s-table"><thead><tr><th>#</th><th>Strike</th><th>OI</th><th>LTP</th></tr></thead>'
-        f'<tbody>{ce_rows(oc["top_ce"])}</tbody></table></div>'
-        f'<div><div class="strikes-head" style="color:#ff6b6b;">▼ PUT Options (PE)</div>'
-        f'<table class="s-table"><thead><tr><th>#</th><th>Strike</th><th>OI</th><th>LTP</th></tr></thead>'
-        f'<tbody>{pe_rows(oc["top_pe"])}</tbody></table></div>'
-        f'</div></div>'
-    )
-
-
-# =================================================================
-#  SECTION 6 -- STRATEGIES WITH SMART POP ENGINE
-# =================================================================
-
-def make_payoff_svg(shape, bull_color="#00c896", bear_color="#ff6b6b"):
-    w, h = 80, 50; mid = h // 2; pad = 8
-    def pts(*coords): return " ".join(f"{x},{y}" for x, y in coords)
-    shapes = {
-        "long_call":         {"profit": [(pad,mid),(40,mid),(72,h-pad)],           "loss": [(pad,mid),(40,mid)]},
-        "short_put":         {"profit": [(pad,h-pad),(40,mid),(72,mid)],           "loss": [(pad,mid),(40,mid)]},
-        "bull_call_spread":  {"profit": [(pad,mid),(30,mid),(55,h-pad),(72,h-pad)],"loss": [(pad,mid),(30,mid)]},
-        "bull_put_spread":   {"profit": [(pad,h-pad),(30,h-pad),(55,mid),(72,mid)],"loss": [(pad,mid),(72,mid)]},
-        "call_ratio_back":   {"profit": [(pad,h-pad),(25,mid),(50,mid),(72,h-pad)],"loss": [(pad,mid),(25,mid),(50,mid)]},
-        "long_synthetic":    {"profit": [(pad,mid),(72,h-pad)],                    "loss": [(pad,pad),(40,mid)]},
-        "range_forward":     {"profit": [(pad,mid),(30,mid),(55,h-pad),(72,h-pad)],"loss": [(pad,pad),(30,pad),(55,mid)]},
-        "bull_butterfly":    {"profit": [(pad,mid),(36,h-pad),(54,mid)],           "loss": [(pad,mid),(36,mid),(54,mid),(72,mid)]},
-        "bull_condor":       {"profit": [(pad,mid),(28,mid),(36,h-pad),(50,h-pad),(58,mid),(72,mid)],"loss": [(pad,mid),(72,mid)]},
-        "short_call":        {"profit": [(pad,mid),(40,mid),(72,pad)],             "loss": [(pad,mid),(40,mid)]},
-        "long_put":          {"profit": [(pad,h-pad),(40,mid),(72,mid)],           "loss": [(pad,mid),(40,mid)]},
-        "bear_call_spread":  {"profit": [(pad,h-pad),(30,h-pad),(55,mid),(72,mid)],"loss": [(pad,mid),(72,mid)]},
-        "bear_put_spread":   {"profit": [(pad,mid),(30,mid),(55,h-pad),(72,h-pad)],"loss": [(pad,mid),(30,mid)]},
-        "put_ratio_back":    {"profit": [(pad,h-pad),(25,mid),(50,mid),(72,pad)],  "loss": [(pad,mid),(25,mid),(50,mid)]},
-        "short_synthetic":   {"profit": [(pad,mid),(72,pad)],                     "loss": [(pad,h-pad),(40,mid)]},
-        "risk_reversal":     {"profit": [(pad,h-pad),(36,mid),(72,pad)],           "loss": [(pad,mid),(36,mid)]},
-        "bear_butterfly":    {"profit": [(pad,mid),(36,pad),(54,mid)],             "loss": [(pad,mid),(36,mid),(54,mid),(72,mid)]},
-        "bear_condor":       {"profit": [(pad,mid),(28,mid),(36,pad),(50,pad),(58,mid),(72,mid)],"loss": [(pad,mid),(72,mid)]},
-        "long_straddle":     {"profit": [(pad,h-pad),(36,mid),(54,mid),(72,h-pad)],"loss": [(pad,mid),(36,mid),(54,mid),(72,mid)]},
-        "short_straddle":    {"profit": [(pad,mid),(36,mid),(54,mid),(72,mid)],    "loss": [(pad,h-pad),(36,mid),(54,mid),(72,h-pad)]},
-        "long_strangle":     {"profit": [(pad,h-pad),(30,mid),(50,mid),(72,h-pad)],"loss": [(pad,mid),(30,mid),(50,mid),(72,mid)]},
-        "short_strangle":    {"profit": [(pad,mid),(30,mid),(50,mid),(72,mid)],    "loss": [(pad,h-pad),(30,mid),(50,mid),(72,h-pad)]},
-        "jade_lizard":       {"profit": [(pad,pad),(30,mid),(55,mid),(72,mid)],    "loss": [(pad,mid),(30,mid)]},
-        "reverse_jade":      {"profit": [(pad,mid),(30,mid),(55,h-pad),(72,h-pad)],"loss": [(pad,pad),(30,mid)]},
-        "call_ratio_spread": {"profit": [(pad,mid),(36,h-pad),(72,mid)],           "loss": [(pad,mid),(36,mid),(72,pad)]},
-        "put_ratio_spread":  {"profit": [(pad,mid),(36,h-pad),(72,mid)],           "loss": [(pad,pad),(36,mid),(72,mid)]},
-        "batman":            {"profit": [(pad,mid),(20,h-pad),(36,mid),(54,mid),(68,h-pad),(72,mid)],"loss": [(pad,mid),(72,mid)]},
-        "long_iron_fly":     {"profit": [(pad,pad),(36,mid),(54,mid),(72,pad)],    "loss": [(pad,mid),(36,h-pad),(54,h-pad),(72,mid)]},
-        "short_iron_fly":    {"profit": [(pad,mid),(36,h-pad),(54,h-pad),(72,mid)],"loss": [(pad,pad),(36,mid),(54,mid),(72,pad)]},
-        "double_fly":        {"profit": [(pad,mid),(20,h-pad),(36,mid),(54,mid),(68,h-pad),(72,mid)],"loss": [(pad,mid),(72,mid)]},
-        "long_iron_condor":  {"profit": [(pad,pad),(24,mid),(36,mid),(54,mid),(66,pad),(72,pad)],   "loss": [(pad,mid),(24,mid),(66,mid),(72,mid)]},
-        "short_iron_condor": {"profit": [(pad,mid),(24,h-pad),(36,h-pad),(54,h-pad),(66,mid),(72,mid)],"loss": [(pad,pad),(72,pad)]},
-        "double_condor":     {"profit": [(pad,mid),(20,h-pad),(36,mid),(54,mid),(68,h-pad),(72,mid)],"loss": [(pad,mid),(72,mid)]},
-        "call_calendar":     {"profit": [(pad,mid),(36,h-pad),(54,mid),(72,mid)],  "loss": [(pad,mid),(36,mid),(54,mid),(72,mid)]},
-        "put_calendar":      {"profit": [(pad,mid),(36,h-pad),(54,mid),(72,mid)],  "loss": [(pad,mid),(36,mid),(54,mid),(72,mid)]},
-        "diagonal_calendar": {"profit": [(pad,mid),(30,h-pad),(55,mid),(72,mid)],  "loss": [(pad,mid),(30,mid),(55,mid),(72,mid)]},
-        "call_butterfly":    {"profit": [(pad,mid),(36,h-pad),(54,mid),(72,mid)],  "loss": [(pad,mid),(72,mid)]},
-        "put_butterfly":     {"profit": [(pad,mid),(36,h-pad),(54,mid),(72,mid)],  "loss": [(pad,mid),(72,mid)]},
-    }
-    s = shapes.get(shape, {"profit": [(pad,mid),(72,mid)], "loss": []})
-    profit_pts = pts(*s["profit"]); loss_pts = pts(*s["loss"]) if s["loss"] else ""
-    def area(coords, is_p):
-        if not coords: return ""
-        col = bull_color if is_p else bear_color
-        d = f"M {coords[0][0]},{mid} " + " ".join(f"L {x},{y}" for x, y in coords) + f" L {coords[-1][0]},{mid} Z"
-        return f'<path d="{d}" fill="{col}" fill-opacity="0.18"/>'
-    svg = (f'<svg width="{w}" height="{h}" viewBox="0 0 {w} {h}" xmlns="http://www.w3.org/2000/svg">'
-           f'<line x1="{pad}" y1="{pad}" x2="{pad}" y2="{h-pad}" stroke="rgba(255,255,255,.15)" stroke-width="1"/>'
-           f'<line x1="{pad}" y1="{mid}" x2="{w-pad}" y2="{mid}" stroke="rgba(255,255,255,.15)" stroke-width="1"/>'
-           f'{area(s["profit"],True)}{area(s["loss"],False)}'
-           f'<polyline points="{profit_pts}" fill="none" stroke="{bull_color}" stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round"/>')
-    if loss_pts:
-        svg += f'<polyline points="{loss_pts}" fill="none" stroke="{bear_color}" stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="3,2"/>'
-    return svg + '</svg>'
-
-
-STRATEGIES_DATA = {
-    "bullish": [
-        {"name":"Long Call","shape":"long_call","risk":"Limited","reward":"Unlimited","legs":"BUY CALL (ATM)","desc":"Buy a call option. Profits as market rises above strike. Risk is limited to premium paid."},
-        {"name":"Short Put","shape":"short_put","risk":"Moderate","reward":"Limited","legs":"SELL PUT (OTM)","desc":"Sell a put option below market. Collect premium. Profit if market stays above strike."},
-        {"name":"Bull Call Spread","shape":"bull_call_spread","risk":"Limited","reward":"Limited","legs":"BUY CALL (Low) · SELL CALL (High)","desc":"Buy lower call, sell higher call. Reduces cost; caps profit at upper strike."},
-        {"name":"Bull Put Spread","shape":"bull_put_spread","risk":"Limited","reward":"Limited","legs":"SELL PUT (High) · BUY PUT (Low)","desc":"Sell higher put, buy lower put. Credit received upfront. Profit if market stays above higher strike."},
-        {"name":"Call Ratio Back Spread","shape":"call_ratio_back","risk":"Limited","reward":"Unlimited","legs":"SELL 1 CALL (Low) · BUY 2 CALLS (High)","desc":"Sell fewer calls, buy more higher calls. Benefits from a big upside move."},
-        {"name":"Long Synthetic","shape":"long_synthetic","risk":"High","reward":"Unlimited","legs":"BUY CALL (ATM) · SELL PUT (ATM)","desc":"Replicates owning the underlying. Unlimited profit potential with high risk."},
-        {"name":"Range Forward","shape":"range_forward","risk":"Limited","reward":"Limited","legs":"BUY CALL (High) · SELL PUT (Low)","desc":"Collar-like structure. Profit in a range. Used to hedge existing positions."},
-        {"name":"Bull Butterfly","shape":"bull_butterfly","risk":"Limited","reward":"Limited","legs":"BUY Low CALL · SELL 2 Mid CALL · BUY High CALL","desc":"Max profit at middle strike. Low cost strategy for moderate bullish view."},
-        {"name":"Bull Condor","shape":"bull_condor","risk":"Limited","reward":"Limited","legs":"BUY Low · SELL Mid-Low · SELL Mid-High · BUY High","desc":"Four-leg bullish strategy. Profit in a range above current price."},
-    ],
-    "bearish": [
-        {"name":"Short Call","shape":"short_call","risk":"Unlimited","reward":"Limited","legs":"SELL CALL (ATM/OTM)","desc":"Sell a call option above market. Collect premium. Profit if market falls or stays below strike."},
-        {"name":"Long Put","shape":"long_put","risk":"Limited","reward":"High","legs":"BUY PUT (ATM)","desc":"Buy a put option. Profits as market falls below strike. Risk is limited to premium paid."},
-        {"name":"Bear Call Spread","shape":"bear_call_spread","risk":"Limited","reward":"Limited","legs":"SELL CALL (Low) · BUY CALL (High)","desc":"Sell lower call, buy higher call. Credit received. Profit if market stays below lower strike."},
-        {"name":"Bear Put Spread","shape":"bear_put_spread","risk":"Limited","reward":"Limited","legs":"BUY PUT (High) · SELL PUT (Low)","desc":"Buy higher put, sell lower put. Cheaper bearish bet with capped profit."},
-        {"name":"Put Ratio Back Spread","shape":"put_ratio_back","risk":"Limited","reward":"High","legs":"SELL 1 PUT (High) · BUY 2 PUTS (Low)","desc":"Sell fewer puts, buy more lower puts. Benefits from a big downside move."},
-        {"name":"Short Synthetic","shape":"short_synthetic","risk":"High","reward":"High","legs":"SELL CALL (ATM) · BUY PUT (ATM)","desc":"Replicates shorting the underlying. Profit as market falls. High risk."},
-        {"name":"Risk Reversal","shape":"risk_reversal","risk":"High","reward":"High","legs":"BUY PUT (Low) · SELL CALL (High)","desc":"Protect downside while giving up upside. Common hedging structure."},
-        {"name":"Bear Butterfly","shape":"bear_butterfly","risk":"Limited","reward":"Limited","legs":"BUY Low PUT · SELL 2 Mid PUT · BUY High PUT","desc":"Max profit at middle strike. Low cost strategy for moderate bearish view."},
-        {"name":"Bear Condor","shape":"bear_condor","risk":"Limited","reward":"Limited","legs":"BUY High · SELL Mid-High · SELL Mid-Low · BUY Low","desc":"Four-leg bearish strategy. Profit in a range below current price."},
-    ],
-    "nondirectional": [
-        {"name":"Long Straddle","shape":"long_straddle","risk":"Limited","reward":"Unlimited","legs":"BUY CALL (ATM) + BUY PUT (ATM)","desc":"Buy both ATM call and put. Profit from big move in either direction. Best before events."},
-        {"name":"Short Straddle","shape":"short_straddle","risk":"Unlimited","reward":"Limited","legs":"SELL CALL (ATM) + SELL PUT (ATM)","desc":"Sell both ATM call and put. Profit from low volatility. High risk unlimited loss."},
-        {"name":"Long Strangle","shape":"long_strangle","risk":"Limited","reward":"Unlimited","legs":"BUY OTM CALL + BUY OTM PUT","desc":"Buy OTM call and put. Cheaper than straddle. Needs bigger move to profit."},
-        {"name":"Short Strangle","shape":"short_strangle","risk":"Unlimited","reward":"Limited","legs":"SELL OTM CALL + SELL OTM PUT","desc":"Sell OTM call and put. Wider profit range than short straddle. Still high risk."},
-        {"name":"Jade Lizard","shape":"jade_lizard","risk":"Limited","reward":"Limited","legs":"SELL OTM PUT + SELL CALL SPREAD","desc":"No upside risk. Collect premium. Bearish but risk-defined."},
-        {"name":"Reverse Jade Lizard","shape":"reverse_jade","risk":"Limited","reward":"Limited","legs":"SELL OTM CALL + SELL PUT SPREAD","desc":"No downside risk. Collect premium. Bullish but risk-defined."},
-        {"name":"Call Ratio Spread","shape":"call_ratio_spread","risk":"Unlimited","reward":"Limited","legs":"BUY 1 CALL (Low) · SELL 2 CALLS (High)","desc":"Sell more calls than bought. Credit or debit. Risk if big upside move occurs."},
-        {"name":"Put Ratio Spread","shape":"put_ratio_spread","risk":"Unlimited","reward":"Limited","legs":"BUY 1 PUT (High) · SELL 2 PUTS (Low)","desc":"Sell more puts than bought. Risk if big downside move occurs."},
-        {"name":"Batman Strategy","shape":"batman","risk":"Limited","reward":"Limited","legs":"BUY 2 CALLS + SELL 4 CALLS + BUY 2 CALLS","desc":"Double butterfly. Two profit peaks. Complex strategy for range-bound markets."},
-        {"name":"Long Iron Fly","shape":"long_iron_fly","risk":"Limited","reward":"Limited","legs":"BUY CALL · BUY PUT · SELL ATM CALL · SELL ATM PUT","desc":"Debit iron fly. Profit from a big move. Max loss if price stays at ATM."},
-        {"name":"Short Iron Fly","shape":"short_iron_fly","risk":"Limited","reward":"Limited","legs":"SELL CALL · SELL PUT · BUY OTM CALL · BUY OTM PUT","desc":"Credit iron fly. Max profit at ATM. Common non-directional strategy."},
-        {"name":"Double Fly","shape":"double_fly","risk":"Limited","reward":"Limited","legs":"TWO BUTTERFLY SPREADS","desc":"Two butterfly spreads at different strikes. Two profit peaks."},
-        {"name":"Long Iron Condor","shape":"long_iron_condor","risk":"Limited","reward":"Limited","legs":"BUY CALL SPREAD + BUY PUT SPREAD","desc":"Debit condor. Profit from a big move. Opposite of short iron condor."},
-        {"name":"Short Iron Condor","shape":"short_iron_condor","risk":"Limited","reward":"Limited","legs":"SELL CALL SPREAD + SELL PUT SPREAD","desc":"Collect premium from both sides. Profit if price stays in a range."},
-        {"name":"Double Condor","shape":"double_condor","risk":"Limited","reward":"Limited","legs":"TWO CONDOR SPREADS","desc":"Two condor spreads. Wider profit range. Complex multi-leg strategy."},
-        {"name":"Call Calendar","shape":"call_calendar","risk":"Limited","reward":"Limited","legs":"SELL NEAR-TERM CALL · BUY FAR-TERM CALL","desc":"Profit from time decay difference. Best when price stays near strike."},
-        {"name":"Put Calendar","shape":"put_calendar","risk":"Limited","reward":"Limited","legs":"SELL NEAR-TERM PUT · BUY FAR-TERM PUT","desc":"Profit from time decay. Best when price stays near strike on expiry."},
-        {"name":"Diagonal Calendar","shape":"diagonal_calendar","risk":"Limited","reward":"Limited","legs":"SELL NEAR CALL/PUT · BUY FAR DIFF STRIKE","desc":"Calendar spread with different strikes. Combines time and price movement."},
-        {"name":"Call Butterfly","shape":"call_butterfly","risk":"Limited","reward":"Limited","legs":"BUY Low CALL · SELL 2 Mid CALL · BUY High CALL","desc":"Max profit at middle strike using calls only. Low net debit strategy."},
-        {"name":"Put Butterfly","shape":"put_butterfly","risk":"Limited","reward":"Limited","legs":"BUY High PUT · SELL 2 Mid PUT · BUY Low PUT","desc":"Max profit at middle strike using puts only. Low net debit strategy."},
-    ],
-}
-
-
-def build_strategies_html(oc_analysis, tech=None, md=None, multi_expiry_analyzed=None, expiry_list=None, lot_size=30, emit_script=True, instrument_prefix="bn"):
-    spot       = oc_analysis["underlying"]   if oc_analysis else 23000
-    atm        = oc_analysis["atm_strike"]   if oc_analysis else 23000
-    pcr        = oc_analysis["pcr_oi"]       if oc_analysis else 1.0
-    mp         = oc_analysis["max_pain"]     if oc_analysis else 23000
-    max_ce_s   = oc_analysis["max_ce_strike"] if oc_analysis else atm + 200
-    max_pe_s   = oc_analysis["max_pe_strike"] if oc_analysis else atm - 200
-    strikes_json = json.dumps(oc_analysis.get("strikes_data", [])) if oc_analysis else "[]"
-
-    # Build multi-expiry data for dropdown
-    all_expiry_js = {}
-    if multi_expiry_analyzed and expiry_list:
-        for exp in expiry_list:
-            oc_e = multi_expiry_analyzed.get(exp)
-            if not oc_e:
-                continue
-            all_expiry_js[exp] = {
-                "spot":        round(oc_e["underlying"], 2),
-                "atm":         oc_e["atm_strike"],
-                "pcr":         round(oc_e["pcr_oi"], 3),
-                "maxCeStrike": oc_e["max_ce_strike"],
-                "maxPeStrike": oc_e["max_pe_strike"],
-                "support":     round(tech["support"], 2) if tech else spot - 150,
-                "resistance":  round(tech["resistance"], 2) if tech else spot + 150,
-                "strongSup":   round(tech["strong_sup"], 2) if tech else spot - 300,
-                "strongRes":   round(tech["strong_res"], 2) if tech else spot + 300,
-                "strikes":     oc_e.get("strikes_data", []),
-            }
-    all_expiry_json = json.dumps(all_expiry_js)
-    expiry_opts_html = ""
-    if expiry_list:
-        first_with_data = True
-        for exp in expiry_list:
-            has_data = exp in (all_expiry_js or {})
-            sel = "selected" if (has_data and first_with_data) else ""
-            if has_data and first_with_data:
-                first_with_data = False
-            # Show all expiries; disable ones with no data
-            if has_data:
-                expiry_opts_html += f'<option value="{exp}" {sel}>{exp}</option>\n'
-            else:
-                expiry_opts_html += f'<option value="{exp}" disabled style="color:rgba(255,255,255,0.3);">{exp} (no data)</option>\n'
-    else:
-        expiry_opts_html = f'<option value="">{oc_analysis["expiry"] if oc_analysis else "N/A"}</option>'
-    
-    support     = tech["support"]    if tech else spot - 150
-    resistance  = tech["resistance"] if tech else spot + 150
-    strong_sup  = tech["strong_sup"] if tech else spot - 300
-    strong_res  = tech["strong_res"] if tech else spot + 300
-
-    bias        = md["bias"]       if md else "SIDEWAYS"
-    conf        = md["confidence"] if md else "MEDIUM"
-    bull_sc     = md["bull"]       if md else 4
-    bear_sc     = md["bear"]       if md else 4
-
-    def render_cards(strats, cat):
-        cards = ""
-        for idx, s in enumerate(strats):
-            svg  = make_payoff_svg(s["shape"])
-            rc   = "#00c896" if s["risk"]   in ("Limited","Low") else ("#ff6b6b" if s["risk"] in ("Unlimited","High") else "#6480ff")
-            rwc  = "#00c896" if s["reward"] == "Unlimited" else "#6480ff"
-            cid  = f"sc_{instrument_prefix}_{cat}_{idx}"
-            cards += (
-                f'<div class="sc-card" data-cat="{cat}" data-shape="{s["shape"]}" '
-                f'data-name="{s["name"]}" data-legs="{s["legs"]}" '
-                f'data-risk="{s["risk"]}" data-reward="{s["reward"]}" '
-                f'data-margin-mult="{s.get("margin_mult",1.0)}" data-lot-size="{s.get("lot_size",65)}" id="{cid}">'
-                f'<div class="sc-pop-badge" id="pop_{cid}">—%</div>'
-                f'<div class="sc-svg">{svg}</div>'
-                f'<div class="sc-body">'
-                f'<div class="sc-name">{s["name"]}</div>'
-                f'<div class="sc-legs">{s["legs"]}</div>'
-                f'<div class="sc-tags">'
-                f'<span class="sc-tag" style="color:{rc};border-color:{rc}40;">Risk: {s["risk"]}</span>'
-                f'<span class="sc-tag" style="color:{rwc};border-color:{rwc}40;">Reward: {s["reward"]}</span>'
-                f'</div></div>'
-                f'<div class="sc-detail" id="detail_{cid}">'
-                f'<div class="sc-desc">{s["desc"]}</div>'
-                f'<div class="sc-metrics-live" id="metrics_{cid}">'
-                f'<div class="sc-loading">&#9685; Calculating metrics...</div>'
-                f'</div></div></div>'
+        # ── RSI: circular ring gauge ─────────────────────────────────────────
+        if label.startswith('RSI'):
+            try:    rsi_num = float(value)
+            except: rsi_num = 50.0
+            circumf = 138.2
+            offset  = circumf * (1 - rsi_num / 100)
+            ring_col = '#ff5252' if rsi_num > 70 else ('#00e676' if rsi_num < 30 else '#ffb74d')
+            extra_visual = f"""
+            <div style="display:flex;justify-content:center;margin:6px 0 8px;">
+              <div style="position:relative;width:56px;height:56px;">
+                <svg viewBox="0 0 56 56" style="width:100%;height:100%;">
+                  <circle cx="28" cy="28" r="22" fill="none" stroke="rgba(255,255,255,0.06)" stroke-width="7"/>
+                  <circle cx="28" cy="28" r="22" fill="none" stroke="{ring_col}" stroke-width="7"
+                    stroke-linecap="round" stroke-dasharray="{circumf:.1f}" stroke-dashoffset="{offset:.1f}"
+                    style="transform:rotate(-90deg);transform-origin:28px 28px;" opacity="0.85"/>
+                </svg>
+                <div style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
+                  font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:700;color:{ring_col};">{rsi_num:.0f}</div>
+              </div>
+            </div>"""
+        # ── MACD: mini histogram bars ────────────────────────────────────────
+        elif label.startswith('MACD'):
+            bar_color = '#ff5252' if badge_class == 'bearish' else '#00e676'
+            heights = [30,45,55,68,78,88,95,100] if badge_class == 'bearish' else [100,90,75,60,48,35,22,12]
+            hist_bars = ''.join(
+                f'<div style="flex:1;height:{h}%;background:{bar_color};opacity:{0.4+i*0.075:.2f};'
+                f'border-radius:2px 2px 0 0;min-width:3px;"></div>'
+                for i,h in enumerate(heights)
             )
-        return cards
+            extra_visual = f"""
+            <div style="display:flex;align-items:flex-end;gap:2px;height:36px;padding:0 2px;margin:6px 0 8px;">
+              {hist_bars}
+            </div>"""
+        # ── SMA: mini sparkline trend line ───────────────────────────────────
+        elif label.startswith('SMA'):
+            line_color = '#ff5252' if badge_class == 'bearish' else '#00e676'
+            pts = "0,28 12,24 22,20 30,22 40,26 50,18 60,14 70,10 80,12 90,8 100,6" if badge_class == 'bullish' else "0,8 12,10 22,14 30,12 40,9 50,18 60,22 70,26 80,24 90,28 100,30"
+            extra_visual = f"""
+            <div style="height:32px;margin:6px 0 8px;position:relative;">
+              <svg viewBox="0 0 100 32" preserveAspectRatio="none" style="width:100%;height:100%;overflow:visible;">
+                <polyline points="{pts}" fill="none" stroke="{line_color}" stroke-width="1.8"
+                  stroke-linejoin="round" opacity="0.7"/>
+              </svg>
+            </div>"""
+        else:
+            extra_visual = ''
 
-    bull_cards = render_cards(STRATEGIES_DATA["bullish"],       "bullish")
-    bear_cards = render_cards(STRATEGIES_DATA["bearish"],       "bearish")
-    nd_cards   = render_cards(STRATEGIES_DATA["nondirectional"],"nondirectional")
+        bg_map = {'bullish':'linear-gradient(145deg,rgba(10,30,20,0.9),rgba(4,14,10,0.95))',
+                  'bearish':'linear-gradient(145deg,rgba(30,10,14,0.9),rgba(12,4,8,0.95))',
+                  'neutral':'linear-gradient(145deg,rgba(28,22,8,0.9),rgba(12,10,4,0.95))'}
+        card_bg = bg_map.get(badge_class, '#111827')
 
-    return (
-    f"""
-<div class="section" id="strat">
-  <div class="sec-title">STRATEGIES REFERENCE
-    <span class="sec-sub">Smart PoP · Live S/R + OI Walls + Market Bias · Click to expand</span>
-  </div>
+        return f"""
+            <div class="g-compact" style="border-color:{border_color};background:{card_bg};">
+                <div style="position:absolute;top:0;left:0;right:0;height:1px;
+                  background:linear-gradient(90deg,transparent,{top_color},transparent);"></div>
+                <div class="cc-top"><span class="cc-ico">{icon}</span><div class="cc-lbl">{label}</div>
+                  <span class="tag {tag_cls}">{badge_text}</span></div>
+                {extra_visual}
+                <div class="cc-val">{value}</div>
+                {f'<div class="cc-sub">{sub_text}</div>' if sub_text else ''}
+                <div class="cc-bar"><div class="cc-bar-fill {bar_type}" style="width:{bar_pct:.1f}%"></div></div>
+            </div>"""
 
-  <div id="smartPopLegend" style="
-    background:linear-gradient(135deg,rgba(100,128,255,.08),rgba(0,200,150,.06));
-    border:1px solid rgba(100,128,255,.2);border-radius:14px;padding:14px 18px;
-    margin-bottom:18px;display:flex;flex-wrap:wrap;gap:14px;align-items:flex-start;">
-    <div style="flex:0 0 auto;">
-      <div style="font-size:13px;font-weight:700;letter-spacing:2px;color:#8aa0ff;text-transform:uppercase;margin-bottom:8px;">&#9889; SMART POP ENGINE</div>
-      <div style="font-size:14.5px;color:rgba(255,255,255,.78);line-height:1.8;">
-        PoP = Base 50% + Bias Alignment + S/R Zone + OI Walls + PCR Weight
+    def _build_enhanced_oc_cards(self):
+        """Enhanced Option Chain cards: PCR needle meter, Max Pain zone bar, CE/PE OI battle bars."""
+        d = self.html_data
+        if not d['has_option_data']:
+            return '<div style="color:#80deea;padding:20px;">Option chain data unavailable</div>'
+
+        pcr     = d['pcr']
+        max_pain= d['max_pain']
+        max_ce  = d['max_ce_oi']
+        max_pe  = d['max_pe_oi']
+        spot    = d['current_price']
+        ce_pct  = d['ce_oi_pct']
+        pe_pct  = d['pe_oi_pct']
+
+        pcr_tag    = 'Bearish' if pcr < 0.9 else ('Bullish' if pcr > 1.1 else 'Neutral')
+        pcr_col    = '#ff5252' if pcr < 0.9 else ('#00e676' if pcr > 1.1 else '#ffb74d')
+        pcr_border = 'rgba(255,82,82,0.35)' if pcr < 0.9 else ('rgba(0,230,118,0.35)' if pcr > 1.1 else 'rgba(255,183,77,0.3)')
+        pcr_tag_cls= 'tag-bear' if pcr < 0.9 else ('tag-bull' if pcr > 1.1 else 'tag-neu')
+        pcr_needle_pct = round(min(97, max(3, pcr / 2.0 * 100)), 1)
+
+        level_min = min(spot, max_pain) - 200
+        level_max = max(spot, max_pain) + 200
+        rng = level_max - level_min or 1
+        spot_pct  = round((spot - level_min) / rng * 100, 1)
+        pain_pct  = round((max_pain - level_min) / rng * 100, 1)
+        pain_diff = int(max_pain - spot)
+        pain_sign = '+' if pain_diff >= 0 else ''
+        pain_col  = '#00e676' if pain_diff > 0 else '#ff5252'
+
+        ce_oi_chg   = d.get('total_ce_oi_change', 0)
+        pe_oi_chg   = d.get('total_pe_oi_change', 0)
+        total_abs   = abs(ce_oi_chg) + abs(pe_oi_chg) or 1
+        ce_bar_pct  = round(abs(ce_oi_chg) / total_abs * 100, 1)
+        pe_bar_pct  = round(abs(pe_oi_chg) / total_abs * 100, 1)
+        ce_chg_col  = '#ff5252' if ce_oi_chg > 0 else '#00e676'
+        pe_chg_col  = '#00e676' if pe_oi_chg > 0 else '#ff5252'
+
+        return f"""
+        <!-- ── PCR Card ──────────────────────────────────────────────── -->
+        <div class="g-compact" style="border-color:{pcr_border};background:linear-gradient(145deg,rgba(12,4,8,0.95),rgba(8,4,6,0.98));position:relative;overflow:hidden;">
+          <div style="position:absolute;top:0;left:0;right:0;height:1px;
+            background:linear-gradient(90deg,transparent,{pcr_col},transparent);"></div>
+          <div class="cc-top">
+            <span class="cc-ico">&#128308;</span>
+            <div class="cc-lbl">PCR Ratio (OI)</div>
+            <span class="tag {pcr_tag_cls}">{pcr_tag}</span>
+          </div>
+          <div class="cc-val" style="color:{pcr_col};">{pcr:.3f}</div>
+          <div class="cc-sub">Put/Call OI Ratio</div>
+          <div style="position:relative;margin:8px 0 4px;">
+            <div style="height:8px;border-radius:4px;overflow:hidden;background:rgba(0,0,0,0.4);position:relative;">
+              <div style="position:absolute;inset:0;border-radius:4px;
+                background:linear-gradient(90deg,#ff3355 0%,#ff9900 35%,#ffcc00 50%,#88dd00 65%,#00e676 100%);opacity:0.75;"></div>
+              <div style="position:absolute;left:35%;top:0;bottom:0;width:1px;background:rgba(255,255,255,0.4);"></div>
+              <div style="position:absolute;left:60%;top:0;bottom:0;width:1px;background:rgba(255,255,255,0.4);"></div>
+              <div style="position:absolute;top:-3px;left:{pcr_needle_pct}%;
+                transform:translateX(-50%);width:3px;height:14px;
+                background:white;border-radius:1.5px;box-shadow:0 0 8px white;"></div>
+            </div>
+            <div style="display:flex;justify-content:space-between;margin-top:4px;
+              font-family:'JetBrains Mono',monospace;font-size:8px;">
+              <span style="color:#ff5252;">&#60;0.7 Bear</span>
+              <span style="color:rgba(180,210,230,0.35);">Neutral</span>
+              <span style="color:#00e676;">&#62;1.2 Bull</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- ── Max Pain Card ─────────────────────────────────────────── -->
+        <div class="g-compact" style="border-color:rgba(255,183,77,0.3);background:linear-gradient(145deg,rgba(28,22,8,0.9),rgba(12,10,4,0.95));position:relative;overflow:hidden;">
+          <div style="position:absolute;top:0;left:0;right:0;height:1px;
+            background:linear-gradient(90deg,transparent,#ffb74d,transparent);"></div>
+          <div class="cc-top">
+            <span class="cc-ico">&#127919;</span>
+            <div class="cc-lbl">Max Pain</div>
+            <span class="tag tag-neu">Expiry Magnet</span>
+          </div>
+          <div class="cc-val" style="color:#ffb74d;">&#8377;{max_pain:,}</div>
+          <div class="cc-sub">Price gravity level</div>
+          <div style="position:relative;height:20px;border-radius:6px;overflow:hidden;
+            background:linear-gradient(90deg,rgba(0,230,118,0.1),rgba(255,183,77,0.2),rgba(255,82,82,0.1));
+            margin:8px 0 4px;">
+            <div style="position:absolute;left:{pain_pct}%;top:50%;
+              transform:translate(-50%,-50%);width:3px;height:16px;
+              background:#ffb74d;box-shadow:0 0 8px #ffb74d;border-radius:1.5px;"></div>
+            <div style="position:absolute;left:{spot_pct}%;top:50%;
+              transform:translate(-50%,-50%);width:3px;height:16px;
+              background:#4fc3f7;box-shadow:0 0 8px #4fc3f7;border-radius:1.5px;"></div>
+          </div>
+          <div style="display:flex;justify-content:space-between;font-family:'JetBrains Mono',monospace;font-size:8px;">
+            <span style="color:#4fc3f7;">&#9632; Now &#8377;{spot:,.0f}</span>
+            <span style="color:{pain_col};">{pain_sign}{pain_diff:,} pts to pain</span>
+            <span style="color:#ffb74d;">&#9632; Pain &#8377;{max_pain:,}</span>
+          </div>
+        </div>
+
+        <!-- ── Max CE OI (Resistance Wall) ──────────────────────────── -->
+        <div class="g-compact" style="border-color:rgba(255,82,82,0.28);background:linear-gradient(145deg,rgba(30,10,14,0.9),rgba(12,4,8,0.95));position:relative;overflow:hidden;">
+          <div style="position:absolute;top:0;left:0;right:0;height:1px;
+            background:linear-gradient(90deg,transparent,#ff5252,transparent);"></div>
+          <div class="cc-top">
+            <span class="cc-ico">&#128308;</span>
+            <div class="cc-lbl">Max Call OI</div>
+            <span class="tag tag-bear">Resistance</span>
+          </div>
+          <div class="cc-val" style="color:#ff8899;">&#8377;{max_ce:,}</div>
+          <div class="cc-sub">CE wall</div>
+          <div style="margin-top:8px;">
+            <div style="font-family:'JetBrains Mono',monospace;font-size:8px;letter-spacing:1.5px;
+              color:rgba(120,160,180,0.4);text-transform:uppercase;margin-bottom:6px;">OI Change Today</div>
+            <div style="display:flex;flex-direction:column;gap:5px;">
+              <div style="display:flex;align-items:center;gap:7px;">
+                <span style="font-family:'JetBrains Mono',monospace;font-size:9px;font-weight:700;color:{ce_chg_col};width:22px;">CE</span>
+                <div style="flex:1;height:5px;background:rgba(0,0,0,0.4);border-radius:3px;overflow:hidden;">
+                  <div style="height:100%;width:{ce_bar_pct}%;border-radius:3px;background:linear-gradient(90deg,#ff5252,#ff6680);"></div>
+                </div>
+                <span style="font-family:'JetBrains Mono',monospace;font-size:9px;font-weight:700;color:{ce_chg_col};width:30px;text-align:right;">{ce_bar_pct:.0f}%</span>
+              </div>
+              <div style="display:flex;align-items:center;gap:7px;">
+                <span style="font-family:'JetBrains Mono',monospace;font-size:9px;font-weight:700;color:{pe_chg_col};width:22px;">PE</span>
+                <div style="flex:1;height:5px;background:rgba(0,0,0,0.4);border-radius:3px;overflow:hidden;">
+                  <div style="height:100%;width:{pe_bar_pct}%;border-radius:3px;background:linear-gradient(90deg,#00e676,#44ffaa);"></div>
+                </div>
+                <span style="font-family:'JetBrains Mono',monospace;font-size:9px;font-weight:700;color:{pe_chg_col};width:30px;text-align:right;">{pe_bar_pct:.0f}%</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- ── Max PE OI (Support Floor) ────────────────────────────── -->
+        <div class="g-compact" style="border-color:rgba(0,230,118,0.25);background:linear-gradient(145deg,rgba(10,30,20,0.9),rgba(4,14,10,0.95));position:relative;overflow:hidden;">
+          <div style="position:absolute;top:0;left:0;right:0;height:1px;
+            background:linear-gradient(90deg,transparent,#00e676,transparent);"></div>
+          <div class="cc-top">
+            <span class="cc-ico">&#128994;</span>
+            <div class="cc-lbl">Max Put OI</div>
+            <span class="tag tag-bull">Support</span>
+          </div>
+          <div class="cc-val" style="color:#44ffaa;">&#8377;{max_pe:,}</div>
+          <div class="cc-sub">PE floor</div>
+          <div style="margin-top:8px;">
+            <div style="font-family:'JetBrains Mono',monospace;font-size:8px;letter-spacing:1.5px;
+              color:rgba(120,160,180,0.4);text-transform:uppercase;margin-bottom:6px;">Total OI Ratio</div>
+            <div style="display:flex;flex-direction:column;gap:5px;">
+              <div style="display:flex;align-items:center;gap:7px;">
+                <span style="font-family:'JetBrains Mono',monospace;font-size:9px;font-weight:700;color:#ff8899;width:22px;">CE</span>
+                <div style="flex:1;height:5px;background:rgba(0,0,0,0.4);border-radius:3px;overflow:hidden;">
+                  <div style="height:100%;width:{ce_pct:.1f}%;border-radius:3px;background:linear-gradient(90deg,#ff5252,#ff6680);"></div>
+                </div>
+                <span style="font-family:'JetBrains Mono',monospace;font-size:9px;font-weight:700;color:#ff8899;width:30px;text-align:right;">{ce_pct:.0f}%</span>
+              </div>
+              <div style="display:flex;align-items:center;gap:7px;">
+                <span style="font-family:'JetBrains Mono',monospace;font-size:9px;font-weight:700;color:#44ffaa;width:22px;">PE</span>
+                <div style="flex:1;height:5px;background:rgba(0,0,0,0.4);border-radius:3px;overflow:hidden;">
+                  <div style="height:100%;width:{pe_pct:.1f}%;border-radius:3px;background:linear-gradient(90deg,#00e676,#44ffaa);"></div>
+                </div>
+                <span style="font-family:'JetBrains Mono',monospace;font-size:9px;font-weight:700;color:#44ffaa;width:30px;text-align:right;">{pe_pct:.0f}%</span>
+              </div>
+            </div>
+          </div>
+        </div>"""
+
+    def _signal_summary_bar_html(self):
+        d = self.html_data
+
+        # ── 1. OI Signal ──────────────────────────────────────────────────
+        oi_cls = d.get('oi_class', 'neutral') if d.get('has_option_data') else 'neutral'
+        if   oi_cls == 'bullish':  oi_score=1;  oi_lbl='Bullish';  oi_sub='Put build dominant';       oi_col='#00e676'; oi_bg='rgba(0,230,118,0.12)';  oi_bdr='rgba(0,230,118,0.3)';  oi_arrow='&#9651;'
+        elif oi_cls == 'bearish':  oi_score=-1; oi_lbl='Bearish';  oi_sub='Call build dominant';      oi_col='#ff4757'; oi_bg='rgba(255,71,87,0.12)';  oi_bdr='rgba(255,71,87,0.3)';  oi_arrow='&#9661;'
+        else:                      oi_score=0;  oi_lbl='Neutral';  oi_sub='Both sides building';      oi_col='#ffb74d'; oi_bg='rgba(255,183,77,0.10)'; oi_bdr='rgba(255,183,77,0.25)'; oi_arrow='&#9711;'
+
+        # ── 2. FII/DII Signal ─────────────────────────────────────────────
+        fii_summ  = d.get('fii_dii_summ', {})
+        fii_badge = fii_summ.get('badge_cls', 'fii-neu')
+        fii_label = fii_summ.get('label', 'Neutral')
+        fii_avg   = fii_summ.get('fii_avg', 0)
+        dii_avg   = fii_summ.get('dii_avg', 0)
+        if   fii_badge in ('fii-bull',):  fii_score=1;  fii_col='#00e676'; fii_bg='rgba(0,230,118,0.12)';   fii_bdr='rgba(0,230,118,0.3)';   fii_arrow='&#9651;'
+        elif fii_badge in ('fii-cbull',): fii_score=1;  fii_col='#69f0ae'; fii_bg='rgba(105,240,174,0.10)'; fii_bdr='rgba(105,240,174,0.28)'; fii_arrow='&#9651;'
+        elif fii_badge in ('fii-bear',):  fii_score=-1; fii_col='#ff4757'; fii_bg='rgba(255,71,87,0.12)';   fii_bdr='rgba(255,71,87,0.3)';   fii_arrow='&#9661;'
+        else:                             fii_score=0;  fii_col='#ffb74d'; fii_bg='rgba(255,183,77,0.10)';  fii_bdr='rgba(255,183,77,0.25)'; fii_arrow='&#9711;'
+        fii_sub = f"FII {'+' if fii_avg>=0 else ''}{fii_avg:,.0f} / DII {'+' if dii_avg>=0 else ''}{dii_avg:,.0f}"
+
+        # ── 3. Technical Signal ───────────────────────────────────────────
+        bias       = d.get('bias', 'SIDEWAYS')
+        bull_score = d.get('bullish_score', 0)
+        bear_score = d.get('bearish_score', 0)
+        score_diff = bull_score - bear_score
+        if   bias in ('BULLISH',):    tech_score=1;  tech_lbl='Bullish';    tech_col='#00e676'; tech_bg='rgba(0,230,118,0.12)';   tech_bdr='rgba(0,230,118,0.3)';   tech_arrow='&#9651;'
+        elif bias in ('WATCH BULL',): tech_score=1;  tech_lbl='Watch Bull'; tech_col='#b5ea3a'; tech_bg='rgba(181,234,58,0.10)';  tech_bdr='rgba(181,234,58,0.28)'; tech_arrow='&#9651;'
+        elif bias in ('BEARISH',):    tech_score=-1; tech_lbl='Bearish';    tech_col='#ff4757'; tech_bg='rgba(255,71,87,0.12)';   tech_bdr='rgba(255,71,87,0.3)';   tech_arrow='&#9661;'
+        elif bias in ('WATCH BEAR',): tech_score=-1; tech_lbl='Watch Bear'; tech_col='#ff9800'; tech_bg='rgba(255,152,0,0.10)';   tech_bdr='rgba(255,152,0,0.28)';  tech_arrow='&#9661;'
+        else:                         tech_score=0;  tech_lbl='Sideways';   tech_col='#ffb74d'; tech_bg='rgba(255,183,77,0.10)';  tech_bdr='rgba(255,183,77,0.25)'; tech_arrow='&#8596;'
+        tech_sub = f"Score {score_diff:+d} / {bull_score+bear_score} signals"
+
+        # ── 4. Strategy Checklist Score ───────────────────────────────────
+        # Re-derive from existing html_data fields (same data checklist uses)
+        pcr_val  = d.get('pcr') if d.get('has_option_data') else None
+        rsi_val  = d.get('rsi')
+        macd_b   = d.get('macd_bullish')
+        sma20    = d.get('sma_20_above')
+        sma50    = d.get('sma_50_above')
+        sma200   = d.get('sma_200_above')
+        oi_dir   = d.get('oi_class') if d.get('has_option_data') else None
+        strat_sc = 0
+        if pcr_val is not None:
+            if   pcr_val > 1.5: strat_sc += 2
+            elif pcr_val > 1.1: strat_sc += 1
+            elif pcr_val < 0.5: strat_sc -= 2
+            elif pcr_val < 0.9: strat_sc -= 1
+        if rsi_val is not None:
+            if   rsi_val > 70:  strat_sc -= 1
+            elif rsi_val < 30:  strat_sc += 2
+            elif rsi_val >= 55: strat_sc += 1
+            elif rsi_val <= 45: strat_sc -= 1
+        if macd_b is not None: strat_sc += 1 if macd_b else -1
+        trend_pts = sum([1 if x else -1 for x in [sma20, sma50, sma200] if x is not None])
+        strat_sc += (1 if trend_pts > 0 else -1 if trend_pts < 0 else 0)
+        if oi_dir == 'bullish':  strat_sc += 1
+        elif oi_dir == 'bearish': strat_sc -= 1
+        if   strat_sc >= 3:  strat_score=1;  strat_lbl='Strong Bull'; strat_col='#00e676'; strat_bg='rgba(0,230,118,0.12)';  strat_bdr='rgba(0,230,118,0.3)';  strat_arrow='&#9651;'
+        elif strat_sc >= 1:  strat_score=1;  strat_lbl='Mild Bull';   strat_col='#69f0ae'; strat_bg='rgba(105,240,174,0.10)';strat_bdr='rgba(105,240,174,0.28)';strat_arrow='&#9651;'
+        elif strat_sc <= -3: strat_score=-1; strat_lbl='Strong Bear'; strat_col='#ff4757'; strat_bg='rgba(255,71,87,0.12)';  strat_bdr='rgba(255,71,87,0.3)';  strat_arrow='&#9661;'
+        elif strat_sc <= -1: strat_score=-1; strat_lbl='Mild Bear';   strat_col='#fca5a5'; strat_bg='rgba(252,165,165,0.10)';strat_bdr='rgba(252,165,165,0.25)';strat_arrow='&#9661;'
+        else:                strat_score=0;  strat_lbl='Neutral';     strat_col='#ffb74d'; strat_bg='rgba(255,183,77,0.10)'; strat_bdr='rgba(255,183,77,0.25)'; strat_arrow='&#9711;'
+        strat_sub = f"Score {strat_sc:+d} / 5 factors"
+
+        # ── 5. PCR Signal ─────────────────────────────────────────────────
+        pcr_disp = d.get('pcr', 0) if d.get('has_option_data') else None
+        if pcr_disp is not None:
+            if   pcr_disp > 1.5: pcr_score=1;  pcr_lbl=f'{pcr_disp:.2f}'; pcr_sub='Strongly Bullish';  pcr_col='#00e676'; pcr_bg='rgba(0,230,118,0.12)';  pcr_bdr='rgba(0,230,118,0.3)'
+            elif pcr_disp > 1.1: pcr_score=1;  pcr_lbl=f'{pcr_disp:.2f}'; pcr_sub='Bullish (>1.1)';    pcr_col='#69f0ae'; pcr_bg='rgba(105,240,174,0.10)';pcr_bdr='rgba(105,240,174,0.28)'
+            elif pcr_disp < 0.5: pcr_score=-1; pcr_lbl=f'{pcr_disp:.2f}'; pcr_sub='Strongly Bearish';  pcr_col='#ff4757'; pcr_bg='rgba(255,71,87,0.12)';  pcr_bdr='rgba(255,71,87,0.3)'
+            elif pcr_disp < 0.9: pcr_score=-1; pcr_lbl=f'{pcr_disp:.2f}'; pcr_sub='Bearish (<0.9)';    pcr_col='#ff9999'; pcr_bg='rgba(255,71,87,0.08)';  pcr_bdr='rgba(255,71,87,0.2)'
+            else:                pcr_score=0;  pcr_lbl=f'{pcr_disp:.2f}'; pcr_sub='Neutral (0.9-1.1)'; pcr_col='#ffb74d'; pcr_bg='rgba(255,183,77,0.10)'; pcr_bdr='rgba(255,183,77,0.25)'
+        else:
+            pcr_score=0; pcr_lbl='N/A'; pcr_sub='No option data'; pcr_col='#8faabe'; pcr_bg='rgba(143,170,190,0.08)'; pcr_bdr='rgba(143,170,190,0.2)'
+
+        # ── Overall Verdict ───────────────────────────────────────────────
+        scores     = [oi_score, fii_score, tech_score, strat_score, pcr_score]
+        bull_count = sum(1 for s in scores if s > 0)
+        bear_count = sum(1 for s in scores if s < 0)
+        neu_count  = sum(1 for s in scores if s == 0)
+        total      = len(scores)
+        bull_pct   = round(bull_count / total * 100)
+        bear_pct   = round(bear_count / total * 100)
+
+        if   bull_count >= 4: vrd_lbl='STRONGLY BULLISH'; vrd_col='#00e676'; vrd_bg='rgba(0,230,118,0.08)';  vrd_bdr='#00e676';  vrd_lbdr='rgba(0,230,118,0.6)'
+        elif bull_count == 3: vrd_lbl='BULLISH';          vrd_col='#00e676'; vrd_bg='rgba(0,230,118,0.06)';  vrd_bdr='#00e676';  vrd_lbdr='rgba(0,230,118,0.5)'
+        elif bull_count == 2 and bear_count == 0: vrd_lbl='CAUTIOUSLY BULLISH'; vrd_col='#69f0ae'; vrd_bg='rgba(105,240,174,0.06)'; vrd_bdr='#69f0ae'; vrd_lbdr='rgba(105,240,174,0.4)'
+        elif bear_count >= 4: vrd_lbl='STRONGLY BEARISH'; vrd_col='#ff4757'; vrd_bg='rgba(255,71,87,0.08)';  vrd_bdr='#ff4757';  vrd_lbdr='rgba(255,71,87,0.6)'
+        elif bear_count == 3: vrd_lbl='BEARISH';          vrd_col='#ff4757'; vrd_bg='rgba(255,71,87,0.06)';  vrd_bdr='#ff4757';  vrd_lbdr='rgba(255,71,87,0.5)'
+        elif bear_count == 2 and bull_count == 0: vrd_lbl='CAUTIOUSLY BEARISH'; vrd_col='#fca5a5'; vrd_bg='rgba(252,165,165,0.06)'; vrd_bdr='#fca5a5'; vrd_lbdr='rgba(252,165,165,0.4)'
+        else:                 vrd_lbl='NEUTRAL';          vrd_col='#ffb74d'; vrd_bg='rgba(255,183,77,0.06)'; vrd_bdr='#ffb74d';  vrd_lbdr='rgba(255,183,77,0.4)'
+
+        # ── Dot indicators ────────────────────────────────────────────────
+        dot_scores = [
+            (oi_score,    'OI'),
+            (fii_score,   'FII/DII'),
+            (tech_score,  'Technical'),
+            (strat_score, 'Strategy'),
+            (pcr_score,   'PCR'),
+        ]
+        dots_html = ''
+        for sc, name in dot_scores:
+            if   sc > 0:  dc='#00e676'
+            elif sc < 0:  dc='#ff4757'
+            else:          dc='rgba(255,255,255,0.12)'
+            dots_html += f'<div class="ssb-dot" style="background:{dc};" title="{name}"></div>'
+
+        # ── Build one cell ────────────────────────────────────────────────
+        def cell(lbl, badge_lbl, arrow, col, bg, bdr, sub):
+            return (
+                f'<div class="ssb-cell">'
+                f'<span class="ssb-cell-lbl">{lbl}</span>'
+                f'<span class="ssb-badge" style="color:{col};background:{bg};border:1px solid {bdr};">'
+                f'{arrow} {badge_lbl}</span>'
+                f'<span class="ssb-sub">{sub}</span>'
+                f'</div>'
+            )
+
+        ts = d.get('timestamp', '')
+
+        return f"""
+<div class="section ssb-section" id="sec-signals">
+  <div class="ssb-wrap">
+    <div class="ssb-header">
+      <span class="ssb-title">&#9889; SIGNAL SUMMARY</span>
+      <span class="ssb-ts">{ts}</span>
+    </div>
+    <div class="ssb-grid">
+      {cell('OI Signal',   oi_lbl,    oi_arrow,    oi_col,    oi_bg,    oi_bdr,    d.get('oi_signal','—') if d.get('has_option_data') else 'No data')}
+      {cell('FII / DII',   fii_label, fii_arrow,   fii_col,   fii_bg,   fii_bdr,   fii_sub)}
+      {cell('Technical',   tech_lbl,  tech_arrow,  tech_col,  tech_bg,  tech_bdr,  tech_sub)}
+      {cell('Strategy',    strat_lbl, strat_arrow, strat_col, strat_bg, strat_bdr, strat_sub)}
+      {cell('PCR',         pcr_lbl,   '',          pcr_col,   pcr_bg,   pcr_bdr,   pcr_sub)}
+      <div class="ssb-verdict" style="background:{vrd_bg};border-left:3px solid {vrd_lbdr};">
+        <span class="ssb-verdict-lbl" style="color:#80deea;">Overall Verdict</span>
+        <span class="ssb-verdict-val" style="color:{vrd_col};">{vrd_lbl}</span>
+        <div class="ssb-score-dots">{dots_html}</div>
+        <div class="ssb-bar-wrap">
+          <div class="ssb-bar-lbl">
+            <span style="color:rgba(0,230,118,0.6);">Bull {bull_count}</span>
+            <span style="color:rgba(255,183,77,0.5);">Neu {neu_count}</span>
+            <span style="color:rgba(255,71,87,0.6);">Bear {bear_count}</span>
+          </div>
+          <div class="ssb-bar-track">
+            <div style="height:100%;width:{bull_pct}%;background:#00e676;border-radius:2px;display:inline-block;"></div>
+            <div style="height:100%;width:{bear_pct}%;background:#ff4757;border-radius:2px;float:right;"></div>
+          </div>
+        </div>
       </div>
     </div>
-    <div style="display:flex;gap:10px;flex-wrap:wrap;flex:1;">
-      <div id="legendBias" style="background:rgba(0,0,0,.2);border-radius:8px;padding:8px 12px;min-width:100px;flex:1;">
-        <div style="font-size:11.6px;color:rgba(255,255,255,.68);letter-spacing:1.5px;text-transform:uppercase;margin-bottom:4px;">A · BIAS</div>
-        <div id="legendBiasVal" style="font-family:'DM Mono',monospace;font-size:17.4px;font-weight:700;color:#8aa0ff;">—</div>
-      </div>
-      <div id="legendSR" style="background:rgba(0,0,0,.2);border-radius:8px;padding:8px 12px;min-width:120px;flex:1;">
-        <div style="font-size:11.6px;color:rgba(255,255,255,.68);letter-spacing:1.5px;text-transform:uppercase;margin-bottom:4px;">B · S/R ZONE</div>
-        <div id="legendSRVal" style="font-family:'DM Mono',monospace;font-size:17.4px;font-weight:700;color:#ffd166;">—</div>
-      </div>
-      <div id="legendOI" style="background:rgba(0,0,0,.2);border-radius:8px;padding:8px 12px;min-width:120px;flex:1;">
-        <div style="font-size:11.6px;color:rgba(255,255,255,.68);letter-spacing:1.5px;text-transform:uppercase;margin-bottom:4px;">C · OI WALLS</div>
-        <div id="legendOIVal" style="font-family:'DM Mono',monospace;font-size:17.4px;font-weight:700;color:#00c8e0;">—</div>
-      </div>
-      <div id="legendPCR" style="background:rgba(0,0,0,.2);border-radius:8px;padding:8px 12px;min-width:100px;flex:1;">
-        <div style="font-size:11.6px;color:rgba(255,255,255,.68);letter-spacing:1.5px;text-transform:uppercase;margin-bottom:4px;">D · PCR</div>
-        <div id="legendPCRVal" style="font-family:'DM Mono',monospace;font-size:17.4px;font-weight:700;color:#00c896;">—</div>
-      </div>
-      <div id="legendRec" style="background:rgba(0,200,150,.06);border:1px solid rgba(0,200,150,.2);border-radius:8px;padding:8px 12px;min-width:140px;flex:1;">
-        <div style="font-size:11.6px;color:rgba(0,200,150,.6);letter-spacing:1.5px;text-transform:uppercase;margin-bottom:4px;">&#9733; TOP STRATEGY</div>
-        <div id="legendRecVal" style="font-size:15.9px;font-weight:700;color:#00c896;">Calculating...</div>
-      </div>
-    </div>
-  </div>
-
-  <div class="sc-tabs">
-    <button class="sc-tab active" onclick="filterStrat('bullish',this)"
-      style="border-color:#00c896;color:#00c896;background:rgba(0,200,150,.12);">
-      &#9650; BULLISH <span class="sc-cnt" style="background:#00c896;">9</span>
-    </button>
-    <button class="sc-tab" onclick="filterStrat('bearish',this)"
-      style="border-color:rgba(255,255,255,.15);color:rgba(255,255,255,.5);">
-      &#9660; BEARISH <span class="sc-cnt" style="background:#ff6b6b;">9</span>
-    </button>
-    <button class="sc-tab" onclick="filterStrat('nondirectional',this)"
-      style="border-color:rgba(255,255,255,.15);color:rgba(255,255,255,.5);">
-      &#8596; NON-DIRECTIONAL <span class="sc-cnt" style="background:#6480ff;">20</span>
-    </button>
-    <div style="margin-left:auto;display:flex;align-items:center;gap:8px;">
-      <span style="font-size:13px;font-weight:700;letter-spacing:1.5px;text-transform:uppercase;
-                   color:rgba(255,209,102,.7);">&#128197; EXPIRY DATE</span>
-      <select id="expiryDropdown" onchange="switchExpiry(this.value)"
-        style="appearance:none;-webkit-appearance:none;
-               background:linear-gradient(135deg,rgba(245,197,24,.12),rgba(200,155,10,.06));
-               border:1px solid rgba(245,197,24,.45);border-radius:8px;
-               color:#ffd166;font-family:'DM Mono',monospace;font-size:15.9px;font-weight:700;
-               padding:7px 28px 7px 12px;cursor:pointer;outline:none;letter-spacing:.5px;">
-        {expiry_opts_html}
-      </select>
-    </div>
-  </div>
-  <div class="sc-grid" id="sc-grid">
-    {bull_cards}{bear_cards}{nd_cards}
   </div>
 </div>
-
-"""
-    + (f"""
-<script>
-const OC={{
-  spot:        {spot:.2f},
-  atm:         {atm},
-  pcr:         {pcr:.3f},
-  maxPain:     {mp},
-  maxCeStrike: {max_ce_s},
-  maxPeStrike: {max_pe_s},
-  support:     {support:.2f},
-  resistance:  {resistance:.2f},
-  strongSup:   {strong_sup:.2f},
-  strongRes:   {strong_res:.2f},
-  bias:        "{bias}",
-  biasConf:    "{conf}",
-  bullScore:   {bull_sc},
-  bearScore:   {bear_sc},
-  strikes:     {strikes_json},
-  lotSize:     {lot_size},
-  strikeStep:  100,
-  instName:    "BankNifty"
-}};
-
-const STRIKE_MAP={{}};
-OC.strikes.forEach(s=>{{ STRIKE_MAP[s.strike]=s; }});
-
-function smartPoP(shape, cat) {{
-  const spot=OC.spot, pcr=OC.pcr;
-  const sup=OC.support, res=OC.resistance;
-  const ssup=OC.strongSup, sres=OC.strongRes;
-  const maxCE=OC.maxCeStrike, maxPE=OC.maxPeStrike;
-  const bias=OC.bias, conf=OC.biasConf;
-  const rangeSize = res - sup || 200;
-  const confMult = conf==="HIGH" ? 1.25 : conf==="LOW" ? 0.6 : 1.0;
-  let biasAdj = 0;
-  if (cat === "bullish") {{ biasAdj = bias==="BULLISH" ? 15 : bias==="BEARISH" ? -15 : 0; }}
-  else if (cat === "bearish") {{ biasAdj = bias==="BEARISH" ? 15 : bias==="BULLISH" ? -15 : 0; }}
-  else {{ biasAdj = bias==="SIDEWAYS" ? 8 : (OC.bullScore===OC.bearScore ? 5 : -5); }}
-  biasAdj = biasAdj * confMult;
-  let srAdj = 0;
-  const distToSup = spot - sup; const distToRes = res - spot;
-  if (cat === "bullish") {{
-    if (distToSup >= 0 && distToSup <= rangeSize * 0.25) {{ srAdj = 10; }}
-    else if (distToSup >= 0 && distToSup <= rangeSize * 0.5) {{ srAdj = 5; }}
-    else if (distToRes >= 0 && distToRes <= rangeSize * 0.2) {{ srAdj = -10; }}
-    else if (spot > res) {{ srAdj = -8; }} else {{ srAdj = 2; }}
-  }} else if (cat === "bearish") {{
-    if (distToRes >= 0 && distToRes <= rangeSize * 0.25) {{ srAdj = 10; }}
-    else if (distToRes >= 0 && distToRes <= rangeSize * 0.5) {{ srAdj = 5; }}
-    else if (distToSup >= 0 && distToSup <= rangeSize * 0.2) {{ srAdj = -10; }}
-    else if (spot < sup) {{ srAdj = -8; }} else {{ srAdj = 2; }}
-  }} else {{
-    const midRange = (sup + res) / 2; const distFromMid = Math.abs(spot - midRange); const halfRange = rangeSize / 2;
-    if (distFromMid <= halfRange * 0.3) {{ srAdj = 10; }} else if (distFromMid <= halfRange * 0.6) {{ srAdj = 5; }} else {{ srAdj = -5; }}
-  }}
-  srAdj = srAdj * confMult;
-  let oiAdj = 0;
-  const distAboveMaxPE = spot - maxPE; const distBelowMaxCE = maxCE - spot;
-  if (cat === "bullish") {{
-    if (distAboveMaxPE > 0 && distAboveMaxPE < 150) {{ oiAdj += 8; }} else if (distAboveMaxPE > 150) {{ oiAdj += 4; }} else {{ oiAdj -= 8; }}
-    if (distBelowMaxCE > 200) {{ oiAdj += 5; }} else if (distBelowMaxCE < 100) {{ oiAdj -= 7; }}
-  }} else if (cat === "bearish") {{
-    if (distBelowMaxCE > 0 && distBelowMaxCE < 150) {{ oiAdj += 8; }} else if (distBelowMaxCE > 150) {{ oiAdj += 4; }} else {{ oiAdj -= 8; }}
-    if (distAboveMaxPE > 200) {{ oiAdj += 5; }} else if (distAboveMaxPE < 100) {{ oiAdj -= 7; }}
-  }} else {{
-    if (distAboveMaxPE > 0 && distBelowMaxCE > 0) {{
-      const oiRange = maxCE - maxPE || 200; const midOI = (maxPE + maxCE) / 2; const distFromOIMid = Math.abs(spot - midOI);
-      if (distFromOIMid < oiRange * 0.3) {{ oiAdj = 10; }} else {{ oiAdj = 4; }}
-    }} else {{ oiAdj = -5; }}
-  }}
-  let pcrAdj = 0;
-  if (cat === "bullish") {{ pcrAdj = pcr > 1.5 ? 8 : pcr > 1.2 ? 6 : pcr > 1.0 ? 3 : pcr < 0.7 ? -8 : pcr < 0.9 ? -4 : 0; }}
-  else if (cat === "bearish") {{ pcrAdj = pcr < 0.5 ? 8 : pcr < 0.7 ? 6 : pcr < 0.9 ? 3 : pcr > 1.3 ? -8 : pcr > 1.1 ? -4 : 0; }}
-  else {{ pcrAdj = (pcr >= 0.85 && pcr <= 1.15) ? 6 : (pcr >= 0.7 && pcr <= 1.3) ? 3 : -4; }}
-  let stratAdj = 0;
-  if (shape.includes('spread') || shape.includes('condor') || shape.includes('butterfly')) {{ stratAdj = 2; }}
-  if (shape === 'short_straddle' || shape === 'short_strangle') {{ stratAdj = bias === 'SIDEWAYS' ? 8 : -10; }}
-  if (shape === 'long_straddle' || shape === 'long_strangle') {{ stratAdj = bias === 'SIDEWAYS' ? -8 : 8; }}
-  if ((shape === 'short_iron_condor' || shape === 'short_iron_fly') && bias === 'SIDEWAYS') {{ stratAdj = 10; }}
-  const rawPoP = 50 + biasAdj + srAdj + oiAdj + pcrAdj + stratAdj;
-  return {{ pop: Math.min(95, Math.max(5, Math.round(rawPoP))), biasAdj: Math.round(biasAdj), srAdj: Math.round(srAdj), oiAdj: Math.round(oiAdj), pcrAdj: Math.round(pcrAdj), stratAdj: Math.round(stratAdj) }};
-}}
-
-function normCDF(x) {{
-  const a1=0.254829592,a2=-0.284496736,a3=1.421413741,a4=-1.453152027,a5=1.061405429,p=0.3275911;
-  const sign=x<0?-1:1; x=Math.abs(x);
-  const t=1/(1+p*x); const y=1-(((((a5*t+a4)*t)+a3)*t+a2)*t+a1)*t*Math.exp(-x*x);
-  return 0.5*(1+sign*y);
-}}
-function getATMLTP(type) {{
-  const row=STRIKE_MAP[OC.atm]||OC.strikes.reduce((b,s)=>Math.abs(s.strike-OC.atm)<Math.abs(b.strike-OC.atm)?s:b,OC.strikes[0]||{{strike:OC.atm,ce_ltp:0,pe_ltp:0,ce_iv:15,pe_iv:15}});
-  return type==='ce'?row.ce_ltp:row.pe_ltp;
-}}
-function getOTM(type,offset) {{
-  const step = OC.strikeStep || 100;
-  const t=type==='ce'?OC.atm+offset*step:OC.atm-offset*step;
-  const row=STRIKE_MAP[t]||OC.strikes.reduce((b,s)=>Math.abs(s.strike-t)<Math.abs(b.strike-t)?s:b,OC.strikes[0]||{{strike:OC.atm,ce_ltp:0,pe_ltp:0,ce_iv:15,pe_iv:15}});
-  return {{strike:row.strike||t,ltp:type==='ce'?row.ce_ltp:row.pe_ltp,iv:type==='ce'?row.ce_iv:row.pe_iv}};
-}}
-
-function getGreeks(type, strike) {{
-  // Returns {{delta, theta, vega}} for a given strike and option type (ce/pe)
-  // Uses STRIKE_MAP which now includes BS-computed greeks from Python
-  const row = STRIKE_MAP[strike] || OC.strikes.reduce(
-    (b, s) => Math.abs(s.strike - strike) < Math.abs(b.strike - strike) ? s : b,
-    OC.strikes[0] || {{strike: OC.atm, ce_delta:0.5, pe_delta:-0.5, ce_theta:-0.1, pe_theta:-0.1, ce_vega:0.05, pe_vega:0.05}}
-  );
-  if (type === 'ce') return {{ delta: row.ce_delta||0.5,  theta: row.ce_theta||0, vega: row.ce_vega||0  }};
-  else               return {{ delta: row.pe_delta||-0.5, theta: row.pe_theta||0, vega: row.pe_vega||0 }};
-}}
-
-
-// ── Near-expiry LTP helpers for Calendar / Diagonal strategies ──────────
-// Looks up the NEXT available expiry in ALL_EXPIRY_DATA and returns the
-// real traded LTP for the ATM (or OTM+offset) strike.
-// Returns 0 if no real data exists → LTP Gate will block the card.
-function getNearExpiryATMLTP(type) {{
-  try {{
-    const sel = document.getElementById('expiryDropdown');
-    if (!sel) return 0;
-    const opts = Array.from(sel.options).filter(o => !o.disabled);
-    const curIdx = opts.findIndex(o => o.value === sel.value);
-    if (curIdx < 0 || curIdx + 1 >= opts.length) return 0;
-    const nearExp = opts[curIdx + 1].value;
-    const nd = ALL_EXPIRY_DATA[nearExp];
-    if (!nd || !nd.strikes || !nd.strikes.length) return 0;
-    const atm = OC.atm;
-    const row = nd.strikes.find(s => s.strike === atm) ||
-      nd.strikes.reduce((b, s) =>
-        Math.abs(s.strike - atm) < Math.abs(b.strike - atm) ? s : b,
-        nd.strikes[0]);
-    if (!row) return 0;
-    const ltp = type === 'ce' ? (row.ce_ltp || 0) : (row.pe_ltp || 0);
-    return ltp;
-  }} catch(e) {{ return 0; }}
-}}
-
-function getNearExpiryOTMLTP(type, offset) {{
-  try {{
-    const sel = document.getElementById('expiryDropdown');
-    if (!sel) return 0;
-    const opts = Array.from(sel.options).filter(o => !o.disabled);
-    const curIdx = opts.findIndex(o => o.value === sel.value);
-    if (curIdx < 0 || curIdx + 1 >= opts.length) return 0;
-    const nearExp = opts[curIdx + 1].value;
-    const nd = ALL_EXPIRY_DATA[nearExp];
-    if (!nd || !nd.strikes || !nd.strikes.length) return 0;
-    const step = OC.strikeStep || 100;
-    const target = type === 'ce' ? OC.atm + offset * step : OC.atm - offset * step;
-    const row = nd.strikes.find(s => s.strike === target) ||
-      nd.strikes.reduce((b, s) =>
-        Math.abs(s.strike - target) < Math.abs(b.strike - target) ? s : b,
-        nd.strikes[0]);
-    if (!row) return 0;
-    return type === 'ce' ? (row.ce_ltp || 0) : (row.pe_ltp || 0);
-  }} catch(e) {{ return 0; }}
-}}
-
-function calcMetrics(shape, smartPop) {{
-  const spot   = OC.spot, atm = OC.atm;
-  const lotSz  = OC.lotSize;
-  const ce_atm = getATMLTP('ce'), pe_atm = getATMLTP('pe');
-
-  const co1 = getOTM('ce', 1), co2 = getOTM('ce', 2), co3 = getOTM('ce', 3);
-  const po1 = getOTM('pe', 1), po2 = getOTM('pe', 2), po3 = getOTM('pe', 3);
-
-  const ceWing1 = co1.strike - atm;
-  const peWing1 = atm - po1.strike;
-
-  // Near-expiry LTP for calendar strategies (real data from ALL_EXPIRY_DATA)
-  // Must be declared BEFORE _LTP_REQS to avoid JS Temporal Dead Zone errors.
-  const nearCeLTP  = getNearExpiryATMLTP('ce');
-  const nearPeLTP  = getNearExpiryATMLTP('pe');
-  const nearCo1LTP = getNearExpiryOTMLTP('ce', 1);
-
-  // ── LTP Gate: never recommend a strategy when any required LTP is null/zero ──
-  // If NSE hasn't traded a strike yet (LTP = 0 / null), all P&L figures would be
-  // fabricated.  Return null → calling code hides the card entirely.
-  const _LTP_REQS = {{
-    long_call:         [ce_atm],
-    long_put:          [pe_atm],
-    short_call:        [ce_atm],
-    short_put:         [pe_atm],
-    bull_call_spread:  [ce_atm, co1.ltp],
-    bear_call_spread:  [ce_atm, co1.ltp],
-    bull_put_spread:   [pe_atm, po1.ltp],
-    bear_put_spread:   [pe_atm, po1.ltp],
-    long_straddle:     [ce_atm, pe_atm],
-    short_straddle:    [ce_atm, pe_atm],
-    long_strangle:     [co1.ltp, po1.ltp],
-    short_strangle:    [co1.ltp, po1.ltp],
-    short_iron_fly:    [ce_atm, pe_atm, co1.ltp, po1.ltp],
-    long_iron_fly:     [ce_atm, pe_atm, co1.ltp, po1.ltp],
-    short_iron_condor: [co1.ltp, co2.ltp, po1.ltp, po2.ltp],
-    long_iron_condor:  [co1.ltp, co2.ltp, po1.ltp, po2.ltp],
-    call_butterfly:    [ce_atm, co1.ltp, co2.ltp],
-    bull_butterfly:    [ce_atm, co1.ltp, co2.ltp],
-    put_butterfly:     [pe_atm, po1.ltp, po2.ltp],
-    bear_butterfly:    [pe_atm, po1.ltp, po2.ltp],
-    call_ratio_back:   [ce_atm, co1.ltp],
-    put_ratio_back:    [pe_atm, po1.ltp],
-    call_ratio_spread: [ce_atm, co1.ltp],
-    put_ratio_spread:  [pe_atm, po1.ltp],
-    long_synthetic:    [ce_atm, pe_atm],
-    short_synthetic:   [ce_atm, pe_atm],
-    risk_reversal:     [po1.ltp, co1.ltp],
-    range_forward:     [co1.ltp, po1.ltp],
-    jade_lizard:       [po1.ltp, co1.ltp, co2.ltp],
-    reverse_jade:      [co1.ltp, po1.ltp, po2.ltp],
-    bull_condor:       [ce_atm, co1.ltp, co2.ltp, co3.ltp],
-    bear_condor:       [pe_atm, po1.ltp, po2.ltp, po3.ltp],
-    batman:            [ce_atm, co1.ltp, co2.ltp],
-    double_fly:        [ce_atm, pe_atm, co1.ltp, co2.ltp, po1.ltp, po2.ltp],
-    double_condor:     [ce_atm, pe_atm, co1.ltp, co2.ltp, co3.ltp, po1.ltp, po2.ltp, po3.ltp],
-    call_calendar:     [ce_atm, nearCeLTP],
-    put_calendar:      [pe_atm, nearPeLTP],
-    diagonal_calendar: [ce_atm, co1.ltp, nearCo1LTP],
-  }};
-  const _reqs = _LTP_REQS[shape];
-  if (_reqs && _reqs.some(v => !(v > 0))) return null;
-  // ─────────────────────────────────────────────────────────────────────────────
-
-  // Greeks helpers
-  const gCeAtm = getGreeks('ce', atm);
-  const gPeAtm = getGreeks('pe', atm);
-  const gCo1   = getGreeks('ce', co1.strike);
-  const gCo2   = getGreeks('ce', co2.strike);
-  const gCo3   = getGreeks('ce', co3.strike);
-  const gPo1   = getGreeks('pe', po1.strike);
-  const gPo2   = getGreeks('pe', po2.strike);
-  const gPo3   = getGreeks('pe', po3.strike);
-
-  let pop = smartPop || 50;
-  let mp = 0, ml = 0, be = [], nc = 0, margin = 0, rrRatio = 0;
-  let ltpParts = [];
-  // Net greeks for intraday simulator (per lot)
-  let netDelta = 0, netTheta = 0, netVega = 0;
-
-  switch (shape) {{
-
-    case 'long_call': {{
-      const p = ce_atm;
-      mp = 999999; ml = p * lotSz; be = [atm + p];
-      nc = -p * lotSz; margin = p * lotSz;
-      ltpParts = [{{ l: 'BUY CE \u20b9' + atm.toLocaleString('en-IN'), v: p, c: '#00c8e0' }}];
-      netDelta = gCeAtm.delta * lotSz; netTheta = gCeAtm.theta * lotSz; netVega = gCeAtm.vega * lotSz;
-      break;
-    }}
-    case 'long_put': {{
-      const p = pe_atm;
-      mp = 999999; ml = p * lotSz; be = [atm - p];
-      nc = -p * lotSz; margin = p * lotSz;
-      ltpParts = [{{ l: 'BUY PE \u20b9' + atm.toLocaleString('en-IN'), v: p, c: '#ff9090' }}];
-      netDelta = gPeAtm.delta * lotSz; netTheta = gPeAtm.theta * lotSz; netVega = gPeAtm.vega * lotSz;
-      break;
-    }}
-    case 'short_put': {{
-      const p = pe_atm;
-      mp = p * lotSz; ml = (atm - p) * lotSz; be = [atm - p];
-      nc = p * lotSz; margin = atm * lotSz * 0.15;
-      rrRatio = ((atm - p) / p).toFixed(2);
-      ltpParts = [{{ l: 'SELL PE \u20b9' + atm.toLocaleString('en-IN'), v: p, c: '#ff9090' }}];
-      netDelta = -gPeAtm.delta * lotSz; netTheta = -gPeAtm.theta * lotSz; netVega = -gPeAtm.vega * lotSz;
-      break;
-    }}
-    case 'short_call': {{
-      const p = ce_atm;
-      mp = p * lotSz; ml = 999999; be = [atm + p];
-      nc = p * lotSz; margin = atm * lotSz * 0.15;
-      ltpParts = [{{ l: 'SELL CE \u20b9' + atm.toLocaleString('en-IN'), v: p, c: '#00c8e0' }}];
-      netDelta = -gCeAtm.delta * lotSz; netTheta = -gCeAtm.theta * lotSz; netVega = -gCeAtm.vega * lotSz;
-      break;
-    }}
-
-    case 'bull_call_spread': {{
-      const bp = ce_atm, sp = co1.ltp;
-      const nd = bp - sp, sw = ceWing1;
-      mp = (sw - nd) * lotSz; ml = nd * lotSz; be = [atm + nd];
-      nc = -nd * lotSz; margin = nd * lotSz;
-      rrRatio = ((sw - nd) / nd).toFixed(2);
-      ltpParts = [
-        {{ l: 'BUY CE \u20b9' + atm.toLocaleString('en-IN'), v: bp, c: '#00c8e0' }},
-        {{ l: 'SELL CE \u20b9' + co1.strike.toLocaleString('en-IN'), v: sp, c: '#00c896' }}
-      ];
-      netDelta=(gCeAtm.delta - gCo1.delta)*lotSz; netTheta=(gCeAtm.theta - gCo1.theta)*lotSz; netVega=(gCeAtm.vega - gCo1.vega)*lotSz;
-      break;
-    }}
-    case 'bull_put_spread': {{
-      const sp = pe_atm, bp = po1.ltp;
-      const nc2 = sp - bp, sw = peWing1;
-      mp = nc2 * lotSz; ml = (sw - nc2) * lotSz; be = [atm - nc2];
-      nc = nc2 * lotSz; margin = sw * lotSz;
-      rrRatio = (nc2 / (sw - nc2)).toFixed(2);
-      ltpParts = [
-        {{ l: 'SELL PE \u20b9' + atm.toLocaleString('en-IN'), v: sp, c: '#00c896' }},
-        {{ l: 'BUY PE \u20b9' + po1.strike.toLocaleString('en-IN'), v: bp, c: '#ff9090' }}
-      ];
-      netDelta=(-gPeAtm.delta + gPo1.delta)*lotSz; netTheta=(-gPeAtm.theta + gPo1.theta)*lotSz; netVega=(-gPeAtm.vega + gPo1.vega)*lotSz;
-      break;
-    }}
-    case 'bear_call_spread': {{
-      const sp = ce_atm, bp = co1.ltp;
-      const nc2 = sp - bp, sw = ceWing1;
-      mp = nc2 * lotSz; ml = (sw - nc2) * lotSz; be = [atm + nc2];
-      nc = nc2 * lotSz; margin = sw * lotSz;
-      rrRatio = (nc2 / (sw - nc2)).toFixed(2);
-      ltpParts = [
-        {{ l: 'SELL CE \u20b9' + atm.toLocaleString('en-IN'), v: sp, c: '#00c896' }},
-        {{ l: 'BUY CE \u20b9' + co1.strike.toLocaleString('en-IN'), v: bp, c: '#00c8e0' }}
-      ];
-      netDelta=(-gCeAtm.delta + gCo1.delta)*lotSz; netTheta=(-gCeAtm.theta + gCo1.theta)*lotSz; netVega=(-gCeAtm.vega + gCo1.vega)*lotSz;
-      break;
-    }}
-    case 'bear_put_spread': {{
-      const bp = pe_atm, sp = po1.ltp;
-      const nd = bp - sp, sw = peWing1;
-      mp = (sw - nd) * lotSz; ml = nd * lotSz; be = [atm - nd];
-      nc = -nd * lotSz; margin = nd * lotSz;
-      rrRatio = ((sw - nd) / nd).toFixed(2);
-      ltpParts = [
-        {{ l: 'BUY PE \u20b9' + atm.toLocaleString('en-IN'), v: bp, c: '#ff9090' }},
-        {{ l: 'SELL PE \u20b9' + po1.strike.toLocaleString('en-IN'), v: sp, c: '#00c896' }}
-      ];
-      netDelta=(gPeAtm.delta - gPo1.delta)*lotSz; netTheta=(gPeAtm.theta - gPo1.theta)*lotSz; netVega=(gPeAtm.vega - gPo1.vega)*lotSz;
-      break;
-    }}
-
-    case 'long_straddle': {{
-      const cp2 = ce_atm, pp = pe_atm, tp = cp2 + pp;
-      mp = 999999; ml = tp * lotSz; be = [atm - tp, atm + tp];
-      nc = -tp * lotSz; margin = tp * lotSz;
-      ltpParts = [
-        {{ l: 'BUY CE \u20b9' + atm.toLocaleString('en-IN'), v: cp2, c: '#00c8e0' }},
-        {{ l: 'BUY PE \u20b9' + atm.toLocaleString('en-IN'), v: pp, c: '#ff9090' }}
-      ];
-      netDelta=(gCeAtm.delta + gPeAtm.delta)*lotSz; netTheta=(gCeAtm.theta + gPeAtm.theta)*lotSz; netVega=(gCeAtm.vega + gPeAtm.vega)*lotSz;
-      break;
-    }}
-    case 'short_straddle': {{
-      const cp2 = ce_atm, pp = pe_atm, tp = cp2 + pp;
-      mp = tp * lotSz; ml = 999999; be = [atm - tp, atm + tp];
-      nc = tp * lotSz; margin = Math.round(0.155 * OC.spot * OC.lotSize); // SPAN straddle: both ATM naked ~15.5% notional
-      ltpParts = [
-        {{ l: 'SELL CE \u20b9' + atm.toLocaleString('en-IN'), v: cp2, c: '#00c8e0' }},
-        {{ l: 'SELL PE \u20b9' + atm.toLocaleString('en-IN'), v: pp, c: '#ff9090' }}
-      ];
-      netDelta=-(gCeAtm.delta + gPeAtm.delta)*lotSz; netTheta=-(gCeAtm.theta + gPeAtm.theta)*lotSz; netVega=-(gCeAtm.vega + gPeAtm.vega)*lotSz;
-      break;
-    }}
-    case 'long_strangle': {{
-      const cp2 = co1.ltp, pp = po1.ltp, tp = cp2 + pp;
-      mp = 999999; ml = tp * lotSz;
-      be = [po1.strike - tp, co1.strike + tp];
-      nc = -tp * lotSz; margin = tp * lotSz;
-      ltpParts = [
-        {{ l: 'BUY CE \u20b9' + co1.strike.toLocaleString('en-IN'), v: cp2, c: '#00c8e0' }},
-        {{ l: 'BUY PE \u20b9' + po1.strike.toLocaleString('en-IN'), v: pp, c: '#ff9090' }}
-      ];
-      netDelta=(gCo1.delta + gPo1.delta)*lotSz; netTheta=(gCo1.theta + gPo1.theta)*lotSz; netVega=(gCo1.vega + gPo1.vega)*lotSz;
-      break;
-    }}
-    case 'short_strangle': {{
-      const cp2 = co1.ltp, pp = po1.ltp, tp = cp2 + pp;
-      mp = tp * lotSz; ml = 999999;
-      be = [po1.strike - tp, co1.strike + tp];
-      nc = tp * lotSz; margin = Math.round((Math.max(0.117*OC.spot,0.075*co1.strike)*OC.lotSize > Math.max(0.117*OC.spot,0.075*po1.strike)*OC.lotSize ? Math.max(0.117*OC.spot,0.075*co1.strike)*OC.lotSize*0.85 + Math.max(0.117*OC.spot,0.075*po1.strike)*OC.lotSize*0.15 : Math.max(0.117*OC.spot,0.075*po1.strike)*OC.lotSize*0.85 + Math.max(0.117*OC.spot,0.075*co1.strike)*OC.lotSize*0.15)); // SPAN strangle: 85/15 netting
-      ltpParts = [
-        {{ l: 'SELL CE \u20b9' + co1.strike.toLocaleString('en-IN'), v: cp2, c: '#00c8e0' }},
-        {{ l: 'SELL PE \u20b9' + po1.strike.toLocaleString('en-IN'), v: pp, c: '#ff9090' }}
-      ];
-      netDelta=-(gCo1.delta + gPo1.delta)*lotSz; netTheta=-(gCo1.theta + gPo1.theta)*lotSz; netVega=-(gCo1.vega + gPo1.vega)*lotSz;
-      break;
-    }}
-
-    case 'short_iron_fly': {{
-      const cp2 = ce_atm, pp = pe_atm;
-      const wc = co1.ltp, wp = po1.ltp;
-      const nc2 = cp2 + pp - wc - wp;
-      mp = nc2 * lotSz; ml = (ceWing1 - nc2) * lotSz;
-      be = [atm - nc2, atm + nc2];
-      nc = nc2 * lotSz; margin = ceWing1 * lotSz * 2;
-      rrRatio = (nc2 / (ceWing1 - nc2)).toFixed(2);
-      ltpParts = [
-        {{ l: 'SELL CE \u20b9' + atm.toLocaleString('en-IN'), v: cp2, c: '#00c8e0' }},
-        {{ l: 'SELL PE \u20b9' + atm.toLocaleString('en-IN'), v: pp, c: '#ff9090' }},
-        {{ l: 'BUY CE \u20b9' + co1.strike.toLocaleString('en-IN'), v: wc, c: '#00c8e0' }},
-        {{ l: 'BUY PE \u20b9' + po1.strike.toLocaleString('en-IN'), v: wp, c: '#ff9090' }}
-      ];
-      netDelta=-(gCeAtm.delta+gPeAtm.delta-gCo1.delta-gPo1.delta)*lotSz; netTheta=-(gCeAtm.theta+gPeAtm.theta-gCo1.theta-gPo1.theta)*lotSz; netVega=-(gCeAtm.vega+gPeAtm.vega-gCo1.vega-gPo1.vega)*lotSz;
-      break;
-    }}
-    case 'long_iron_fly': {{
-      const cp2 = ce_atm, pp = pe_atm;
-      const wc = co1.ltp, wp = po1.ltp;
-      const nd = wc + wp - cp2 - pp;
-      mp = (ceWing1 - Math.abs(nd)) * lotSz; ml = Math.abs(nd) * lotSz;
-      be = [atm - Math.abs(nd), atm + Math.abs(nd)];
-      nc = -Math.abs(nd) * lotSz; margin = Math.abs(nd) * lotSz;
-      rrRatio = ((ceWing1 - Math.abs(nd)) / Math.abs(nd)).toFixed(2);
-      ltpParts = [
-        {{ l: 'BUY CE \u20b9' + atm.toLocaleString('en-IN'), v: cp2, c: '#00c8e0' }},
-        {{ l: 'BUY PE \u20b9' + atm.toLocaleString('en-IN'), v: pp, c: '#ff9090' }},
-        {{ l: 'SELL CE \u20b9' + co1.strike.toLocaleString('en-IN'), v: wc, c: '#00c8e0' }},
-        {{ l: 'SELL PE \u20b9' + po1.strike.toLocaleString('en-IN'), v: wp, c: '#ff9090' }}
-      ];
-      netDelta=(gCeAtm.delta+gPeAtm.delta-gCo1.delta-gPo1.delta)*lotSz; netTheta=(gCeAtm.theta+gPeAtm.theta-gCo1.theta-gPo1.theta)*lotSz; netVega=(gCeAtm.vega+gPeAtm.vega-gCo1.vega-gPo1.vega)*lotSz;
-      break;
-    }}
-    case 'short_iron_condor': {{
-      const sc = co1.ltp, bc = co2.ltp;
-      const sp = po1.ltp, bp = po2.ltp;
-      const nc2 = sc - bc + sp - bp;
-      mp = nc2 * lotSz; ml = (ceWing1 - nc2) * lotSz;
-      be = [po1.strike - nc2, co1.strike + nc2];
-      nc = nc2 * lotSz; margin = ceWing1 * lotSz * 2;
-      rrRatio = (nc2 / (ceWing1 - nc2)).toFixed(2);
-      ltpParts = [
-        {{ l: 'SELL CE \u20b9' + co1.strike.toLocaleString('en-IN'), v: sc, c: '#00c8e0' }},
-        {{ l: 'BUY CE \u20b9' + co2.strike.toLocaleString('en-IN'), v: bc, c: '#00c8e0' }},
-        {{ l: 'SELL PE \u20b9' + po1.strike.toLocaleString('en-IN'), v: sp, c: '#ff9090' }},
-        {{ l: 'BUY PE \u20b9' + po2.strike.toLocaleString('en-IN'), v: bp, c: '#ff9090' }}
-      ];
-      netDelta=-(gCo1.delta+gPo1.delta-gCo2.delta-gPo2.delta)*lotSz; netTheta=-(gCo1.theta+gPo1.theta-gCo2.theta-gPo2.theta)*lotSz; netVega=-(gCo1.vega+gPo1.vega-gCo2.vega-gPo2.vega)*lotSz;
-      break;
-    }}
-    case 'long_iron_condor': {{
-      const sc = co1.ltp, bc = co2.ltp;
-      const sp = po1.ltp, bp = po2.ltp;
-      const nd = bc - sc + bp - sp;
-      mp = (ceWing1 - Math.abs(nd)) * lotSz; ml = Math.abs(nd) * lotSz;
-      be = [po1.strike - Math.abs(nd), co1.strike + Math.abs(nd)];
-      nc = nd * lotSz; margin = Math.abs(nd) * lotSz;
-      rrRatio = ((ceWing1 - Math.abs(nd)) / Math.abs(nd)).toFixed(2);
-      ltpParts = [
-        {{ l: 'SELL CE \u20b9' + co1.strike.toLocaleString('en-IN'), v: sc, c: '#00c8e0' }},
-        {{ l: 'BUY CE \u20b9' + co2.strike.toLocaleString('en-IN'), v: bc, c: '#00c8e0' }},
-        {{ l: 'SELL PE \u20b9' + po1.strike.toLocaleString('en-IN'), v: sp, c: '#ff9090' }},
-        {{ l: 'BUY PE \u20b9' + po2.strike.toLocaleString('en-IN'), v: bp, c: '#ff9090' }}
-      ];
-      netDelta=(gCo1.delta+gPo1.delta-gCo2.delta-gPo2.delta)*lotSz; netTheta=(gCo1.theta+gPo1.theta-gCo2.theta-gPo2.theta)*lotSz; netVega=(gCo1.vega+gPo1.vega-gCo2.vega-gPo2.vega)*lotSz;
-      break;
-    }}
-
-    case 'call_butterfly':
-    case 'bull_butterfly': {{
-      const lp = ce_atm, mid = co1.ltp, hp = co2.ltp;
-      const nd = lp - 2 * mid + hp;
-      mp = (ceWing1 - nd) * lotSz; ml = nd * lotSz;
-      be = [atm + nd, co2.strike - nd];
-      nc = -nd * lotSz; margin = nd * lotSz;
-      rrRatio = ((ceWing1 - nd) / nd).toFixed(2);
-      ltpParts = [
-        {{ l: 'BUY CE \u20b9' + atm.toLocaleString('en-IN'), v: lp, c: '#00c8e0' }},
-        {{ l: 'SELL 2x CE \u20b9' + co1.strike.toLocaleString('en-IN'), v: mid, c: '#00c896' }},
-        {{ l: 'BUY CE \u20b9' + co2.strike.toLocaleString('en-IN'), v: hp, c: '#00c8e0' }}
-      ];
-      netDelta=(gCeAtm.delta - 2*gCo1.delta + gCo2.delta)*lotSz; netTheta=(gCeAtm.theta - 2*gCo1.theta + gCo2.theta)*lotSz; netVega=(gCeAtm.vega - 2*gCo1.vega + gCo2.vega)*lotSz;
-      break;
-    }}
-    case 'put_butterfly':
-    case 'bear_butterfly': {{
-      const hp = pe_atm, mid = po1.ltp, lp = po2.ltp;
-      const nd = hp - 2 * mid + lp;
-      mp = (peWing1 - nd) * lotSz; ml = nd * lotSz;
-      be = [po2.strike + nd, atm - nd];
-      nc = -nd * lotSz; margin = nd * lotSz;
-      rrRatio = ((peWing1 - nd) / nd).toFixed(2);
-      ltpParts = [
-        {{ l: 'BUY PE \u20b9' + atm.toLocaleString('en-IN'), v: hp, c: '#ff9090' }},
-        {{ l: 'SELL 2x PE \u20b9' + po1.strike.toLocaleString('en-IN'), v: mid, c: '#00c896' }},
-        {{ l: 'BUY PE \u20b9' + po2.strike.toLocaleString('en-IN'), v: lp, c: '#ff9090' }}
-      ];
-      netDelta=(gPeAtm.delta - 2*gPo1.delta + gPo2.delta)*lotSz; netTheta=(gPeAtm.theta - 2*gPo1.theta + gPo2.theta)*lotSz; netVega=(gPeAtm.vega - 2*gPo1.vega + gPo2.vega)*lotSz;
-      break;
-    }}
-
-    case 'call_ratio_back': {{
-      const sp = ce_atm, bp = co1.ltp, nd = 2 * bp - sp;
-      mp = 999999; ml = nd > 0 ? nd * lotSz : 0;
-      be = [co1.strike + Math.abs(nd)];
-      nc = -nd * lotSz; margin = Math.round((0.117 - 0.01) * OC.spot * OC.lotSize); // SPAN: naked(11.7%) - 1 BUY hedge(1%)
-      ltpParts = [
-        {{ l: 'SELL CE \u20b9' + atm.toLocaleString('en-IN'), v: sp, c: '#00c896' }},
-        {{ l: 'BUY 2x CE \u20b9' + co1.strike.toLocaleString('en-IN'), v: bp, c: '#00c8e0' }}
-      ];
-      netDelta=(-gCeAtm.delta + 2*gCo1.delta)*lotSz; netTheta=(-gCeAtm.theta + 2*gCo1.theta)*lotSz; netVega=(-gCeAtm.vega + 2*gCo1.vega)*lotSz;
-      break;
-    }}
-    case 'put_ratio_back': {{
-      const sp = pe_atm, bp = po1.ltp, nd = 2 * bp - sp;
-      mp = 999999; ml = nd > 0 ? nd * lotSz : 0;
-      be = [po1.strike - Math.abs(nd)];
-      nc = -nd * lotSz; margin = Math.round((0.117 - 0.01) * OC.spot * OC.lotSize); // SPAN: naked(11.7%) - 1 BUY hedge(1%)
-      ltpParts = [
-        {{ l: 'SELL PE \u20b9' + atm.toLocaleString('en-IN'), v: sp, c: '#00c896' }},
-        {{ l: 'BUY 2x PE \u20b9' + po1.strike.toLocaleString('en-IN'), v: bp, c: '#ff9090' }}
-      ];
-      netDelta=(-gPeAtm.delta + 2*gPo1.delta)*lotSz; netTheta=(-gPeAtm.theta + 2*gPo1.theta)*lotSz; netVega=(-gPeAtm.vega + 2*gPo1.vega)*lotSz;
-      break;
-    }}
-
-    case 'call_ratio_spread': {{
-      const bp = ce_atm, sp = co1.ltp;
-      const nc2 = 2 * sp - bp;
-      const maxProfitPts = ceWing1 + nc2;
-      mp = maxProfitPts * lotSz; ml = 999999;
-      be = nc2 >= 0
-        ? [2 * co1.strike - atm + nc2]
-        : [atm - nc2, 2 * co1.strike - atm + nc2];
-      nc = nc2 * lotSz; margin = co1.strike * lotSz * 0.15;
-      ltpParts = [
-        {{ l: 'BUY CE \u20b9' + atm.toLocaleString('en-IN'), v: bp, c: '#00c8e0' }},
-        {{ l: 'SELL 2x CE \u20b9' + co1.strike.toLocaleString('en-IN'), v: sp, c: '#00c896' }}
-      ];
-      netDelta=(gCeAtm.delta - 2*gCo1.delta)*lotSz; netTheta=(gCeAtm.theta - 2*gCo1.theta)*lotSz; netVega=(gCeAtm.vega - 2*gCo1.vega)*lotSz;
-      break;
-    }}
-    case 'put_ratio_spread': {{
-      const bp = pe_atm, sp = po1.ltp;
-      const nc2 = 2 * sp - bp;
-      const maxProfitPts = peWing1 + nc2;
-      mp = maxProfitPts * lotSz; ml = 999999;
-      be = nc2 >= 0
-        ? [2 * po1.strike - atm - nc2]
-        : [2 * po1.strike - atm - nc2, atm + nc2];
-      nc = nc2 * lotSz; margin = po1.strike * lotSz * 0.15;
-      ltpParts = [
-        {{ l: 'BUY PE \u20b9' + atm.toLocaleString('en-IN'), v: bp, c: '#ff9090' }},
-        {{ l: 'SELL 2x PE \u20b9' + po1.strike.toLocaleString('en-IN'), v: sp, c: '#00c896' }}
-      ];
-      netDelta=(gPeAtm.delta - 2*gPo1.delta)*lotSz; netTheta=(gPeAtm.theta - 2*gPo1.theta)*lotSz; netVega=(gPeAtm.vega - 2*gPo1.vega)*lotSz;
-      break;
-    }}
-
-    case 'long_synthetic': {{
-      const cp2 = ce_atm, pp = pe_atm, nd = cp2 - pp;
-      mp = 999999; ml = 999999;
-      be = [atm + nd]; nc = -Math.abs(nd) * lotSz;
-      margin = atm * lotSz * 0.30;
-      ltpParts = [
-        {{ l: 'BUY CE \u20b9' + atm.toLocaleString('en-IN'), v: cp2, c: '#00c8e0' }},
-        {{ l: 'SELL PE \u20b9' + atm.toLocaleString('en-IN'), v: pp, c: '#ff9090' }}
-      ];
-      netDelta=(gCeAtm.delta - gPeAtm.delta)*lotSz; netTheta=(gCeAtm.theta - gPeAtm.theta)*lotSz; netVega=(gCeAtm.vega - gPeAtm.vega)*lotSz;
-      break;
-    }}
-    case 'short_synthetic': {{
-      const cp2 = ce_atm, pp = pe_atm, nc2 = cp2 - pp;
-      mp = 999999; ml = 999999;
-      be = [atm + nc2]; nc = Math.abs(nc2) * lotSz;
-      margin = atm * lotSz * 0.30;
-      ltpParts = [
-        {{ l: 'SELL CE \u20b9' + atm.toLocaleString('en-IN'), v: cp2, c: '#00c8e0' }},
-        {{ l: 'BUY PE \u20b9' + atm.toLocaleString('en-IN'), v: pp, c: '#ff9090' }}
-      ];
-      netDelta=(-gCeAtm.delta + gPeAtm.delta)*lotSz; netTheta=(-gCeAtm.theta + gPeAtm.theta)*lotSz; netVega=(-gCeAtm.vega + gPeAtm.vega)*lotSz;
-      break;
-    }}
-
-    case 'risk_reversal': {{
-      const bp = po1.ltp, sc = co1.ltp;
-      const nd = bp - sc;
-      mp = 999999; ml = 999999;
-      be = [po1.strike - Math.abs(nd), co1.strike + Math.abs(nd)];
-      nc = -nd * lotSz; margin = atm * lotSz * 0.20;
-      ltpParts = [
-        {{ l: 'BUY PE \u20b9' + po1.strike.toLocaleString('en-IN'), v: bp, c: '#ff9090' }},
-        {{ l: 'SELL CE \u20b9' + co1.strike.toLocaleString('en-IN'), v: sc, c: '#00c8e0' }}
-      ];
-      netDelta=(gPo1.delta - gCo1.delta)*lotSz; netTheta=(gPo1.theta - gCo1.theta)*lotSz; netVega=(gPo1.vega - gCo1.vega)*lotSz;
-      break;
-    }}
-    case 'range_forward': {{
-      const bc = co1.ltp, sp = po1.ltp;
-      const nd = bc - sp;
-      mp = 999999; ml = 999999;
-      be = [po1.strike - Math.abs(nd), co1.strike + Math.abs(nd)];
-      nc = -nd * lotSz; margin = atm * lotSz * 0.20;
-      ltpParts = [
-        {{ l: 'BUY CE \u20b9' + co1.strike.toLocaleString('en-IN'), v: bc, c: '#00c8e0' }},
-        {{ l: 'SELL PE \u20b9' + po1.strike.toLocaleString('en-IN'), v: sp, c: '#ff9090' }}
-      ];
-      netDelta=(gCo1.delta - gPo1.delta)*lotSz; netTheta=(gCo1.theta - gPo1.theta)*lotSz; netVega=(gCo1.vega - gPo1.vega)*lotSz;
-      break;
-    }}
-
-    case 'jade_lizard': {{
-      const pp = po1.ltp, cs = co1.ltp, cb = co2.ltp;
-      const nc2 = pp + cs - cb;
-      mp = nc2 * lotSz; ml = (po1.strike - nc2) * lotSz;
-      be = [po1.strike - nc2];
-      nc = nc2 * lotSz; margin = po1.strike * lotSz * 0.15;
-      ltpParts = [
-        {{ l: 'SELL PE \u20b9' + po1.strike.toLocaleString('en-IN'), v: pp, c: '#ff9090' }},
-        {{ l: 'SELL CE \u20b9' + co1.strike.toLocaleString('en-IN'), v: cs, c: '#00c8e0' }},
-        {{ l: 'BUY CE \u20b9' + co2.strike.toLocaleString('en-IN'), v: cb, c: '#00c8e0' }}
-      ];
-      netDelta=(-gPo1.delta - gCo1.delta + gCo2.delta)*lotSz; netTheta=(-gPo1.theta - gCo1.theta + gCo2.theta)*lotSz; netVega=(-gPo1.vega - gCo1.vega + gCo2.vega)*lotSz;
-      break;
-    }}
-    case 'reverse_jade': {{
-      const cp2 = co1.ltp, ps = po1.ltp, pb = po2.ltp;
-      const nc2 = cp2 + ps - pb;
-      mp = nc2 * lotSz; ml = (po1.strike - nc2) * lotSz;
-      be = [po1.strike - nc2];
-      nc = nc2 * lotSz; margin = co1.strike * lotSz * 0.15;
-      ltpParts = [
-        {{ l: 'SELL CE \u20b9' + co1.strike.toLocaleString('en-IN'), v: cp2, c: '#00c8e0' }},
-        {{ l: 'SELL PE \u20b9' + po1.strike.toLocaleString('en-IN'), v: ps, c: '#ff9090' }},
-        {{ l: 'BUY PE \u20b9' + po2.strike.toLocaleString('en-IN'), v: pb, c: '#ff9090' }}
-      ];
-      netDelta=(-gCo1.delta - gPo1.delta + gPo2.delta)*lotSz; netTheta=(-gCo1.theta - gPo1.theta + gPo2.theta)*lotSz; netVega=(-gCo1.vega - gPo1.vega + gPo2.vega)*lotSz;
-      break;
-    }}
-
-    case 'bull_condor': {{
-      const s1 = ce_atm;
-      const s2 = co1.ltp;
-      const s3 = co2.ltp;
-      const s4 = co3.ltp;
-      const nd = s1 - s2 - s3 + s4;
-      mp = (ceWing1 - nd) * lotSz; ml = nd * lotSz;
-      be = [atm + nd, co3.strike - nd];
-      nc = -nd * lotSz; margin = nd * lotSz;
-      rrRatio = ((ceWing1 - nd) / nd).toFixed(2);
-      ltpParts = [
-        {{ l: 'BUY CE \u20b9'  + atm.toLocaleString('en-IN'),        v: s1, c: '#00c8e0' }},
-        {{ l: 'SELL CE \u20b9' + co1.strike.toLocaleString('en-IN'), v: s2, c: '#00c896' }},
-        {{ l: 'SELL CE \u20b9' + co2.strike.toLocaleString('en-IN'), v: s3, c: '#00c896' }},
-        {{ l: 'BUY CE \u20b9'  + co3.strike.toLocaleString('en-IN'), v: s4, c: '#00c8e0' }}
-      ];
-      netDelta=(gCeAtm.delta - gCo1.delta - gCo2.delta + gCo3.delta)*lotSz; netTheta=(gCeAtm.theta - gCo1.theta - gCo2.theta + gCo3.theta)*lotSz; netVega=(gCeAtm.vega - gCo1.vega - gCo2.vega + gCo3.vega)*lotSz;
-      break;
-    }}
-    case 'bear_condor': {{
-      const s1 = pe_atm;
-      const s2 = po1.ltp;
-      const s3 = po2.ltp;
-      const s4 = po3.ltp;
-      const nd = s1 - s2 - s3 + s4;
-      mp = (peWing1 - nd) * lotSz; ml = nd * lotSz;
-      be = [po3.strike + nd, atm - nd];
-      nc = -nd * lotSz; margin = nd * lotSz;
-      rrRatio = ((peWing1 - nd) / nd).toFixed(2);
-      ltpParts = [
-        {{ l: 'BUY PE \u20b9'  + atm.toLocaleString('en-IN'),        v: s1, c: '#ff9090' }},
-        {{ l: 'SELL PE \u20b9' + po1.strike.toLocaleString('en-IN'), v: s2, c: '#00c896' }},
-        {{ l: 'SELL PE \u20b9' + po2.strike.toLocaleString('en-IN'), v: s3, c: '#00c896' }},
-        {{ l: 'BUY PE \u20b9'  + po3.strike.toLocaleString('en-IN'), v: s4, c: '#ff9090' }}
-      ];
-      netDelta=(gPeAtm.delta - gPo1.delta - gPo2.delta + gPo3.delta)*lotSz; netTheta=(gPeAtm.theta - gPo1.theta - gPo2.theta + gPo3.theta)*lotSz; netVega=(gPeAtm.vega - gPo1.vega - gPo2.vega + gPo3.vega)*lotSz;
-      break;
-    }}
-
-    case 'batman': {{
-      const s1 = ce_atm, s2 = co1.ltp, s3 = co2.ltp;
-      const ndPerUnit = s1 - 2 * s2 + s3;
-      const totalNd = 2 * ndPerUnit;
-      mp = 2 * (ceWing1 - ndPerUnit) * lotSz; ml = totalNd * lotSz;
-      be = [atm + ndPerUnit, co2.strike - ndPerUnit];
-      nc = -totalNd * lotSz; margin = totalNd * lotSz;
-      ltpParts = [
-        {{ l: 'BUY 2x CE \u20b9' + atm.toLocaleString('en-IN'), v: s1, c: '#00c8e0' }},
-        {{ l: 'SELL 4x CE \u20b9' + co1.strike.toLocaleString('en-IN'), v: s2, c: '#00c896' }},
-        {{ l: 'BUY 2x CE \u20b9' + co2.strike.toLocaleString('en-IN'), v: s3, c: '#00c8e0' }}
-      ];
-      netDelta=2*(gCeAtm.delta - 2*gCo1.delta + gCo2.delta)*lotSz; netTheta=2*(gCeAtm.theta - 2*gCo1.theta + gCo2.theta)*lotSz; netVega=2*(gCeAtm.vega - 2*gCo1.vega + gCo2.vega)*lotSz;
-      break;
-    }}
-
-    case 'double_fly': {{
-      const cNd = ce_atm - 2 * co1.ltp + co2.ltp;
-      const pNd = pe_atm - 2 * po1.ltp + po2.ltp;
-      const totalNd = cNd + pNd;
-      mp = ((ceWing1 - cNd) + (peWing1 - pNd)) * lotSz;
-      ml = totalNd * lotSz;
-      be = [atm - totalNd * 0.5, atm + totalNd * 0.5];
-      nc = -totalNd * lotSz; margin = totalNd * lotSz;
-      ltpParts = [
-        {{ l: 'CALL FLY: BUY/SELL/BUY CE', v: ce_atm, c: '#00c8e0' }},
-        {{ l: 'PUT FLY:  BUY/SELL/BUY PE', v: pe_atm, c: '#ff9090' }}
-      ];
-      netDelta=((gCeAtm.delta-2*gCo1.delta+gCo2.delta)+(gPeAtm.delta-2*gPo1.delta+gPo2.delta))*lotSz; netTheta=((gCeAtm.theta-2*gCo1.theta+gCo2.theta)+(gPeAtm.theta-2*gPo1.theta+gPo2.theta))*lotSz; netVega=((gCeAtm.vega-2*gCo1.vega+gCo2.vega)+(gPeAtm.vega-2*gPo1.vega+gPo2.vega))*lotSz;
-      break;
-    }}
-
-    case 'double_condor': {{
-      const cNd = ce_atm - co1.ltp - co2.ltp + co3.ltp;
-      const pNd = pe_atm - po1.ltp - po2.ltp + po3.ltp;
-      const totalNd = cNd + pNd;
-      mp = ((ceWing1 - cNd) + (peWing1 - pNd)) * lotSz;
-      ml = totalNd * lotSz;
-      be = [atm - totalNd, atm + totalNd];
-      nc = -totalNd * lotSz; margin = totalNd * lotSz;
-      ltpParts = [
-        {{ l: 'CE CONDOR \u20b9' + atm.toLocaleString('en-IN') + ' \u2192 \u20b9' + co3.strike.toLocaleString('en-IN'), v: ce_atm, c: '#00c8e0' }},
-        {{ l: 'PE CONDOR \u20b9' + atm.toLocaleString('en-IN') + ' \u2192 \u20b9' + po3.strike.toLocaleString('en-IN'), v: pe_atm, c: '#ff9090' }}
-      ];
-      netDelta=((gCeAtm.delta-gCo1.delta-gCo2.delta+gCo3.delta)+(gPeAtm.delta-gPo1.delta-gPo2.delta+gPo3.delta))*lotSz; netTheta=((gCeAtm.theta-gCo1.theta-gCo2.theta+gCo3.theta)+(gPeAtm.theta-gPo1.theta-gPo2.theta+gPo3.theta))*lotSz; netVega=((gCeAtm.vega-gCo1.vega-gCo2.vega+gCo3.vega)+(gPeAtm.vega-gPo1.vega-gPo2.vega+gPo3.vega))*lotSz;
-      break;
-    }}
-
-    case 'call_calendar': {{
-      const farLTP  = ce_atm;
-      const nearLTP = nearCeLTP;   // real near-expiry ATM CE LTP from ALL_EXPIRY_DATA
-      const nd = farLTP - nearLTP;
-      mp = Math.round(nd * 0.80) * lotSz; ml = nd * lotSz;
-      be = [atm - Math.round(nd * 0.6), atm + Math.round(nd * 0.6)];
-      nc = -nd * lotSz; margin = nd * lotSz;
-      ltpParts = [
-        {{ l: 'SELL NEAR CE \u20b9' + atm.toLocaleString('en-IN'), v: nearLTP, c: '#00c896' }},
-        {{ l: 'BUY FAR CE \u20b9'   + atm.toLocaleString('en-IN'), v: farLTP,  c: '#00c8e0' }}
-      ];
-      netDelta=gCeAtm.delta*0.1*lotSz; netTheta=Math.abs(gCeAtm.theta)*0.45*lotSz; netVega=gCeAtm.vega*0.3*lotSz;
-      break;
-    }}
-    case 'put_calendar': {{
-      const farLTP  = pe_atm;
-      const nearLTP = nearPeLTP;   // real near-expiry ATM PE LTP from ALL_EXPIRY_DATA
-      const nd = farLTP - nearLTP;
-      mp = Math.round(nd * 0.80) * lotSz; ml = nd * lotSz;
-      be = [atm - Math.round(nd * 0.6), atm + Math.round(nd * 0.6)];
-      nc = -nd * lotSz; margin = nd * lotSz;
-      ltpParts = [
-        {{ l: 'SELL NEAR PE \u20b9' + atm.toLocaleString('en-IN'), v: nearLTP, c: '#00c896' }},
-        {{ l: 'BUY FAR PE \u20b9'   + atm.toLocaleString('en-IN'), v: farLTP,  c: '#ff9090' }}
-      ];
-      netDelta=gPeAtm.delta*0.1*lotSz; netTheta=Math.abs(gPeAtm.theta)*0.45*lotSz; netVega=gPeAtm.vega*0.3*lotSz;
-      break;
-    }}
-    case 'diagonal_calendar': {{
-      const farLTP  = ce_atm;
-      const nearLTP = nearCo1LTP;  // real near-expiry OTM+1 CE LTP from ALL_EXPIRY_DATA
-      const nd = farLTP - nearLTP;
-      mp = Math.round(nd * 0.70) * lotSz; ml = nd * lotSz;
-      be = [atm + Math.round(nd * 0.25), atm + Math.round(nd * 1.4)];
-      nc = -nd * lotSz; margin = nd * lotSz;
-      ltpParts = [
-        {{ l: 'SELL NEAR CE \u20b9' + co1.strike.toLocaleString('en-IN'), v: nearLTP, c: '#00c896' }},
-        {{ l: 'BUY FAR CE \u20b9'   + atm.toLocaleString('en-IN'),        v: farLTP,  c: '#00c8e0' }}
-      ];
-      netDelta=(gCeAtm.delta - gCo1.delta*0.5)*0.1*lotSz; netTheta=Math.abs(gCeAtm.theta)*0.35*lotSz; netVega=(gCeAtm.vega-gCo1.vega*0.5)*0.3*lotSz;
-      break;
-    }}
-
-    default: {{
-      const p = ce_atm;
-      mp = p * lotSz * 0.5; ml = p * lotSz * 0.3;
-      be = [atm]; nc = -p * 0.3 * lotSz;
-      margin = p * lotSz; rrRatio = 1.5;
-      ltpParts = [{{ l: 'ATM \u20b9' + atm.toLocaleString('en-IN'), v: p, c: '#00c8e0' }}];
-    }}
-  }}
-
-  const beStr     = be.map(v => '\u20b9' + Math.round(v).toLocaleString('en-IN')).join(' / ');
-  const mpStr     = mp === 999999 ? 'Unlimited' : '\u20b9' + Math.round(mp).toLocaleString('en-IN');
-  const mlStr     = ml === 999999 ? 'Unlimited' : '\u20b9' + Math.round(ml).toLocaleString('en-IN');
-  const ncStr     = (nc >= 0 ? '+ ' : '- ') + '\u20b9' + Math.abs(Math.round(nc)).toLocaleString('en-IN');
-  const marginStr = '\u20b9' + Math.round(margin).toLocaleString('en-IN');
-  const rrStr     = rrRatio === 0 ? '\u221e' : ('1:' + Math.abs(rrRatio));
-  const mpPct     = mp === 999999 ? '\u221e' : (ml > 0 ? (mp / ml * 100).toFixed(0) + '%' : '\u2014');
-  const ltpStr    = ltpParts.map(x =>
-    `<span style="display:inline-flex;align-items:center;gap:4px;margin-bottom:2px;">
-      <span style="font-size:12.3px;color:rgba(255,255,255,.70);">${{x.l}}</span>
-      <span style="font-family:'DM Mono',monospace;font-weight:700;color:${{x.c}};">\u20b9${{x.v.toFixed(2)}}</span>
-    </span>`
-  ).join('<br>');
-  const strikeStr = 'ATM \u20b9' + atm.toLocaleString('en-IN');
-  return {{pop,mpStr,mlStr,rrStr,beStr,ncStr,marginStr,mpPct,strikeStr,ltpStr,
-           mpRaw:mp,mlRaw:ml,ncRaw:Math.round(nc),ncPositive:nc>=0,
-           netDelta:Math.round(netDelta*100)/100,
-           netTheta:Math.round(netTheta*100)/100,
-           netVega:Math.round(netVega*100)/100,
-           mlRawVal:ml, shape:shape}};
-}}
-
-function renderMetrics(m, scoreBreakdown) {{
-  const pc=m.pop>=70?'#38d888':(m.pop>=55?'#ffcc00':m.pop>=45?'#ffaa00':'#f04050');
-  const nc=m.ncPositive?'#38d888':'#f04050';
-  const sbHtml = scoreBreakdown ? `
-    <div style="background:rgba(255,185,0,.04);border-top:1px solid rgba(255,185,0,.12);padding:9px 12px 11px;">
-      <div style="font-size:11px;letter-spacing:1.8px;text-transform:uppercase;color:rgba(255,210,0,.85);margin-bottom:7px;font-family:DM Mono,monospace;font-weight:700;">PoP BREAKDOWN</div>
-      <div style="display:flex;flex-wrap:wrap;gap:5px;">
-        <span style="font-size:13px;background:rgba(0,0,0,.3);padding:3px 9px;border-radius:4px;border:1px solid rgba(255,185,0,.25);color:rgba(255,210,0,.85);font-family:DM Mono,monospace;">Base <b style="color:#ffcc00;">60%</b></span>
-        <span style="font-size:13px;background:rgba(0,0,0,.3);padding:3px 9px;border-radius:4px;border:1px solid rgba(255,185,0,.25);color:rgba(255,210,0,.85);font-family:DM Mono,monospace;">Bias <b style="color:${{scoreBreakdown.biasAdj>=0?'#38d888':'#f04050'}};">${{scoreBreakdown.biasAdj>=0?'+':''}}${{scoreBreakdown.biasAdj}}</b></span>
-        <span style="font-size:13px;background:rgba(0,0,0,.3);padding:3px 9px;border-radius:4px;border:1px solid rgba(255,185,0,.25);color:rgba(255,210,0,.85);font-family:DM Mono,monospace;">S/R <b style="color:${{scoreBreakdown.srAdj>=0?'#38d888':'#f04050'}};">${{scoreBreakdown.srAdj>=0?'+':''}}${{scoreBreakdown.srAdj}}</b></span>
-        <span style="font-size:13px;background:rgba(0,0,0,.3);padding:3px 9px;border-radius:4px;border:1px solid rgba(255,185,0,.25);color:rgba(255,210,0,.85);font-family:DM Mono,monospace;">OI <b style="color:${{scoreBreakdown.oiAdj>=0?'#38d888':'#f04050'}};">${{scoreBreakdown.oiAdj>=0?'+':''}}${{scoreBreakdown.oiAdj}}</b></span>
-        <span style="font-size:13px;background:rgba(0,0,0,.3);padding:3px 9px;border-radius:4px;border:1px solid rgba(255,185,0,.25);color:rgba(255,210,0,.85);font-family:DM Mono,monospace;">PCR <b style="color:${{scoreBreakdown.pcrAdj>=0?'#38d888':'#f04050'}};">${{scoreBreakdown.pcrAdj>=0?'+':''}}${{scoreBreakdown.pcrAdj}}</b></span>
-        <span style="font-size:13px;background:rgba(0,0,0,.3);padding:3px 9px;border-radius:4px;border:1px solid rgba(255,185,0,.25);color:rgba(255,210,0,.85);font-family:DM Mono,monospace;">Strat <b style="color:${{scoreBreakdown.stratAdj>=0?'#38d888':'#f04050'}};">${{scoreBreakdown.stratAdj>=0?'+':''}}${{scoreBreakdown.stratAdj}}</b></span>
-      </div>
-    </div>` : '';
-  return `
-  <div style="display:flex;justify-content:space-between;align-items:center;padding:8px 12px;border-bottom:1px solid rgba(255,185,0,.12);background:rgba(255,185,0,.05);">
-    <span style="font-family:DM Mono,monospace;font-size:11px;color:rgba(255,210,0,.85);letter-spacing:1.2px;text-transform:uppercase;font-weight:700;">Strike Price</span>
-    <span style="font-family:DM Mono,monospace;font-size:15px;font-weight:700;text-align:right;color:#ffcc00;">${{m.strikeStr}}</span>
-  </div>
-  <div style="display:flex;justify-content:space-between;align-items:center;padding:8px 12px;border-bottom:1px solid rgba(255,185,0,.1);background:rgba(255,185,0,.03);">
-    <span style="font-family:DM Mono,monospace;font-size:11px;color:rgba(255,210,0,.9);letter-spacing:1.2px;text-transform:uppercase;font-weight:700;">LTP (per leg)</span>
-    <span style="font-family:DM Mono,monospace;font-size:13px;font-weight:700;text-align:right;line-height:1.8;display:flex;flex-direction:column;align-items:flex-end;">${{m.ltpStr}}</span>
-  </div>
-  <div style="display:grid;grid-template-columns:1fr 1fr;border-bottom:1px solid rgba(255,185,0,.1);">
-    <div style="padding:11px 12px;border-right:1px solid rgba(255,185,0,.1);">
-      <div style="font-family:DM Mono,monospace;font-size:11px;color:rgba(255,210,0,.85);letter-spacing:1.2px;text-transform:uppercase;margin-bottom:5px;font-weight:700;">Prob. of Profit</div>
-      <div style="font-family:DM Mono,monospace;font-size:26px;font-weight:800;color:${{pc}};">${{m.pop}}%</div>
-    </div>
-    <div style="padding:11px 12px;">
-      <div style="font-family:DM Mono,monospace;font-size:11px;color:rgba(255,210,0,.85);letter-spacing:1.2px;text-transform:uppercase;margin-bottom:5px;font-weight:700;">Max Profit</div>
-      <div style="font-family:DM Mono,monospace;font-size:20px;font-weight:700;color:#38d888;">${{m.mpStr}} <span style="font-size:12px;opacity:.7;">${{m.mpPct}}</span></div>
-    </div>
-  </div>
-  <div style="display:grid;grid-template-columns:1fr 1fr;border-bottom:1px solid rgba(255,185,0,.1);">
-    <div style="padding:11px 12px;border-right:1px solid rgba(255,185,0,.1);">
-      <div style="font-family:DM Mono,monospace;font-size:11px;color:rgba(255,210,0,.85);letter-spacing:1.2px;text-transform:uppercase;margin-bottom:5px;font-weight:700;">Max Loss</div>
-      <div style="font-family:DM Mono,monospace;font-size:20px;font-weight:700;color:#f04050;">${{m.mlStr}}</div>
-    </div>
-    <div style="padding:11px 12px;">
-      <div style="font-family:DM Mono,monospace;font-size:11px;color:rgba(255,210,0,.85);letter-spacing:1.2px;text-transform:uppercase;margin-bottom:5px;font-weight:700;">R/R Ratio</div>
-      <div style="font-family:DM Mono,monospace;font-size:20px;font-weight:700;color:#ffcc00;">${{m.rrStr}}</div>
-    </div>
-  </div>
-  <div style="display:grid;grid-template-columns:repeat(4,1fr);border-bottom:1px solid rgba(255,185,0,.1);">
-    <div style="padding:9px 10px;border-right:1px solid rgba(255,185,0,.08);">
-      <div style="font-family:DM Mono,monospace;font-size:10px;color:rgba(255,205,60,.82);letter-spacing:1px;text-transform:uppercase;margin-bottom:4px;font-weight:700;">Breakeven</div>
-      <div style="font-family:DM Mono,monospace;font-size:13px;font-weight:700;color:#fff8e0;">${{m.beStr}}</div>
-    </div>
-    <div style="padding:9px 10px;border-right:1px solid rgba(255,185,0,.08);">
-      <div style="font-family:DM Mono,monospace;font-size:10px;color:rgba(255,205,60,.82);letter-spacing:1px;text-transform:uppercase;margin-bottom:4px;font-weight:700;">Net CR/DR</div>
-      <div style="font-family:DM Mono,monospace;font-size:13px;font-weight:700;color:${{nc}};">${{m.ncStr}}</div>
-    </div>
-    <div style="padding:9px 10px;border-right:1px solid rgba(255,185,0,.08);">
-      <div style="font-family:DM Mono,monospace;font-size:10px;color:rgba(255,205,60,.82);letter-spacing:1px;text-transform:uppercase;margin-bottom:4px;font-weight:700;">Margin</div>
-      <div style="font-family:DM Mono,monospace;font-size:13px;font-weight:700;color:#fff8e0;">${{m.marginStr}}</div>
-    </div>
-    <div style="padding:9px 10px;">
-      <div style="font-family:DM Mono,monospace;font-size:10px;color:rgba(255,205,60,.82);letter-spacing:1px;text-transform:uppercase;margin-bottom:4px;font-weight:700;">ATM Strike</div>
-      <div style="font-family:DM Mono,monospace;font-size:13px;font-weight:700;color:#ffcc00;">${{m.strikeStr}}</div>
-    </div>
-  </div>
-  ${{sbHtml}}
-  ${{buildIntradaySim(m)}}`;
-}}
-
-// ── Intraday P&L Simulator ───────────────────────────────────────────────────
-function buildIntradaySim(m) {{
-  const nd      = m.netDelta;
-  const nt      = m.netTheta;
-  const nv      = m.netVega;
-
-  // Declare ALL strategy context BEFORE calcPnl (avoids JS TDZ errors)
-  const shape  = m.shape || '';
-  const spot   = OC.spot;
-  const atm    = OC.atm;
-  const ce_atm = getATMLTP('ce');
-  const pe_atm = getATMLTP('pe');
-  const co1    = getOTM('ce',1), co2 = getOTM('ce',2);
-  const po1    = getOTM('pe',1), po2 = getOTM('pe',2);
-  const maxP   = (m.mpRaw    !== undefined && m.mpRaw    < 9000000) ? m.mpRaw    : null;
-  const maxL   = (m.mlRawVal !== undefined && m.mlRawVal < 9000000) ? m.mlRawVal : null;
-
-  const moves = [-300,-200,-150,-100,-50,0,50,100,150,200,300];
-
-  function calcPnl(movePts) {{
-    const newSpot = spot + movePts;
-    const lotSz   = OC.lotSize || 30;
-    let pnl = 0;
-
-    // Helper: intrinsic value of option at newSpot
-    const ceIntr = (k) => Math.max(0, newSpot - k);
-    const peIntr = (k) => Math.max(0, k - newSpot);
-
-    switch(shape) {{
-      // ── Single legs ──
-      case 'long_call':
-        pnl = (ceIntr(atm) - ce_atm) * lotSz; break;
-      case 'short_call':
-        pnl = (ce_atm - ceIntr(atm)) * lotSz; break;
-      case 'long_put':
-        pnl = (peIntr(atm) - pe_atm) * lotSz; break;
-      case 'short_put':
-        pnl = (pe_atm - peIntr(atm)) * lotSz; break;
-
-      // ── Bull / Bear spreads ──
-      // bull_call_spread: BUY ATM CE + SELL OTM CE
-      case 'bull_call_spread': {{
-        const debit = ce_atm - co1.ltp;
-        pnl = (ceIntr(atm) - ceIntr(co1.strike) - debit) * lotSz; break;
-      }}
-      // bear_call_spread: SELL ATM CE + BUY OTM CE
-      case 'bear_call_spread': {{
-        const credit = ce_atm - co1.ltp;
-        pnl = (credit - ceIntr(atm) + ceIntr(co1.strike)) * lotSz; break;
-      }}
-      // bull_put_spread: SELL ATM PE + BUY OTM PE
-      case 'bull_put_spread': {{
-        const credit = pe_atm - po1.ltp;
-        pnl = (credit - peIntr(atm) + peIntr(po1.strike)) * lotSz; break;
-      }}
-      // bear_put_spread: BUY ATM PE + SELL OTM PE
-      case 'bear_put_spread': {{
-        const debit = pe_atm - po1.ltp;
-        pnl = (peIntr(atm) - peIntr(po1.strike) - debit) * lotSz; break;
-      }}
-
-      // ── Straddle / Strangle ──
-      case 'long_straddle': {{
-        const tp = ce_atm + pe_atm;
-        pnl = (ceIntr(atm) + peIntr(atm) - tp) * lotSz; break;
-      }}
-      case 'short_straddle': {{
-        const tp = ce_atm + pe_atm;
-        pnl = (tp - ceIntr(atm) - peIntr(atm)) * lotSz; break;
-      }}
-      case 'long_strangle': {{
-        const tp = co1.ltp + po1.ltp;
-        pnl = (ceIntr(co1.strike) + peIntr(po1.strike) - tp) * lotSz; break;
-      }}
-      case 'short_strangle': {{
-        const tp = co1.ltp + po1.ltp;
-        pnl = (tp - ceIntr(co1.strike) - peIntr(po1.strike)) * lotSz; break;
-      }}
-
-      // ── Short Iron Fly: SELL ATM CE + SELL ATM PE + BUY OTM CE + BUY OTM PE ──
-      case 'short_iron_fly': {{
-        const credit = ce_atm + pe_atm - co1.ltp - po1.ltp;
-        pnl = (credit - ceIntr(atm) - peIntr(atm) + ceIntr(co1.strike) + peIntr(po1.strike)) * lotSz; break;
-      }}
-      // ── Long Iron Fly: BUY ATM CE + BUY ATM PE + SELL OTM CE + SELL OTM PE ──
-      case 'long_iron_fly': {{
-        const debit = ce_atm + pe_atm - co1.ltp - po1.ltp;
-        pnl = (-debit + ceIntr(atm) + peIntr(atm) - ceIntr(co1.strike) - peIntr(po1.strike)) * lotSz; break;
-      }}
-      // ── Short Iron Condor: SELL co1 CE + BUY co2 CE + SELL po1 PE + BUY po2 PE ──
-      case 'short_iron_condor': {{
-        const sc = co1.ltp, bc = co2.ltp, sp2 = po1.ltp, bp2 = po2.ltp;
-        const credit = sc - bc + sp2 - bp2;
-        const callLoss = Math.max(0, ceIntr(co1.strike) - ceIntr(co2.strike));
-        const putLoss  = Math.max(0, peIntr(po1.strike) - peIntr(po2.strike));
-        pnl = (credit - callLoss - putLoss) * lotSz; break;
-      }}
-      // ── Long Iron Condor: BUY co1 CE + SELL co2 CE + BUY po1 PE + SELL po2 PE ──
-      case 'long_iron_condor': {{
-        const sc = co1.ltp, bc = co2.ltp, sp2 = po1.ltp, bp2 = po2.ltp;
-        const debit = bc - sc + bp2 - sp2;
-        const callProfit = Math.max(0, ceIntr(co1.strike) - ceIntr(co2.strike));
-        const putProfit  = Math.max(0, peIntr(po1.strike) - peIntr(po2.strike));
-        pnl = (-debit + callProfit + putProfit) * lotSz; break;
-      }}
-
-      // ── Butterfly: BUY low + SELL 2x mid + BUY high ──
-      case 'call_butterfly':
-      case 'bull_butterfly': {{
-        const debit = ce_atm - 2*co1.ltp + co2.ltp;
-        pnl = (ceIntr(atm) - 2*ceIntr(co1.strike) + ceIntr(co2.strike) - debit) * lotSz; break;
-      }}
-      case 'put_butterfly':
-      case 'bear_butterfly': {{
-        const debit = pe_atm - 2*po1.ltp + po2.ltp;
-        pnl = (peIntr(atm) - 2*peIntr(po1.strike) + peIntr(po2.strike) - debit) * lotSz; break;
-      }}
-
-      // ── Ratio Back Spreads: SELL 1x ATM + BUY 2x OTM ──
-      // Unlimited profit if big move, small loss/profit if near ATM
-      case 'call_ratio_back': {{
-        const sp2 = ce_atm, bp2 = co1.ltp;
-        const nc2 = 2*bp2 - sp2; // net credit(+) or debit(-)
-        pnl = (nc2 - ceIntr(atm) + 2*ceIntr(co1.strike)) * lotSz; break;
-      }}
-      case 'put_ratio_back': {{
-        const sp2 = pe_atm, bp2 = po1.ltp;
-        const nc2 = 2*bp2 - sp2;
-        pnl = (nc2 - peIntr(atm) + 2*peIntr(po1.strike)) * lotSz; break;
-      }}
-
-      // ── Ratio Spreads: BUY 1x ATM + SELL 2x OTM ──
-      // Max profit at OTM strike, unlimited loss beyond
-      case 'call_ratio_spread': {{
-        const bp2 = ce_atm, sp2 = co1.ltp;
-        const nc2 = 2*sp2 - bp2;
-        pnl = (nc2 + ceIntr(atm) - 2*ceIntr(co1.strike)) * lotSz; break;
-      }}
-      case 'put_ratio_spread': {{
-        const bp2 = pe_atm, sp2 = po1.ltp;
-        const nc2 = 2*sp2 - bp2;
-        pnl = (nc2 + peIntr(atm) - 2*peIntr(po1.strike)) * lotSz; break;
-      }}
-
-      // ── Jade Lizard: SELL OTM PE + SELL OTM CE + BUY further OTM CE ──
-      case 'jade_lizard': {{
-        const pp = po1.ltp, cs = co1.ltp, cb = co2.ltp;
-        const credit = pp + cs - cb;
-        pnl = (credit - peIntr(po1.strike) - ceIntr(co1.strike) + ceIntr(co2.strike)) * lotSz; break;
-      }}
-      // ── Reverse Jade: SELL OTM CE + SELL OTM PE + BUY further OTM PE ──
-      case 'reverse_jade': {{
-        const cp2 = co1.ltp, ps = po1.ltp, pb = po2.ltp;
-        const credit = cp2 + ps - pb;
-        pnl = (credit - ceIntr(co1.strike) - peIntr(po1.strike) + peIntr(po2.strike)) * lotSz; break;
-      }}
-
-      // ── Bull Condor: BUY ATM CE + SELL co1 + SELL co2 + BUY co3 ──
-      case 'bull_condor': {{
-        const s1 = ce_atm, s2 = co1.ltp, s3 = co2.ltp, s4 = co3.ltp;
-        const debit = s1 - s2 - s3 + s4;
-        pnl = (ceIntr(atm) - ceIntr(co1.strike) - ceIntr(co2.strike) + ceIntr(co3.strike) - debit) * lotSz; break;
-      }}
-      // ── Bear Condor: BUY ATM PE + SELL po1 + SELL po2 + BUY po3 ──
-      case 'bear_condor': {{
-        const s1 = pe_atm, s2 = po1.ltp, s3 = po2.ltp, s4 = po3.ltp;
-        const debit = s1 - s2 - s3 + s4;
-        pnl = (peIntr(atm) - peIntr(po1.strike) - peIntr(po2.strike) + peIntr(po3.strike) - debit) * lotSz; break;
-      }}
-
-      // ── Batman: 2x (BUY ATM + SELL 2x OTM + BUY far OTM) call butterfly ──
-      case 'batman': {{
-        const s1 = ce_atm, s2 = co1.ltp, s3 = co2.ltp;
-        const unitDebit = s1 - 2*s2 + s3;
-        const unitPnl   = ceIntr(atm) - 2*ceIntr(co1.strike) + ceIntr(co2.strike) - unitDebit;
-        pnl = 2 * unitPnl * lotSz; break;
-      }}
-
-      // ── Double Fly: call butterfly + put butterfly ──
-      case 'double_fly': {{
-        const cDebit = ce_atm - 2*co1.ltp + co2.ltp;
-        const pDebit = pe_atm - 2*po1.ltp + po2.ltp;
-        const cPnl   = ceIntr(atm) - 2*ceIntr(co1.strike) + ceIntr(co2.strike) - cDebit;
-        const pPnl   = peIntr(atm) - 2*peIntr(po1.strike) + peIntr(po2.strike) - pDebit;
-        pnl = (cPnl + pPnl) * lotSz; break;
-      }}
-
-      // ── Double Condor: call 4-leg condor + put 4-leg condor ──
-      case 'double_condor': {{
-        const cDebit = ce_atm - co1.ltp - co2.ltp + co3.ltp;
-        const pDebit = pe_atm - po1.ltp - po2.ltp + po3.ltp;
-        const cPnl   = ceIntr(atm) - ceIntr(co1.strike) - ceIntr(co2.strike) + ceIntr(co3.strike) - cDebit;
-        const pPnl   = peIntr(atm) - peIntr(po1.strike) - peIntr(po2.strike) + peIntr(po3.strike) - pDebit;
-        pnl = (cPnl + pPnl) * lotSz; break;
-      }}
-
-      // ── Synthetics / Risk Reversal / Range Forward — unlimited P&L, delta approx is appropriate ──
-      case 'long_synthetic': {{
-        const nc2 = ce_atm - pe_atm;
-        pnl = (-nc2 + ceIntr(atm) - peIntr(atm)) * lotSz; break;
-      }}
-      case 'short_synthetic': {{
-        const nc2 = ce_atm - pe_atm;
-        pnl = (nc2 - ceIntr(atm) + peIntr(atm)) * lotSz; break;
-      }}
-      case 'risk_reversal': {{
-        // BUY OTM PE + SELL OTM CE
-        const nc2 = po1.ltp - co1.ltp;
-        pnl = (-nc2 + peIntr(po1.strike) - ceIntr(co1.strike)) * lotSz; break;
-      }}
-      case 'range_forward': {{
-        // BUY OTM CE + SELL OTM PE
-        const nc2 = co1.ltp - po1.ltp;
-        pnl = (-nc2 + ceIntr(co1.strike) - peIntr(po1.strike)) * lotSz; break;
-      }}
-
-      // ── Calendar / Diagonal — multi-expiry, use conservative delta approx ──
-      case 'call_calendar':
-      case 'put_calendar':
-      case 'diagonal_calendar': {{
-        pnl = nd * movePts + nt;
-        if (maxL !== null) pnl = Math.max(-maxL, pnl);
-        if (maxP !== null) pnl = Math.min(maxP,  pnl);
-        pnl = Math.round(pnl);
-        return pnl;
-      }}
-
-      // ── Everything else — delta approx ──
-      default: {{
-        pnl = nd * movePts + nt;
-        if (maxL !== null) pnl = Math.max(-maxL, pnl);
-        if (maxP !== null) pnl = Math.min(maxP,  pnl);
-        pnl = Math.round(pnl);
-        return pnl;
-      }}
-    }}
-
-    // Hard-clamp to known max profit / max loss
-    if (maxL !== null && maxL < 999999) pnl = Math.max(-maxL, pnl);
-    if (maxP !== null && maxP < 999999) pnl = Math.min(maxP,  pnl);
-    return Math.round(pnl);
-  }}
-  const flatPnl  = calcPnl(0);
-  const flatCol  = flatPnl >= 0 ? '#38d888' : '#f04050';
-  const ntCol    = nt >= 0 ? '#38d888' : '#f04050';
-  const ntSign   = nt >= 0 ? '+' : '';
-  const ndStr    = (nd >= 0 ? '+' : '') + '\u20b9' + Math.abs(nd).toFixed(2);
-  const ntStr    = ntSign + '\u20b9' + Math.abs(Math.round(nt));
-  const nvStr    = (nv >= 0 ? '+' : '') + '\u20b9' + Math.abs(nv).toFixed(2);
-
-  let tRows = '';
-  moves.forEach(mv => {{
-    const pnl    = calcPnl(mv);
-    const col    = pnl > 100 ? '#38d888' : pnl > 0 ? '#ffcc00' : pnl > -200 ? '#ffaa00' : '#f04050';
-    const mvcol  = mv > 0 ? '#38d888' : mv < 0 ? '#f04050' : '#ffcc00';
-    const mvbg   = mv > 0 ? 'rgba(56,216,136,.12)' : mv < 0 ? 'rgba(240,64,80,.18)' : 'rgba(255,185,0,.18)';
-    const mvlbl  = mv > 0 ? '+' + mv : mv === 0 ? 'Flat' : String(mv);
-    const pctmp  = maxP ? ((pnl / maxP) * 100).toFixed(0) + '%' : '—';
-    const isFlat = mv === 0;
-    const rowBg  = isFlat ? 'background:rgba(255,185,0,.05);' : '';
-    tRows += `<tr style="${{rowBg}}">
-      <td style="padding:6px 10px;white-space:nowrap;">
-        <span style="font-family:'DM Mono',monospace;font-size:13px;font-weight:700;padding:4px 8px;border-radius:4px;background:${{mvbg}};color:${{mvcol}};white-space:nowrap;display:inline-block;min-width:56px;text-align:center;">${{mvlbl}}${{mv!==0?'p':''}}</span>
-      </td>
-      <td style="padding:6px 8px;font-family:'DM Mono',monospace;font-size:13px;color:rgba(255,200,80,.82);white-space:nowrap;text-align:left;">${{(OC.spot+mv).toLocaleString('en-IN')}}</td>
-      <td style="padding:6px 8px;font-family:'DM Mono',monospace;font-weight:700;font-size:15px;color:${{col}};white-space:nowrap;text-align:right;">${{pnl>=0?'+':''}}\u20b9${{Math.abs(pnl).toLocaleString('en-IN')}}</td>
-      <td style="padding:6px 6px;font-family:'DM Mono',monospace;font-size:12px;font-weight:700;color:${{col}};text-align:right;white-space:nowrap;opacity:.75;">${{pctmp}}</td>
-    </tr>`;
-  }});
-
-  // Slider range: spot ± 400 in steps of 25
-  const slMin = Math.round((OC.spot - 400) / 25) * 25;
-  const slMax = Math.round((OC.spot + 400) / 25) * 25;
-  const simId = 'sim_' + Math.random().toString(36).slice(2,7);
-
-  return `
-<div style="border-top:1px solid rgba(255,185,0,.2);background:rgba(11,8,0,.6);" onclick="event.stopPropagation()">
-  <!-- Sub-tabs -->
-  <div style="display:flex;border-bottom:1px solid rgba(255,185,0,.15);">
-    <button id="${{simId}}_t1" onclick="simTab('${{simId}}','t1')" style="flex:1;padding:10px 4px;font-family:DM Mono,monospace;font-size:13px;font-weight:700;letter-spacing:1.2px;text-transform:uppercase;cursor:pointer;border:none;border-bottom:2px solid #ffcc00;color:#ffcc00;background:rgba(255,185,0,.07);transition:all .2s;">📊 SCENARIOS</button>
-    <button id="${{simId}}_t2" onclick="simTab('${{simId}}','t2')" style="flex:1;padding:10px 4px;font-family:DM Mono,monospace;font-size:13px;font-weight:700;letter-spacing:1.2px;text-transform:uppercase;cursor:pointer;border:none;border-bottom:2px solid transparent;color:rgba(255,185,0,.5);background:transparent;transition:all .2s;">Δ GREEKS</button>
-    <button id="${{simId}}_t3" onclick="simTab('${{simId}}','t3')" style="flex:1;padding:10px 4px;font-family:DM Mono,monospace;font-size:13px;font-weight:700;letter-spacing:1.2px;text-transform:uppercase;cursor:pointer;border:none;border-bottom:2px solid transparent;color:rgba(255,185,0,.5);background:transparent;transition:all .2s;">⟺ SLIDER</button>
-  </div>
-
-  <!-- TAB 1: Scenarios -->
-  <div id="${{simId}}_c1">
-    <div style="display:flex;align-items:center;justify-content:space-between;padding:10px 12px 8px;border-bottom:1px solid rgba(255,185,0,.12);">
-      <div style="font-family:DM Mono,monospace;font-size:12px;font-weight:700;letter-spacing:1.2px;text-transform:uppercase;color:rgba(255,210,0,.95);">📋 TODAY'S P&amp;L SCENARIOS</div>
-      <div style="font-family:DM Mono,monospace;font-size:11px;color:rgba(255,200,60,.7);background:rgba(0,0,0,.25);padding:2px 8px;border-radius:4px;">Delta×move + Theta · 1 day</div>
-    </div>
-    <div style="overflow-x:auto;-webkit-overflow-scrolling:touch;">
-    <table style="width:100%;min-width:280px;border-collapse:collapse;">
-      <thead>
-        <tr style="background:rgba(0,0,0,.3);">
-          <th style="padding:6px 10px;font-family:DM Mono,monospace;font-size:11px;font-weight:700;letter-spacing:1.2px;text-transform:uppercase;color:rgba(255,205,60,.85);text-align:left;border-bottom:1px solid rgba(255,185,0,.08);">MOVE</th>
-          <th style="padding:6px 8px;font-family:DM Mono,monospace;font-size:11px;font-weight:700;letter-spacing:1.2px;text-transform:uppercase;color:rgba(255,205,60,.85);text-align:left;border-bottom:1px solid rgba(255,185,0,.08);">NEW SPOT</th>
-          <th style="padding:6px 8px;font-family:DM Mono,monospace;font-size:11px;font-weight:700;letter-spacing:1.2px;text-transform:uppercase;color:rgba(255,205,60,.85);text-align:right;border-bottom:1px solid rgba(255,185,0,.08);">TODAY P&amp;L</th>
-          <th style="padding:6px 6px;border-bottom:1px solid rgba(255,185,0,.08);">VS MAX</th>
-        </tr>
-      </thead>
-      <tbody>${{tRows}}</tbody>
-    </table>
-    </div>
-    <div style="padding:9px 12px;font-family:DM Mono,monospace;font-size:11px;color:rgba(255,200,70,.75);background:rgba(0,0,0,.25);border-top:1px solid rgba(255,185,0,.1);line-height:1.7;">
-      © P&amp;L = <span style="color:rgba(255,215,0,.9);">Delta×move</span> + <span style="color:rgba(255,215,0,.9);">Theta (1 day)</span>. Actual exit P&amp;L may differ due to IV changes. Max profit of ${{m.mpStr}} is achievable at expiry only.
-    </div>
-  </div>
-
-  <!-- TAB 2: Greeks Breakdown -->
-  <div id="${{simId}}_c2" style="display:none;">
-    <div style="display:flex;align-items:center;justify-content:space-between;padding:10px 12px 8px;border-bottom:1px solid rgba(255,185,0,.12);">
-      <div style="font-family:DM Mono,monospace;font-size:12px;font-weight:700;letter-spacing:1.2px;text-transform:uppercase;color:rgba(255,210,0,.95);">🔬 NET GREEKS (per lot)</div>
-      <div style="font-family:DM Mono,monospace;font-size:11px;color:rgba(255,200,60,.7);background:rgba(0,0,0,.25);padding:2px 8px;border-radius:4px;">values per lot · today</div>
-    </div>
-    <div style="padding:10px 12px;display:flex;flex-direction:column;gap:5px;">
-      <div style="display:flex;align-items:center;gap:10px;background:rgba(56,216,136,.06);border:1px solid rgba(56,216,136,.18);border-radius:8px;padding:9px 12px;">
-        <div style="width:32px;height:32px;border-radius:6px;background:rgba(56,216,136,.15);border:1px solid rgba(56,216,136,.28);display:flex;align-items:center;justify-content:center;font-size:18px;font-weight:700;color:#38d888;flex-shrink:0;">Δ</div>
-        <div style="flex:1;min-width:0;">
-          <div style="font-family:DM Mono,monospace;font-size:12px;font-weight:700;letter-spacing:1.2px;color:rgba(56,216,136,.9);text-transform:uppercase;">DELTA</div>
-          <div style="font-family:DM Mono,monospace;font-size:11px;color:rgba(255,200,80,.95);">per 1pt move</div>
-        </div>
-        <div style="font-family:DM Mono,monospace;font-size:20px;font-weight:700;color:${{nd>=0?'#38d888':'#f04050'}};white-space:nowrap;">${{ndStr}}</div>
-      </div>
-      <div style="display:flex;align-items:center;gap:10px;background:rgba(240,64,80,.06);border:1px solid rgba(240,64,80,.18);border-radius:8px;padding:9px 12px;">
-        <div style="width:32px;height:32px;border-radius:6px;background:rgba(240,64,80,.15);border:1px solid rgba(240,64,80,.28);display:flex;align-items:center;justify-content:center;font-size:18px;font-weight:700;color:#f04050;flex-shrink:0;">Θ</div>
-        <div style="flex:1;min-width:0;">
-          <div style="font-family:DM Mono,monospace;font-size:12px;font-weight:700;letter-spacing:1.2px;color:rgba(240,64,80,.9);text-transform:uppercase;">THETA</div>
-          <div style="font-family:DM Mono,monospace;font-size:11px;color:rgba(255,200,80,.95);">decay / day</div>
-        </div>
-        <div style="font-family:DM Mono,monospace;font-size:20px;font-weight:700;color:${{ntCol}};white-space:nowrap;">${{ntSign}}\u20b9${{Math.abs(Math.round(nt))}}</div>
-      </div>
-      <div style="display:flex;align-items:center;gap:10px;background:rgba(255,185,0,.06);border:1px solid rgba(255,185,0,.2);border-radius:8px;padding:9px 12px;">
-        <div style="width:32px;height:32px;border-radius:6px;background:rgba(255,185,0,.15);border:1px solid rgba(255,185,0,.28);display:flex;align-items:center;justify-content:center;font-size:18px;font-weight:700;color:#ffcc00;flex-shrink:0;">ν</div>
-        <div style="flex:1;min-width:0;">
-          <div style="font-family:DM Mono,monospace;font-size:12px;font-weight:700;letter-spacing:1.2px;color:rgba(255,204,0,.9);text-transform:uppercase;">VEGA</div>
-          <div style="font-family:DM Mono,monospace;font-size:11px;color:rgba(255,200,80,.95);">per 1% IV</div>
-        </div>
-        <div style="font-family:DM Mono,monospace;font-size:20px;font-weight:700;color:#ffcc00;white-space:nowrap;">${{nvStr}}</div>
-      </div>
-    </div>
-    <div style="border-top:1px solid rgba(255,185,0,.12);margin:0 12px;"></div>
-    <div style="padding:10px 12px 10px;">
-      <div style="font-family:DM Mono,monospace;font-size:11px;color:rgba(255,210,0,.85);letter-spacing:1.2px;text-transform:uppercase;margin-bottom:8px;font-weight:700;">TODAY'S P&amp;L IF MARKET IS FLAT</div>
-      <div style="display:grid;grid-template-columns:1fr auto 1fr;align-items:center;gap:8px;padding:12px;background:rgba(0,0,0,.25);border-radius:8px;border:1px solid rgba(255,185,0,.15);">
-        <div style="text-align:center;">
-          <div style="font-family:DM Mono,monospace;font-size:11px;color:rgba(255,205,60,.85);letter-spacing:1px;text-transform:uppercase;margin-bottom:5px;font-weight:700;">THETA DRAG</div>
-          <div style="font-family:DM Mono,monospace;font-size:24px;font-weight:700;color:${{ntCol}};line-height:1;">${{ntSign}}\u20b9${{Math.abs(Math.round(nt)).toLocaleString('en-IN')}}</div>
-        </div>
-        <div style="font-size:20px;color:rgba(255,255,255,.2);text-align:center;">=</div>
-        <div style="text-align:center;">
-          <div style="font-family:DM Mono,monospace;font-size:11px;color:rgba(255,205,60,.85);letter-spacing:1px;text-transform:uppercase;margin-bottom:5px;font-weight:700;">FLAT P&amp;L TODAY</div>
-          <div style="font-family:DM Mono,monospace;font-size:24px;font-weight:700;color:${{flatCol}};line-height:1;">${{flatPnl>=0?'+':''}}\u20b9${{Math.abs(flatPnl).toLocaleString('en-IN')}}</div>
-        </div>
-      </div>
-      <div style="margin-top:9px;font-family:DM Mono,monospace;font-size:12px;color:rgba(255,200,70,.75);line-height:1.7;">
-        ${{nt < 0 ? '🔴 <span style="color:#f04050;font-weight:700;">Theta negative</span> — you pay \u20b9' + Math.abs(Math.round(nt)).toLocaleString("en-IN") + '/day for holding. Need <b>' + (OC.instName||'Index') + '</b> to move <span style="color:#ffcc00;font-weight:700;">' + Math.ceil(Math.abs(nt)/Math.abs(nd||1)) + ' pts</span> just to break even today.' : '🟢 <span style="color:#38d888;font-weight:700;">Theta positive</span> — you earn \u20b9' + Math.abs(Math.round(nt)).toLocaleString("en-IN") + '/day time decay. Premium selling strategy benefits from flat market.'}}
-      </div>
-    </div>
-  </div>
-
-  <!-- TAB 3: Live Slider -->
-  <div id="${{simId}}_c3" style="display:none;">
-    <div style="display:flex;align-items:center;justify-content:space-between;padding:10px 12px 8px;border-bottom:1px solid rgba(255,185,0,.12);">
-      <div style="font-family:DM Mono,monospace;font-size:12px;font-weight:700;letter-spacing:1.2px;text-transform:uppercase;color:rgba(255,210,0,.95);">⟺ LIVE SCENARIO SLIDER</div>
-    </div>
-    <div style="padding:11px 12px;">
-      <div style="display:flex;justify-content:space-between;margin-bottom:7px;font-family:DM Mono,monospace;font-size:12px;">
-        <span style="color:#ffcc00;">\u20b9${{slMin.toLocaleString('en-IN')}}</span>
-        <span id="${{simId}}_slv" style="font-weight:700;color:#ffcc00;background:rgba(255,185,0,.12);border:1px solid rgba(255,185,0,.35);border-radius:4px;padding:2px 10px;">Spot: \u20b9${{OC.spot.toLocaleString('en-IN')}}</span>
-        <span style="color:#ffcc00;">\u20b9${{slMax.toLocaleString('en-IN')}}</span>
-      </div>
-      <input type="range" id="${{simId}}_sl" min="${{slMin}}" max="${{slMax}}" value="${{OC.spot}}" step="${{OC.strikeStep||100}}"
-        style="width:100%;height:5px;border-radius:3px;outline:none;border:none;-webkit-appearance:none;cursor:pointer;background:linear-gradient(90deg,#ffcc00 50%,rgba(255,185,0,.2) 50%);"
-        onclick="event.stopPropagation()" onmousedown="event.stopPropagation()" ontouchstart="event.stopPropagation()" oninput="simSlide('${{simId}}', this.value, ${{slMin}}, ${{slMax}}, ${{nd}}, ${{nt}}, ${{maxL===null?'null':maxL}}, ${{maxP===null?'null':maxP}})">
-    </div>
-    <div id="${{simId}}_sr" style="padding:4px 12px 14px;text-align:center;">
-      <div style="background:rgba(0,0,0,.3);border-radius:10px;padding:16px;border:1px solid rgba(255,185,0,.2);">
-        <div style="font-family:DM Mono,monospace;font-size:11px;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:rgba(255,205,60,.88);margin-bottom:7px;">ESTIMATED EXIT P&amp;L TODAY</div>
-        <div id="${{simId}}_spnl" style="font-family:DM Mono,monospace;font-size:38px;font-weight:700;color:${{ntCol}};">${{flatPnl>=0?'+':''}}\u20b9${{Math.abs(flatPnl).toLocaleString('en-IN')}}</div>
-        <div id="${{simId}}_snote" style="font-family:DM Mono,monospace;font-size:12px;color:rgba(255,200,70,.92);margin-top:5px;">Flat market — theta drag only</div>
-        <div style="display:flex;gap:12px;justify-content:center;margin-top:11px;padding-top:11px;border-top:1px solid rgba(255,185,0,.12);">
-          <div style="text-align:center;">
-            <div style="font-family:DM Mono,monospace;font-size:11px;color:rgba(255,205,60,.88);letter-spacing:1px;text-transform:uppercase;margin-bottom:3px;font-weight:700;">Delta P&amp;L</div>
-            <div id="${{simId}}_sdelta" style="font-family:DM Mono,monospace;font-size:17px;font-weight:700;color:#38d888;">\u20b90</div>
-          </div>
-          <div style="text-align:center;">
-            <div style="font-family:DM Mono,monospace;font-size:11px;color:rgba(255,205,60,.88);letter-spacing:1px;text-transform:uppercase;margin-bottom:3px;font-weight:700;">Theta Cost</div>
-            <div style="font-family:DM Mono,monospace;font-size:17px;font-weight:700;color:${{ntCol}};">${{ntSign}}\u20b9${{Math.abs(Math.round(nt)).toLocaleString('en-IN')}}</div>
-          </div>
-          <div style="text-align:center;">
-            <div style="font-family:DM Mono,monospace;font-size:11px;color:rgba(255,205,60,.88);letter-spacing:1px;text-transform:uppercase;margin-bottom:3px;font-weight:700;">% of Max</div>
-            <div id="${{simId}}_spct" style="font-family:DM Mono,monospace;font-size:17px;font-weight:700;color:#ffcc00;">—</div>
-          </div>
-        </div>
-      </div>
-    </div>
-  </div>
-
-</div>`;
-}}
-
-function simTab(simId, tab) {{
-  ['t1','t2','t3'].forEach(t => {{
-    const btn = document.getElementById(simId + '_' + t);
-    const con = document.getElementById(simId + '_c' + t.slice(1));
-    if (!btn || !con) return;
-    const isActive = t === tab;
-    con.style.display = isActive ? 'block' : 'none';
-    btn.style.borderBottomColor = isActive ? '#ffcc00' : 'transparent';
-    btn.style.color = isActive ? '#ffcc00' : 'rgba(255,185,0,.5)';
-    btn.style.background = isActive ? 'rgba(255,185,0,.07)' : 'transparent';
-  }});
-}}
-
-function simSlide(simId, val, slMin, slMax, nd, nt, maxL, maxP) {{
-  const spot = parseInt(val);
-  const move = spot - OC.spot;
-  const pct  = ((val - slMin) / (slMax - slMin) * 100);
-  const sl   = document.getElementById(simId + '_sl');
-  if (sl) sl.style.background = `linear-gradient(90deg,#ffcc00 ${{pct}}%,rgba(255,185,0,.2) ${{pct}}%)`;
-  const slv = document.getElementById(simId + '_slv');
-  if (slv) slv.textContent = 'Spot: \u20b9' + spot.toLocaleString('en-IN');
-  let pnl = nd * move + nt;
-  if (maxL !== null) pnl = Math.max(-maxL, pnl);
-  if (maxP !== null) pnl = Math.min(maxP * 0.9, pnl);
-  pnl = Math.round(pnl);
-  const col = pnl > 100 ? '#38d888' : pnl > 0 ? '#ffcc00' : pnl > -200 ? '#ffaa00' : '#f04050';
-  const pEl = document.getElementById(simId + '_spnl');
-  if (pEl) {{ pEl.textContent = (pnl>=0?'+':'') + '\u20b9' + Math.abs(pnl).toLocaleString('en-IN'); pEl.style.color = col; }}
-  const nEl = document.getElementById(simId + '_snote');
-  if (nEl) nEl.textContent = move > 0 ? `${{OC.instName||'Index'}} up ${{move}} pts` : move < 0 ? `${{OC.instName||'Index'}} down ${{Math.abs(move)}} pts` : 'Flat market — theta drag only';
-  const deltaPnl = Math.round(nd * move);
-  const dEl = document.getElementById(simId + '_sdelta');
-  if (dEl) {{ dEl.textContent = (deltaPnl>=0?'+':'') + '\u20b9' + Math.abs(deltaPnl).toLocaleString('en-IN'); dEl.style.color = deltaPnl >= 0 ? '#38d888' : '#f04050'; }}
-  const pctEl = document.getElementById(simId + '_spct');
-  if (pctEl) {{ const pPct = maxP ? ((pnl / maxP) * 100).toFixed(1) + '%' : '—'; pctEl.textContent = pPct; pctEl.style.color = pnl >= 0 ? '#ffcc00' : '#f04050'; }}
-}}
-
-function popBadgeStyle(pop) {{
-  if(pop>=70) return 'background:rgba(0,200,150,.25);color:#00c896;border-color:rgba(0,200,150,.5);font-weight:800;';
-  if(pop>=60) return 'background:rgba(77,232,184,.2);color:#4de8b8;border-color:rgba(77,232,184,.4);';
-  if(pop>=50) return 'background:rgba(100,128,255,.2);color:#8aa0ff;border-color:rgba(100,128,255,.4);';
-  return 'background:rgba(255,107,107,.2);color:#ff6b6b;border-color:rgba(255,107,107,.4);';
-}}
-
-function initAllCards() {{
-  // Only process cards in the currently visible strategy panel
-  const activePanelId = (typeof _activeInstrument !== 'undefined' && _activeInstrument === 'FINNIFTY') ? 'stratFN' : 'stratBN';
-  const activePanel = document.getElementById(activePanelId) || document;
-  let topPop=0, topName='', topCat='';
-  const bullEx = smartPoP('bull_put_spread','bullish');
-  // Legend: A · BIAS
-  const el_b = activePanel.querySelector('#legendBiasVal') || document.getElementById('legendBiasVal');
-  if(el_b) {{ el_b.textContent=OC.bias+' ('+OC.biasConf+')'; el_b.style.color=OC.bias==='BULLISH'?'#00c896':OC.bias==='BEARISH'?'#ff6b6b':'#6480ff'; }}
-  // Legend: B · S/R ZONE
-  const srPts = bullEx.srAdj;
-  const el_sr = activePanel.querySelector('#legendSRVal') || document.getElementById('legendSRVal');
-  if(el_sr) {{ const srLabel = srPts>5?'Near Support ✓':srPts<-5?'Near Resistance ✗':'Mid Range'; el_sr.textContent=srLabel+' ('+(srPts>=0?'+':'')+srPts+')'; el_sr.style.color=srPts>=0?'#00c896':'#ff6b6b'; }}
-  // Legend: C · OI WALLS
-  const oiPts = bullEx.oiAdj;
-  const el_oi = activePanel.querySelector('#legendOIVal') || document.getElementById('legendOIVal');
-  if(el_oi) {{ const oiLabel = OC.spot>OC.maxPeStrike?'Above PE Wall ✓':'Below PE Wall ✗'; el_oi.textContent=oiLabel+' ('+(oiPts>=0?'+':'')+oiPts+')'; el_oi.style.color=oiPts>=0?'#00c896':'#ff6b6b'; }}
-  // Legend: D · PCR
-  const el_pcr = activePanel.querySelector('#legendPCRVal') || document.getElementById('legendPCRVal');
-  if(el_pcr) {{ const pcrLabel = OC.pcr>1.2?'Bullish PCR ':OC.pcr<0.8?'Bearish PCR ':'Neutral PCR '; el_pcr.textContent=pcrLabel+OC.pcr.toFixed(3); el_pcr.style.color=OC.pcr>1.2?'#00c896':OC.pcr<0.8?'#ff6b6b':'#6480ff'; }}
-  // Cards — only process cards in active panel
-  activePanel.querySelectorAll('.sc-card').forEach(card=>{{
-    const shape=card.dataset.shape, cat=card.dataset.cat;
-    const badge=document.getElementById('pop_'+card.id);
-    try {{
-      const result = smartPoP(shape, cat);
-      const m=calcMetrics(shape, result.pop);
-      // ── Hide card if any required LTP is missing/zero (no live data) ──
-      if (m === null) {{
-        card.style.display = 'none';
-        card.dataset.pop = 0;
-        if (badge) {{ badge.textContent = '—'; badge.setAttribute('style', popBadgeStyle(0)); }}
-        return;
-      }}
-      card.style.display = '';   // restore if previously hidden
-      card.dataset.pop=result.pop;
-      card.dataset.scoreBreakdown=JSON.stringify(result);
-      if(badge) {{ badge.textContent=result.pop+'%'; badge.setAttribute('style', popBadgeStyle(result.pop)); }}
-      if(result.pop>topPop) {{ topPop=result.pop; topName=card.dataset.name; topCat=cat; }}
-    }}catch(e){{card.dataset.pop=0;if(badge)badge.textContent='—%';}}
-  }});
-  // Legend: ★ TOP STRATEGY
-  const el_rec = activePanel.querySelector('#legendRecVal') || document.getElementById('legendRecVal');
-  if(el_rec && topName) {{
-    const recCol = topCat==='bullish'?'#00c896':topCat==='bearish'?'#ff6b6b':'#6480ff';
-    el_rec.innerHTML=`<span style="color:${{recCol}};">${{topName}}</span> <span style="color:rgba(255,255,255,.75);font-size:13px;">${{topPop}}% PoP</span>`;
-  }}
-}}
-
-function sortGridByPoP(cat) {{
-  const activePanelId = (typeof _activeInstrument !== 'undefined' && _activeInstrument === 'FINNIFTY') ? 'stratFN' : 'stratBN';
-  const activePanel = document.getElementById(activePanelId) || document;
-  const grid = activePanel.querySelector('.sc-grid') || document.getElementById('sc-grid');
-  if(!grid)return;
-  const cards=Array.from(grid.querySelectorAll(`.sc-card[data-cat="${{cat}}"]`));
-  cards.sort((a,b)=>parseInt(b.dataset.pop||0)-parseInt(a.dataset.pop||0));
-  cards.forEach(c=>grid.appendChild(c));
-}}
-
-window.addEventListener('load',function(){{
-  initAllCards();
-  ['bullish','bearish','nondirectional'].forEach(sortGridByPoP);
-  filterStrat('bullish',document.querySelector('.sc-tab'));
-}});
-
-// ── Multi-Expiry Switcher ─────────────────────────────────────
-const ALL_EXPIRY_DATA = {all_expiry_json};
-
-window.switchExpiry = function(exp) {{
-  let d = ALL_EXPIRY_DATA[exp];
-  if (!d) {{
-    const sel = document.getElementById('expiryDropdown');
-    if (sel) {{
-      const opts = Array.from(sel.options);
-      const curIdx = opts.findIndex(o => o.value === exp);
-      for (let i = curIdx + 1; i < opts.length; i++) {{
-        const nextExp = opts[i].value;
-        if (ALL_EXPIRY_DATA[nextExp]) {{
-          sel.value = nextExp;
-          exp = nextExp;
-          d = ALL_EXPIRY_DATA[nextExp];
-          break;
-        }}
-      }}
-    }}
-    if (!d) return;
-  }}
-  // Update OC object with selected expiry's data
-  OC.spot        = d.spot;
-  OC.atm         = d.atm;
-  OC.pcr         = d.pcr;
-  OC.maxCeStrike = d.maxCeStrike;
-  OC.maxPeStrike = d.maxPeStrike;
-  OC.support     = d.support;
-  OC.resistance  = d.resistance;
-  OC.strongSup   = d.strongSup;
-  OC.strongRes   = d.strongRes;
-  OC.strikes     = d.strikes;
-  // Rebuild strike map
-  Object.keys(STRIKE_MAP).forEach(k => delete STRIKE_MAP[k]);
-  OC.strikes.forEach(s => {{ STRIKE_MAP[s.strike] = s; }});
-  // Collapse all expanded cards first
-  document.querySelectorAll('.sc-card.expanded').forEach(c => c.classList.remove('expanded'));
-  // Reset all metrics panels
-  document.querySelectorAll('.sc-metrics-live').forEach(m => {{
-    m.innerHTML = '<div class="sc-loading">&#9685; Calculating metrics...</div>';
-  }});
-  // Re-run PoP + sort
-  initAllCards();
-  ['bullish','bearish','nondirectional'].forEach(sortGridByPoP);
-  // Flash indicator
-  const sel = document.getElementById('expiryDropdown');
-  if (sel) {{
-    sel.style.borderColor = '#00c896';
-    sel.style.boxShadow = '0 0 10px rgba(0,200,150,.3)';
-    setTimeout(() => {{
-      sel.style.borderColor = 'rgba(245,197,24,.45)';
-      sel.style.boxShadow = 'none';
-    }}, 800);
-  }}
-}};
-</script>
-""" if emit_script else "")
-    )
-
-
-
-# =================================================================
-#  SECTION 7 -- TICKER BAR
-# =================================================================
-
-def rsi_label(rsi):
-    if   rsi >= 70: return "Overbought","#ff6b6b","bearish"
-    elif rsi >= 60: return "Strong",    "#ffd166","neutral"
-    elif rsi >= 40: return "Neutral",   "#6480ff","neutral"
-    elif rsi >= 30: return "Weak",      "#ffd166","neutral"
-    else:           return "Oversold",  "#00c896","bullish"
-
-def macd_label(macd, signal):
-    d = macd - signal
-    if   d >  0.5: return "Bullish",       "#00c896","bullish"
-    elif d >  0:   return "Mildly Bullish","#4de8b8","bullish"
-    elif d > -0.5: return "Mildly Bearish","#ffd166","neutral"
-    else:          return "Bearish",       "#ff6b6b","bearish"
-
-def pcr_label(pcr):
-    if   pcr > 1.3: return "Very Bullish","#00c896","bullish"
-    elif pcr > 1.1: return "Bullish",     "#4de8b8","bullish"
-    elif pcr > 0.9: return "Neutral",     "#6480ff","neutral"
-    elif pcr > 0.7: return "Bearish",     "#ffd166","neutral"
-    else:           return "Very Bearish","#ff6b6b","bearish"
-
-
-def build_ticker_bar(tech, oc, vix_data):
-    items = []
-    if vix_data:
-        v=vix_data["value"]; chg=vix_data["change"]; chg_p=vix_data["change_pct"]
-        lbl,col,bg,bdr,sig=vix_label(v)
-        chg_col="#ff6b6b" if chg>0 else ("#00c896" if chg<0 else "#6480ff")
-        items.append(
-            f'<div class="tk-item">'
-            f'<span class="tk-name" style="background:rgba(0,200,220,.15);color:#00c8e0;border:1px solid rgba(0,200,220,.3);">&#9650;&nbsp;INDIA VIX</span>'
-            f'<span class="tk-val" style="color:{col};">{v:.2f}</span>'
-            f'<span class="tk-sub" style="color:{chg_col};">{chg:+.2f} ({chg_p:+.2f}%)</span>'
-            f'<span class="tk-badge" style="background:{bg};color:{col};border:1px solid {bdr};">{lbl} · {sig}</span>'
-            f'</div>'
-        )
-    if tech:
-        rsi=tech["rsi"]; lbl,col,cls=rsi_label(rsi)
-        rgb="0,200,150" if cls=="bullish" else ("255,107,107" if cls=="bearish" else "100,128,255")
-        items.append(
-            f'<div class="tk-item">'
-            f'<span class="tk-name" style="background:rgba({rgb},.18);color:{col};border:1px solid rgba({rgb},.35);">&#9643;&nbsp;RSI (14)</span>'
-            f'<span class="tk-val" style="color:{col};">{rsi:.1f}</span>'
-            f'<span class="tk-badge" style="background:rgba({rgb},.1);color:{col};border:1px solid rgba({rgb},.3);">{lbl}</span>'
-            f'</div>'
-        )
-        macd=tech["macd"]; sig2=tech["signal_line"]; lbl,col,cls=macd_label(macd,sig2)
-        rgb2="0,200,150" if cls=="bullish" else ("255,107,107" if cls=="bearish" else "100,128,255")
-        diff=macd-sig2
-        items.append(
-            f'<div class="tk-item">'
-            f'<span class="tk-name" style="background:rgba({rgb2},.18);color:{col};border:1px solid rgba({rgb2},.35);">&#9654;&nbsp;MACD</span>'
-            f'<span class="tk-val" style="color:{col};">{macd:.2f}</span>'
-            f'<span class="tk-sub" style="color:rgba(255,255,255,.75);">Sig:&nbsp;{sig2:.2f}&nbsp;Hist:&nbsp;{diff:+.2f}</span>'
-            f'<span class="tk-badge" style="background:rgba({rgb2},.1);color:{col};border:1px solid rgba({rgb2},.3);">{lbl}</span>'
-            f'</div>'
-        )
-    if oc:
-        pcr=oc["pcr_oi"]; lbl,col,cls=pcr_label(pcr)
-        rgb3="0,200,150" if cls=="bullish" else ("255,107,107" if cls=="bearish" else "100,128,255")
-        items.append(
-            f'<div class="tk-item">'
-            f'<span class="tk-name" style="background:rgba({rgb3},.18);color:{col};border:1px solid rgba({rgb3},.35);">&#9670;&nbsp;PCR (OI)</span>'
-            f'<span class="tk-val" style="color:{col};">{pcr:.3f}</span>'
-            f'<span class="tk-badge" style="background:rgba({rgb3},.1);color:{col};border:1px solid rgba({rgb3},.3);">{lbl}</span>'
-            f'</div>'
-        )
-    track = "".join(items) * 2
-    return f'''<div class="ticker-wrap">
-  <div class="ticker-label">LIVE&nbsp;&#9654;</div>
-  <div class="ticker-viewport"><div class="ticker-track" id="tkTrack">''' + track + '''</div></div>
-</div>'''
-
-# =================================================================
-#  SECTION 8 -- CSS
-# =================================================================
-
-CSS = """
-@import url('https://fonts.googleapis.com/css2?family=Sora:wght@300;400;600;700&family=DM+Mono:wght@300;400;500&display=swap');
-*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
-:root{
-  --bg:#06080f;--surf:#080b14;--card:#0c1020;
-  --bdr:rgba(255,255,255,.07);--bdr2:rgba(255,255,255,.12);
-  --aurora1:#00c896;--aurora2:#6480ff;--aurora3:#00c8e0;
-  --bull:#00c896;--bear:#ff6b6b;--neut:#6480ff;
-  --text:rgba(255,255,255,.9);--muted:rgba(255,255,255,.75);--muted2:rgba(255,255,255,.55);
-  --fh:'Sora',sans-serif;--fm:'DM Mono',monospace;
-  --gold:#f5c518;--gold-dim:rgba(245,197,24,.45);--gold-bg:rgba(245,197,24,.10);
-}
-html{scroll-behavior:smooth}
-body{background:var(--bg);color:var(--text);font-family:var(--fh);font-size:18.8px;line-height:1.6;min-height:100vh;overflow-x:hidden;}
-body::before{content:'';position:fixed;inset:0;
-  background-image:
-    radial-gradient(ellipse at 15% 0%,rgba(0,200,150,.10) 0%,transparent 50%),
-    radial-gradient(ellipse at 85% 10%,rgba(100,128,255,.10) 0%,transparent 50%),
-    radial-gradient(ellipse at 50% 90%,rgba(0,200,220,.06) 0%,transparent 50%);
-  pointer-events:none;z-index:0;}
-.app{position:relative;z-index:1;display:grid;grid-template-rows:auto auto auto 1fr auto;min-height:100vh}
-header{display:flex;align-items:center;justify-content:space-between;padding:14px 32px;
-  background:rgba(6,8,15,.85);backdrop-filter:blur(16px);
-  border-bottom:1px solid rgba(255,255,255,.07);position:sticky;top:0;z-index:200;
-  box-shadow:0 1px 0 rgba(0,200,150,.1)}
-.logo-wrap{position:relative;height:42px;overflow:hidden;min-width:400px;}
-.logo-slide{position:absolute;top:0;left:0;width:100%;font-family:var(--fh);font-size:29px;font-weight:700;
-  background:linear-gradient(90deg,#00c896,#6480ff);-webkit-background-clip:text;-webkit-text-fill-color:transparent;
-  filter:drop-shadow(0 0 12px rgba(0,200,150,.3));opacity:0;transform:translateY(20px);
-  transition:opacity .5s ease, transform .5s ease;white-space:nowrap;}
-.logo-slide.active{opacity:1;transform:translateY(0);}
-.logo-slide.exit{opacity:0;transform:translateY(-20px);}
-.hdr-meta{display:flex;align-items:center;gap:14px;font-size:15.9px;color:var(--muted);font-family:var(--fm)}
-.live-dot{width:7px;height:7px;border-radius:50%;background:#00c896;box-shadow:0 0 10px #00c896;animation:pulse 2s infinite}
-@keyframes pulse{0%,100%{opacity:1}50%{opacity:.2}}
-.refresh-countdown{display:flex;align-items:center;gap:8px;background:rgba(0,200,150,.07);
-  border:1px solid rgba(0,200,150,.18);border-radius:20px;padding:4px 12px;font-family:var(--fm);font-size:15.9px;}
-.countdown-arc-wrap{position:relative;width:18px;height:18px;flex-shrink:0;}
-.countdown-arc-wrap svg{display:block;}
-.countdown-num{font-family:var(--fm);font-size:17.4px;font-weight:700;color:#00c896;min-width:20px;text-align:center;transition:color .3s;}
-.countdown-num.urgent{color:#ff6b6b;}
-.countdown-num.halfway{color:#ffd166;}
-.countdown-lbl{font-size:14.5px;color:rgba(255,255,255,.68);letter-spacing:.5px;}
-.refresh-ring{display:none;width:14px;height:14px;border-radius:50%;border:2px solid rgba(0,200,150,.2);border-top-color:#00c896;animation:spin 0.8s linear infinite;}
-.refresh-ring.active{display:inline-block;}
-@keyframes spin{to{transform:rotate(360deg)}}
-#refreshStatus{font-size:14.5px;color:rgba(255,255,255,.70);transition:color .3s;letter-spacing:.3px;}
-#refreshStatus.updated{color:#00c896;font-weight:600;}
-.hero{display:flex;align-items:stretch;background:linear-gradient(135deg,rgba(0,200,150,.055) 0%,rgba(100,128,255,.055) 100%);border-bottom:1px solid rgba(255,255,255,.07);overflow:hidden;position:relative;height:130px;}
-.hero::before{content:'';position:absolute;top:-50px;left:-50px;width:200px;height:200px;border-radius:50%;background:radial-gradient(circle,rgba(0,200,150,.10),transparent 70%);pointer-events:none;}
-.h-gauges{flex-shrink:0;display:flex;align-items:center;gap:10px;padding:0 16px 0 18px;}
-.gauge-sep{width:1px;height:56px;background:rgba(255,255,255,.08);flex-shrink:0;}
-.gauge-wrap{position:relative;width:100px;height:100px;}
-.gauge-wrap svg{display:block;}
-.gauge-inner{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;}
-.g-val{font-family:'DM Mono',monospace;font-size:18.8px;font-weight:700;line-height:1;}
-.g-lbl{font-size:10.9px;letter-spacing:1.5px;text-transform:uppercase;color:rgba(255,255,255,.65);margin-top:2px;}
-.h-mid{flex:1;min-width:0;display:flex;flex-direction:column;justify-content:center;padding:0 15px 0 13px;border-left:1px solid rgba(255,255,255,.05);}
-.h-eyebrow{font-size:11.6px;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:rgba(255,255,255,.60);margin-bottom:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
-.h-signal{font-size:31.9px;font-weight:900;letter-spacing:1px;line-height:1.1;margin-bottom:2px;}
-.h-sub{font-size:13.8px;color:rgba(255,255,255,.68);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
-.h-divider{height:1px;background:rgba(255,255,255,.05);margin:5px 0;}
-.pill-row{display:flex;align-items:center;gap:8px;margin-bottom:4px;}
-.pill-row:last-child{margin-bottom:0;}
-.pill-dot{width:8px;height:8px;border-radius:50%;flex-shrink:0;}
-.pill-lbl{font-size:11.6px;font-weight:700;letter-spacing:1.5px;text-transform:uppercase;color:rgba(255,255,255,.70);width:96px;flex-shrink:0;}
-.pill-track{width:120px;height:5px;background:rgba(255,255,255,.07);border-radius:3px;overflow:hidden;flex-shrink:0;}
-.pill-fill{height:100%;border-radius:3px;}
-.pill-num{font-family:'DM Mono',monospace;font-size:14.5px;font-weight:700;margin-left:8px;flex-shrink:0;}
-.h-stats{flex-shrink:0;min-width:360px;display:flex;flex-direction:column;border-left:1px solid rgba(255,255,255,.07);background:rgba(255,255,255,.015);}
-.h-stat-row{display:flex;align-items:stretch;flex:1;border-bottom:1px solid rgba(255,255,255,.05);}
-.h-stat{flex:1;display:flex;flex-direction:column;justify-content:center;padding:5px 10px;text-align:center;border-right:1px solid rgba(255,255,255,.04);}
-.h-stat:last-child{border-right:none;}
-.h-stat-lbl{font-size:10.9px;font-weight:700;letter-spacing:1.8px;text-transform:uppercase;color:rgba(255,255,255,.60);margin-bottom:3px;white-space:nowrap;}
-.h-stat-val{font-family:'DM Mono',monospace;font-size:18.8px;font-weight:700;line-height:1;white-space:nowrap;}
-.h-stat-bottom{display:flex;align-items:center;justify-content:space-between;padding:4px 10px;}
-.h-bias-row{display:flex;align-items:center;gap:6px;}
-.h-chip{font-size:13px;font-weight:700;letter-spacing:.8px;text-transform:uppercase;padding:2px 9px;border-radius:20px;white-space:nowrap;}
-.h-score{font-family:'DM Mono',monospace;font-size:11.6px;color:rgba(255,255,255,.60);letter-spacing:.5px;}
-.h-ts{font-family:'DM Mono',monospace;font-size:11.6px;color:rgba(255,255,255,.18);letter-spacing:.5px;white-space:nowrap;}
-.main{display:grid;grid-template-columns:268px 1fr;min-height:0}
-.sidebar{background:rgba(8,11,20,.7);backdrop-filter:blur(12px);border-right:1px solid rgba(255,255,255,.06);position:sticky;top:57px;height:calc(100vh - 57px);overflow-y:auto;display:flex;flex-direction:column;}
-.sidebar-sticky-top{position:sticky;top:0;z-index:50;background:rgba(8,11,20,.95);backdrop-filter:blur(16px);border-bottom:1px solid rgba(100,128,255,.15);padding-bottom:4px;}
-.sidebar-scroll{flex:1;overflow-y:auto;}
-.sidebar::-webkit-scrollbar{width:3px}
-.sidebar::-webkit-scrollbar-thumb{background:rgba(255,255,255,.1);border-radius:2px}
-.sidebar-scroll::-webkit-scrollbar{width:3px}
-.sidebar-scroll::-webkit-scrollbar-thumb{background:rgba(255,255,255,.1);border-radius:2px}
-.sb-sec{padding:16px 12px 8px}
-.sb-lbl{font-size:13px;font-weight:700;letter-spacing:.15em;text-transform:uppercase;color:var(--aurora1);margin-bottom:8px;padding:0 0 0 8px;border-left:2px solid var(--aurora1)}
-.sb-btn{display:flex;align-items:center;gap:8px;width:100%;padding:9px 12px;border-radius:8px;border:1px solid transparent;cursor:pointer;background:transparent;color:var(--muted);font-family:var(--fh);font-size:17.4px;text-align:left;transition:all .15s}
-.sb-btn:hover{background:rgba(0,200,150,.08);color:rgba(255,255,255,.8);border-color:rgba(0,200,150,.2)}
-.sb-btn.active{background:rgba(0,200,150,.1);border-color:rgba(0,200,150,.25);color:#00c896;font-weight:600}
-.sb-badge{font-size:14.5px;margin-left:auto;font-weight:700}
-.content{overflow-y:auto}
-.section{padding:26px 28px;border-bottom:1px solid rgba(255,255,255,.05);background:transparent;position:relative}
-.section:nth-child(odd){background:rgba(255,255,255,.015)}
-.sec-title{font-family:var(--fh);font-size:15.9px;font-weight:700;letter-spacing:2.5px;color:var(--aurora1);text-transform:uppercase;display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:20px;padding-bottom:12px;border-bottom:1px solid rgba(0,200,150,.15)}
-.sec-sub{font-size:15.9px;color:var(--muted2);font-weight:400;letter-spacing:.5px;text-transform:none;margin-left:auto}
-.oi-ticker-table{border:1px solid rgba(255,255,255,.07);border-radius:14px;overflow:hidden}
-.oi-ticker-hdr{display:grid;grid-template-columns:130px repeat(5,1fr);padding:9px 18px;align-items:center;gap:6px}
-.oi-ticker-hdr-label{font-size:13px;font-weight:700;letter-spacing:2px;text-transform:uppercase}
-.oi-ticker-hdr-cell{font-size:13px;letter-spacing:1.5px;text-transform:uppercase;color:rgba(255,255,255,.70);text-align:center}
-.oi-ticker-row{display:grid;grid-template-columns:130px repeat(5,1fr);padding:15px 18px;border-top:1px solid rgba(255,255,255,.04);align-items:center;gap:6px;transition:background .15s}
-.oi-ticker-row:hover{background:rgba(255,255,255,.03)}
-.oi-ticker-metric{font-size:14.5px;font-weight:600;letter-spacing:1px;text-transform:uppercase;color:rgba(255,255,255,.70)}
-.oi-ticker-cell{text-align:center}
-.kl-zone-labels{display:flex;justify-content:space-between;margin-bottom:6px;font-size:15.9px;font-weight:700}
-.kl-node{position:absolute;text-align:center}
-.kl-lbl{font-size:14.5px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;line-height:1.3;white-space:nowrap}
-.kl-val{font-size:17.4px;font-weight:700;color:rgba(255,255,255,.7);white-space:nowrap;margin-top:2px}
-.kl-dot{width:11px;height:11px;border-radius:50%;border:2px solid var(--bg)}
-.kl-gradient-bar{position:relative;height:6px;border-radius:3px;background:linear-gradient(90deg,#00a07a 0%,#00c896 25%,#6480ff 55%,#ff6b6b 80%,#cc4040 100%);box-shadow:0 0 12px rgba(0,200,150,.2)}
-.kl-price-tick{position:absolute;top:50%;transform:translate(-50%,-50%);width:3px;height:18px;background:#fff;border-radius:2px;box-shadow:0 0 12px rgba(255,255,255,.6);z-index:10}
-.kl-dist-row{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:4px}
-.kl-dist-box{background:rgba(255,255,255,.03);border:1px solid;border-radius:10px;padding:10px 14px;display:flex;justify-content:space-between;align-items:center}
-.strikes-head{font-weight:700;margin-bottom:10px;font-size:18.8px}
-.strikes-wrap{display:grid;grid-template-columns:1fr 1fr;gap:20px}
-.s-table{width:100%;border-collapse:collapse;border-radius:10px;overflow:hidden}
-.s-table th{background:linear-gradient(90deg,rgba(0,200,150,.15),rgba(100,128,255,.15));color:rgba(255,255,255,.7);padding:10px 12px;font-size:15.9px;font-weight:600;text-align:left;letter-spacing:.5px;border-bottom:1px solid rgba(255,255,255,.08)}
-.s-table td{padding:10px 12px;border-bottom:1px solid rgba(255,255,255,.05);font-size:17.4px;color:rgba(255,255,255,.8);background:rgba(255,255,255,.02)}
-.s-table tr:last-child td{border-bottom:none}
-.s-table tr:hover td{background:rgba(0,200,150,.05)}
-.ticker-wrap{display:flex;align-items:center;background:rgba(4,6,12,.97);border-bottom:1px solid rgba(255,255,255,.07);height:46px;overflow:hidden;position:relative;z-index:190;box-shadow:0 2px 20px rgba(0,0,0,.5);}
-.ticker-label{flex-shrink:0;padding:0 16px;font-family:var(--fm);font-size:13px;font-weight:700;letter-spacing:3px;color:#00c896;text-transform:uppercase;border-right:1px solid rgba(0,200,150,.2);height:100%;display:flex;align-items:center;background:rgba(0,200,150,.07);white-space:nowrap;}
-.ticker-viewport{flex:1;overflow:hidden;height:100%}
-.ticker-track{display:flex;align-items:center;height:100%;white-space:nowrap;animation:ticker-scroll 38s linear infinite;will-change:transform;}
-.ticker-track:hover{animation-play-state:paused}
-@keyframes ticker-scroll{0%{transform:translateX(0)}100%{transform:translateX(-50%)}}
-.tk-item{display:inline-flex;align-items:center;gap:10px;padding:0 20px;height:100%;border-right:1px solid rgba(255,255,255,.04);flex-shrink:0;}
-.tk-name{font-family:var(--fm);font-size:14.5px;font-weight:700;letter-spacing:1.5px;text-transform:uppercase;padding:3px 10px;border-radius:6px;white-space:nowrap;flex-shrink:0;background:rgba(255,255,255,.08);color:rgba(255,255,255,.5);border:1px solid rgba(255,255,255,.1);}
-.tk-val{font-family:var(--fm);font-size:26.1px;font-weight:700;line-height:1;white-space:nowrap;}
-.tk-sub{font-family:var(--fm);font-size:14.5px;color:rgba(255,255,255,.70);white-space:nowrap;}
-.tk-badge{font-family:var(--fh);font-size:14.5px;font-weight:700;padding:3px 10px;border-radius:20px;white-space:nowrap;letter-spacing:.3px;}
-
-/* ── Main Tab Bar ─────────────────────────────────── */
-.main-tabs{display:flex;gap:8px;padding:16px 28px 0;border-bottom:1px solid rgba(255,255,255,.07);background:rgba(4,6,12,.6);position:sticky;top:0;z-index:100;}
-.main-tab{padding:10px 22px;font-family:var(--fh);font-size:13px;font-weight:700;letter-spacing:1px;text-transform:uppercase;border:none;border-bottom:3px solid transparent;background:transparent;color:rgba(255,255,255,.55);cursor:pointer;transition:all .2s;border-radius:6px 6px 0 0;}
-.main-tab:hover{color:rgba(255,255,255,.85);background:rgba(255,255,255,.04);}
-.main-tab.active{color:#00c896;border-bottom:3px solid #00c896;background:rgba(0,200,150,.07);}
-footer{padding:16px 32px;border-top:1px solid rgba(255,255,255,.06);background:rgba(6,8,15,.9);backdrop-filter:blur(12px);display:flex;justify-content:space-between;font-size:15.9px;color:var(--muted2);font-family:var(--fm)}
-.sc-tabs{display:flex;gap:10px;margin-bottom:20px;flex-wrap:wrap}
-.sc-tab{padding:8px 20px;border-radius:24px;border:1px solid;cursor:pointer;font-family:var(--fh);font-size:17.4px;font-weight:600;transition:all .2s;display:flex;align-items:center;gap:8px;background:transparent}
-.sc-tab:hover{opacity:.85}
-.sc-cnt{font-size:14.5px;padding:1px 7px;border-radius:10px;color:#fff;font-weight:700}
-.sc-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:12px}
-.sc-card{background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.08);border-radius:14px;overflow:hidden;cursor:pointer;transition:all .2s;display:flex;flex-direction:column;position:relative;}
-.sc-card:hover{border-color:rgba(0,200,150,.3);transform:translateY(-3px);box-shadow:0 8px 28px rgba(0,200,150,.1)}
-.sc-card.hidden{display:none}
-.sc-card.expanded{grid-column:1 / -1 !important;flex-direction:row !important;align-items:stretch;border-color:rgba(0,200,150,.35);box-shadow:0 0 0 1px rgba(0,200,150,.2),0 12px 32px rgba(0,200,150,.12);overflow:visible;}
-.sc-card.expanded .sc-detail{display:block;flex:0 0 400px;width:400px;border-top:none;border-left:1px solid rgba(0,229,160,.15);overflow:visible;background:rgba(5,13,26,.8);}
-.sc-card.expanded .sc-summary{flex:1;min-width:180px;}
-.sc-card.expanded:hover{transform:none;}
-.sc-pop-badge{position:absolute;top:8px;right:8px;font-family:'DM Mono',monospace;font-size:14.5px;font-weight:700;padding:3px 8px;border-radius:20px;border:1px solid rgba(255,255,255,.15);background:rgba(255,255,255,.08);color:rgba(255,255,255,.5);z-index:5;letter-spacing:.5px;transition:all .3s;min-width:38px;text-align:center;}
-.sc-svg{display:flex;align-items:center;justify-content:center;padding:14px 0 6px;background:rgba(255,255,255,.02)}
-.sc-body{padding:10px 12px 12px}
-.sc-name{font-family:var(--fh);font-size:17.4px;font-weight:700;color:rgba(255,255,255,.9);margin-bottom:4px;line-height:1.3;padding-right:48px}
-.sc-legs{font-family:var(--fm);font-size:13px;color:rgba(0,200,220,.7);margin-bottom:8px;letter-spacing:.3px;line-height:1.4}
-.sc-tags{display:flex;flex-direction:column;gap:4px}
-.sc-tag{font-size:13px;padding:2px 8px;border-radius:6px;border:1px solid;background:rgba(0,0,0,.2);display:inline-block;width:fit-content}
-.sc-detail{display:none;border-top:1px solid rgba(255,255,255,.06);background:rgba(0,200,150,.03)}
-.sc-desc{font-size:15.9px;color:rgba(255,255,255,.5);line-height:1.7;padding:12px 12px 8px;border-bottom:1px solid rgba(255,255,255,.05);}
-.sc-metrics-live{padding:0}
-.sc-loading{padding:14px 12px;font-size:15.9px;color:rgba(255,255,255,.68);text-align:center;font-family:'DM Mono',monospace}
-.metric-row{display:flex;justify-content:space-between;align-items:center;padding:8px 12px;border-bottom:1px solid rgba(255,255,255,.04);transition:background .15s;}
-.metric-row:hover{background:rgba(255,255,255,.03)}
-.metric-strike{background:rgba(255,209,102,.04);border-bottom:1px solid rgba(255,209,102,.12) !important;}
-.metric-lbl{font-size:14.5px;color:rgba(255,255,255,.70);letter-spacing:.5px;text-transform:uppercase;font-family:'DM Mono',monospace;}
-.metric-val{font-family:'DM Mono',monospace;font-size:17.4px;font-weight:600;text-align:right;}
-.greeks-panel{margin:10px 10px 6px;padding:14px 12px;background:linear-gradient(135deg,rgba(100,128,255,.12),rgba(0,200,220,.10));border-radius:14px;border:1px solid rgba(100,128,255,.28);box-shadow:0 4px 20px rgba(100,128,255,.1),inset 0 1px 0 rgba(255,255,255,.06);}
-.greeks-title{font-size:13px;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:rgba(138,160,255,1.0);margin-bottom:10px;padding-bottom:8px;border-bottom:1px solid rgba(100,128,255,.25);display:flex;align-items:center;justify-content:space-between;}
-.greeks-expiry-tag{font-size:12.3px;color:rgba(255,255,255,.5);font-weight:400;letter-spacing:.5px;text-transform:none;}
-.greeks-strike-wrap{position:relative;margin-bottom:10px;}
-.greeks-strike-wrap::after{content:'▼';position:absolute;right:10px;top:50%;transform:translateY(-50%);font-size:11.6px;color:var(--gold);pointer-events:none;z-index:2;}
-.greeks-strike-select{width:100%;appearance:none;-webkit-appearance:none;background:linear-gradient(135deg,rgba(245,197,24,.12),rgba(200,155,10,.06));border:1px solid var(--gold-dim);border-radius:8px;color:var(--gold);font-family:'DM Mono',monospace;font-size:15.9px;font-weight:700;padding:7px 28px 7px 10px;cursor:pointer;outline:none;letter-spacing:.5px;transition:border-color .2s,background .2s,box-shadow .2s;}
-.greeks-strike-select:hover{border-color:rgba(245,197,24,.75);background:linear-gradient(135deg,rgba(245,197,24,.18),rgba(200,155,10,.10));box-shadow:0 0 10px rgba(245,197,24,.18);}
-.greeks-strike-select:focus{border-color:var(--gold);box-shadow:0 0 0 2px rgba(245,197,24,.25);}
-.greeks-strike-select option{background:#0e1225;color:var(--gold);font-weight:700;}
-.greek-name{font-family:'DM Mono',monospace;font-size:15.9px;font-weight:700;letter-spacing:1px;text-transform:uppercase;color:rgba(255,255,255,.92);}
-.greek-sub{font-size:11.6px;color:rgba(255,255,255,.55);margin-top:1px;}
-.greeks-row{display:flex;align-items:center;justify-content:space-between;padding:7px 0;border-bottom:1px solid rgba(255,255,255,.06);}
-.greeks-row:last-child{border-bottom:none;}
-.greeks-atm-badge{display:flex;align-items:center;justify-content:center;gap:6px;background:rgba(100,128,255,.1);border:1px solid rgba(100,128,255,.25);border-radius:8px;padding:5px 8px;margin-bottom:10px;font-family:'DM Mono',monospace;font-size:15.9px;flex-wrap:wrap;}
-.greeks-atm-strike{font-weight:700;color:#8aa0ff;}
-.iv-bar-wrap{display:flex;align-items:center;gap:6px;margin-top:8px;padding-top:8px;border-top:1px solid rgba(255,255,255,.06);}
-.iv-bar-label{font-size:11.6px;color:rgba(255,255,255,.7);letter-spacing:1px;text-transform:uppercase;font-weight:600;width:42px;flex-shrink:0;}
-.iv-bar-track{flex:1;height:4px;background:rgba(255,255,255,.08);border-radius:2px;overflow:hidden;}
-.iv-bar-fill{height:100%;border-radius:2px;transition:width .6s ease;}
-.iv-bar-num{font-family:'DM Mono',monospace;font-size:15.9px;font-weight:700;min-width:38px;text-align:right;}
-.greeks-table-section{padding:22px 28px;border-bottom:1px solid rgba(255,255,255,.05);}
-.greeks-table-wrap{display:grid;grid-template-columns:1fr 1fr;gap:16px;}
-.greeks-tbl{border:1px solid rgba(255,255,255,.07);border-radius:12px;overflow:hidden;}
-.greeks-tbl-head{display:grid;grid-template-columns:90px repeat(4,1fr);background:rgba(255,255,255,.04);padding:8px 14px;border-bottom:1px solid rgba(255,255,255,.06);gap:4px;}
-.greeks-tbl-head-label{font-size:12.3px;letter-spacing:1.5px;text-transform:uppercase;color:rgba(255,255,255,.68);text-align:center;}
-.greeks-tbl-row{display:grid;grid-template-columns:90px repeat(4,1fr);padding:9px 14px;border-bottom:1px solid rgba(255,255,255,.04);align-items:center;gap:4px;transition:background .15s;}
-.greeks-tbl-row:last-child{border-bottom:none;}
-.greeks-tbl-row:hover{background:rgba(255,255,255,.03);}
-.greeks-tbl-strike{font-family:'DM Mono',monospace;font-size:17.4px;font-weight:700;color:rgba(255,255,255,.8);}
-.greeks-tbl-cell{font-family:'DM Mono',monospace;font-size:15.9px;font-weight:600;text-align:center;color:rgba(255,255,255,.65);}
-/* ── Instrument Switcher ─────────────────── */
-.instrument-switcher{display:flex;align-items:center;gap:6px;flex-shrink:0;}
-.inst-btn{padding:5px 14px;border-radius:20px;border:1px solid;cursor:pointer;
-  font-family:var(--fh);font-size:14.5px;font-weight:700;transition:all .2s;background:transparent;
-  letter-spacing:.5px;white-space:nowrap;}
-.inst-btn:hover{opacity:.85;}
-/* Hidden refresh iframe — zero footprint */
-#silentRefreshFrame{position:fixed;width:0;height:0;border:none;visibility:hidden;pointer-events:none;opacity:0;}
-@media(max-width:1024px){
-  .main{grid-template-columns:1fr}
-  .sidebar{position:static;height:auto;border-right:none;border-bottom:1px solid rgba(255,255,255,.06)}
-  .hero{height:auto;flex-wrap:wrap;}
-  .h-gauges{padding:12px 18px;}
-  .h-stats{min-width:100%;border-left:none;border-top:1px solid rgba(255,255,255,.07);}
-  .strikes-wrap{grid-template-columns:1fr}
-  .greeks-table-wrap{grid-template-columns:1fr}
-  .sc-grid{grid-template-columns:repeat(auto-fill,minmax(160px,1fr))}
-  .main-tabs{padding:12px 16px 0;gap:6px;flex-wrap:wrap;}
-  .main-tab{font-size:11px;padding:8px 14px;}
-  .hdr-meta{flex-wrap:wrap;gap:8px;}
-  .logo-wrap{min-width:0;max-width:280px;}
-  .h-eyebrow{white-space:normal;overflow:visible;}
-  .h-sub{white-space:normal;overflow:visible;}
-  .sc-card.expanded{flex-direction:column !important;}
-  .sc-card.expanded .sc-detail{flex:none !important;width:100% !important;border-left:none;border-top:1px solid rgba(0,229,160,.15);}
-}
-@media(max-width:768px){
-  body{font-size:16px;}
-  .h-stat-row{flex-wrap:wrap;gap:8px;}
-  .h-stat{min-width:calc(50% - 8px);}
-  .main-tabs{overflow-x:auto;flex-wrap:nowrap;}
-  .main-tab{white-space:nowrap;}
-  header{flex-wrap:wrap;gap:8px;padding:10px 14px;}
-  .logo-wrap{min-width:0;max-width:200px;height:36px;}
-  .logo-slide{font-size:22px;}
-  .hdr-meta{width:100%;font-size:13px;}
-  .oi-ticker-table{overflow-x:auto;-webkit-overflow-scrolling:touch;}
-  .oi-ticker-hdr,.oi-ticker-row{min-width:560px;}
-  .greeks-tbl{overflow-x:auto;-webkit-overflow-scrolling:touch;}
-  .h-mid{padding:8px 12px;}
-  .h-signal{font-size:24px;}
-  .h-eyebrow{font-size:10px;}
-  .h-sub{font-size:12px;}
-  .pill-track{width:80px;}
-  .sec-sub{margin-left:0;width:100%;}
-  .greeks-table-section{padding:16px 14px;}
-  .sc-tabs{flex-direction:column;gap:8px;}
-  .sc-tabs>div[style]{margin-left:0!important;width:100%;}
-  #expiryDropdown{width:100%;font-size:14px;}
-}
-@media(max-width:640px){
-  header{padding:10px 12px}
-  .section{padding:14px 12px}
-  .kl-dist-row{grid-template-columns:1fr}
-  footer{flex-direction:column;gap:6px}
-  .logo-wrap{min-width:0;max-width:180px;height:32px;}
-  .logo-slide{font-size:20px;}
-  .refresh-countdown{display:none;}
-  .sidebar{display:none;}
-  .sc-grid{grid-template-columns:repeat(auto-fill,minmax(140px,1fr))}
-  .main-tab{font-size:10px;padding:6px 10px;}
-  .h-gauges{padding:10px 12px;gap:8px;}
-  .gauge-wrap{width:76px;height:76px;}
-  .hdr-meta{font-size:11px;gap:6px;}
-  .greeks-table-section{padding:14px 12px;}
-  .greeks-tbl-head,.greeks-tbl-row{grid-template-columns:70px repeat(4,1fr);padding:7px 8px;gap:2px;}
-  .greeks-tbl-head-label,.greeks-tbl-cell{font-size:11px;}
-  .greeks-tbl-strike{font-size:13px;}
-  .sec-title{font-size:13px;letter-spacing:1.5px;margin-bottom:14px;}
-  .sec-sub{font-size:11px;margin-left:0;width:100%;}
-  .h-stat-val{font-size:15px;}
-  .h-stat-lbl{font-size:9px;letter-spacing:1px;}
-  .sc-tabs{gap:6px;margin-bottom:14px;flex-direction:column;}
-  .sc-tabs>div[style]{margin-left:0!important;width:100%!important;}
-  #expiryDropdown{width:100%!important;font-size:13px;padding:6px 10px;}
-  .sc-tab{padding:6px 14px;font-size:15px;}
-  .sc-name{font-size:15px;}
-  .sb-btn{font-size:15px;padding:7px 10px;}
-  .strikes-head{font-size:16px;}
-  .s-table th,.s-table td{padding:8px 10px;font-size:14px;}
-  .oi-ticker-hdr,.oi-ticker-row{min-width:520px;}
-  .metric-lbl{font-size:13px;}
-  .metric-val{font-size:15px;}
-  .h-mid{width:100%;border-left:none;border-top:1px solid rgba(255,255,255,.05);}
-}
-@media(max-width:480px){
-  .sc-grid{grid-template-columns:1fr 1fr;}
-  .gauge-wrap{width:62px;height:62px;}
-  .g-val{font-size:13px;}
-  .g-lbl{font-size:9px;letter-spacing:1px;}
-  .gauge-sep{display:none;}
-  .h-signal{font-size:19px;letter-spacing:.5px;}
-  .h-gauges{gap:4px;padding:8px 10px;}
-  .h-mid{padding:6px 10px;}
-  .h-sub{font-size:11px;}
-  .greeks-tbl-head,.greeks-tbl-row{grid-template-columns:56px repeat(4,1fr);padding:6px 6px;gap:2px;}
-  .greeks-tbl-head-label,.greeks-tbl-cell{font-size:10px;}
-  .greeks-tbl-strike{font-size:11px;}
-  .section{padding:12px 10px;}
-  .sec-title{font-size:12px;letter-spacing:1px;}
-  .h-stat{min-width:calc(50% - 4px);}
-  .h-stat-val{font-size:14px;}
-  .h-stat-lbl{font-size:8px;letter-spacing:.8px;}
-  .pill-lbl{width:68px;font-size:9px;letter-spacing:1px;}
-  .pill-num{font-size:12px;margin-left:4px;}
-  .pill-track{width:64px;}
-  .pill-dot{width:6px;height:6px;}
-  .sb-btn{font-size:14px;padding:6px 10px;}
-  .sb-lbl{font-size:11px;}
-  .sb-badge{font-size:12px;}
-  .main-tabs{padding:8px 10px 0;gap:4px;}
-  .main-tab{font-size:9px;padding:5px 8px;}
-  .strikes-wrap{gap:10px;}
-  .s-table th,.s-table td{padding:7px 8px;font-size:13px;}
-  footer{padding:12px 10px;font-size:13px;}
-  .sc-name{font-size:14px;padding-right:36px;}
-  .sc-legs{font-size:11px;}
-  .sc-tag{font-size:11px;}
-  .sc-pop-badge{font-size:12px;padding:2px 6px;}
-  .kl-lbl{font-size:12px;}
-  .kl-val{font-size:14px;}
-  .kl-dist-box{padding:8px 10px;font-size:14px;}
-  .greeks-panel{margin:6px 6px 4px;padding:10px 10px;}
-  .greeks-row{padding:5px 0;}
-  .greek-name{font-size:13px;}
-  .greek-sub{font-size:10px;}
-  .greeks-atm-badge{font-size:13px;padding:4px 6px;}
-  .iv-bar-label{font-size:10px;width:34px;}
-  .iv-bar-num{font-size:13px;min-width:32px;}
-  .sc-desc{font-size:13px;padding:10px 10px 6px;}
-  .metric-lbl{font-size:12px;}
-  .metric-val{font-size:14px;}
-  .oi-ticker-hdr,.oi-ticker-row{min-width:480px;}
-  .sc-card.expanded .sc-detail{width:100% !important;}
-  .logo-wrap{min-width:0;max-width:160px;height:30px;}
-  .logo-slide{font-size:18px;}
-  #smartPopLegend{flex-direction:column;}
-  .hdr-meta>span:not(:first-child):not(:last-child){display:none;}
-  .sc-card.expanded .sc-detail{overflow-x:auto;-webkit-overflow-scrolling:touch;}
-}
-@media(max-width:380px){
-  .sc-grid{grid-template-columns:1fr;}
-  .gauge-wrap{width:54px;height:54px;}
-  .g-val{font-size:11px;}
-  .g-lbl{font-size:8px;}
-  .h-signal{font-size:16px;}
-  .h-gauges{gap:2px;padding:6px 8px;}
-  .section{padding:10px 8px;}
-  .h-stat{min-width:calc(50% - 2px);}
-  .h-stat-val{font-size:13px;}
-  .h-stat-lbl{font-size:7px;}
-  .s-table th,.s-table td{padding:6px 6px;font-size:12px;}
-  .sc-name{font-size:13px;}
-  .sc-legs{font-size:10px;}
-  .sc-pop-badge{font-size:11px;padding:2px 5px;}
-  .main-tab{font-size:8px;padding:4px 6px;}
-  .kl-val{font-size:12px;}
-  .kl-lbl{font-size:11px;}
-  header{padding:8px 10px;}
-  footer{padding:10px 8px;font-size:12px;}
-  #smartPopLegend>div{flex-direction:column;}
-  .oi-ticker-hdr,.oi-ticker-row{min-width:420px;}
-}
 """
 
-# =================================================================
-#  SECTION 9 -- ANIMATED JS  (v18.3 — SILENT BACKGROUND REFRESH)
-# =================================================================
+    def _market_direction_widget_html(self):
+        d          = self.html_data
+        bias       = d['bias']
+        confidence = d['confidence']
+        bull_score = d['bullish_score']
+        bear_score = d['bearish_score']
 
-ANIMATED_JS = """
+        if bias == 'BULLISH':
+            dir_gradient  = 'linear-gradient(135deg,#00ff88,#00d4ff)'
+            needle_rotate = '-60'
+            widget_border = 'rgba(0,255,136,0.3)'
+            top_line      = 'rgba(0,255,136,0.8)'
+            pulse_color   = '#00ff88'
+            score_color   = '#00ff88'
+        elif bias == 'WATCH BULL':
+            dir_gradient  = 'linear-gradient(135deg,#b5ea3a,#00d4ff)'
+            needle_rotate = '-30'
+            widget_border = 'rgba(181,234,58,0.35)'
+            top_line      = 'rgba(181,234,58,0.8)'
+            pulse_color   = '#b5ea3a'
+            score_color   = '#b5ea3a'
+        elif bias == 'WATCH BEAR':
+            dir_gradient  = 'linear-gradient(135deg,#ff9800,#ff3355)'
+            needle_rotate = '30'
+            widget_border = 'rgba(255,152,0,0.35)'
+            top_line      = 'rgba(255,152,0,0.8)'
+            pulse_color   = '#ff9800'
+            score_color   = '#ff9800'
+        elif bias == 'BEARISH':
+            dir_gradient  = 'linear-gradient(135deg,#ff3355,#ff9900)'
+            needle_rotate = '60'
+            widget_border = 'rgba(255,51,85,0.3)'
+            top_line      = 'rgba(255,51,85,0.8)'
+            pulse_color   = '#ff3355'
+            score_color   = '#ff5252'
+        else:
+            dir_gradient  = 'linear-gradient(135deg,#ffcd3c,#f7931e)'
+            needle_rotate = '0'
+            widget_border = 'rgba(255,183,77,0.3)'
+            top_line      = 'rgba(255,183,77,0.8)'
+            pulse_color   = '#ffb74d'
+            score_color   = '#ffb74d'
+
+        total_score = bull_score - bear_score
+        score_sign  = '+' if total_score > 0 else ''
+        conf_cls    = ('md-pill-conf-high' if confidence == 'HIGH' else
+                       'md-pill-conf-med'  if confidence == 'MEDIUM' else 'md-pill-conf-low')
+
+        # ── Signal breakdown rows ────────────────────────────────────────────
+        signals_meta = [
+            ('SMA 20',  d.get('sma_20_above'),  'sma'),
+            ('SMA 50',  d.get('sma_50_above'),  'sma'),
+            ('SMA 200', d.get('sma_200_above'), 'sma'),
+            ('RSI',     None,                   'rsi'),
+            ('MACD',    d.get('macd_bullish'),  'macd'),
+            ('PCR',     None,                   'pcr'),
+        ]
+        sig_rows_html = ''
+        for name, is_bull, kind in signals_meta:
+            if kind == 'rsi':
+                rsi = d.get('rsi', 50)
+                is_bull = rsi < 40; is_bear = rsi > 70
+                score_val = '+1' if is_bull else ('-1' if is_bear else '0')
+                bar_w = 45 if not is_bull and not is_bear else 80
+                bar_cls = 'bull' if is_bull else ('bear' if is_bear else 'neutral')
+                val_col = '#00ff88' if is_bull else ('#ff5252' if is_bear else '#ffb74d')
+            elif kind == 'pcr':
+                pcr = d.get('pcr', 1.0)
+                is_bull = pcr > 1.1; is_bear = pcr < 0.9
+                score_val = '+1' if is_bull else ('-1' if is_bear else '0')
+                bar_w = 45 if not is_bull and not is_bear else 85
+                bar_cls = 'bull' if is_bull else ('bear' if is_bear else 'neutral')
+                val_col = '#00ff88' if is_bull else ('#ff5252' if is_bear else '#ffb74d')
+            else:
+                score_val = '+1' if is_bull else '-1'
+                bar_w = 80; bar_cls = 'bull' if is_bull else 'bear'
+                val_col = '#00ff88' if is_bull else '#ff5252'
+            bar_color_css = (
+                'linear-gradient(90deg,#00ff88,#00d4ff)' if bar_cls == 'bull' else
+                'linear-gradient(90deg,#ff3355,#ff6680)' if bar_cls == 'bear' else
+                'linear-gradient(90deg,#ffb74d,#ffdd66)'
+            )
+            sig_rows_html += f"""
+            <div style="display:flex;align-items:center;gap:8px;">
+              <span style="font-size:9px;letter-spacing:1px;color:rgba(180,210,230,0.55);width:48px;text-align:right;flex-shrink:0;">{name}</span>
+              <div style="flex:1;height:5px;background:rgba(0,0,0,0.4);border-radius:3px;overflow:hidden;">
+                <div style="height:100%;width:{bar_w}%;border-radius:3px;background:{bar_color_css};"></div>
+              </div>
+              <span style="font-family:'JetBrains Mono',monospace;font-size:10px;font-weight:700;color:{val_col};width:22px;flex-shrink:0;">{score_val}</span>
+            </div>"""
+
+        # ── SVG needle angle: bear_score−bull_score mapped to ±80deg ────────
+        max_s       = max(bull_score + bear_score, 1)
+        needle_deg  = round(max(-80, min(80, (bear_score - bull_score) / max_s * 80)))
+
+        # ── Confidence dots ──────────────────────────────────────────────────
+        filled = 5 if confidence == 'HIGH' else 3 if confidence == 'MEDIUM' else 1
+        dots_html = (
+            ''.join(f'<div style="width:9px;height:9px;border-radius:50%;background:{pulse_color};box-shadow:0 0 6px {pulse_color};"></div>' for _ in range(filled)) +
+            ''.join(f'<div style="width:9px;height:9px;border-radius:50%;background:rgba(255,255,255,0.08);border:1px solid rgba(255,255,255,0.1);"></div>' for _ in range(5 - filled))
+        )
+
+        # ── Neutral S1/R1 panel (only shown when bias is NEUTRAL) ───────────
+        if bias not in ('BULLISH', 'BEARISH'):
+            cp        = float(d.get('current_price') or 0)
+            s1        = float(d['support'])    if d.get('support')    is not None else 0.0
+            r1        = float(d['resistance']) if d.get('resistance') is not None else 0.0
+            pts_to_s1 = round(cp - s1)   if s1 > 0 else None
+            pts_to_r1 = round(r1 - cp)   if r1 > 0 else None
+            # Proximity hint: which level is price closer to?
+            if pts_to_s1 is not None and pts_to_r1 is not None:
+                if pts_to_s1 < pts_to_r1:
+                    proximity_hint = '&#9660; Closer to S1 — watch for bounce or breakdown'
+                    hint_col = '#00e676'
+                elif pts_to_r1 < pts_to_s1:
+                    proximity_hint = '&#9650; Closer to R1 — watch for breakout or rejection'
+                    hint_col = '#ff4d6d'
+                else:
+                    proximity_hint = '&#8596; Midway between S1 and R1'
+                    hint_col = '#ffb74d'
+            else:
+                proximity_hint = ''
+                hint_col = '#ffb74d'
+            dist_s1_html = (f'<span style="font-size:9px;color:rgba(0,230,118,0.55);">{pts_to_s1} pts away</span>'
+                            if pts_to_s1 is not None else '')
+            dist_r1_html = (f'<span style="font-size:9px;color:rgba(255,77,109,0.55);">{pts_to_r1} pts away</span>'
+                            if pts_to_r1 is not None else '')
+            s1_display = f'&#8377;{s1:,.0f}' if s1 > 0 else 'N/A'
+            r1_display = f'&#8377;{r1:,.0f}' if r1 > 0 else 'N/A'
+            neutral_sr_html = f"""
+                <div style="margin-top:6px;width:100%;display:flex;align-items:center;gap:6px;justify-content:center;flex-wrap:wrap;">
+                  <div style="display:flex;align-items:center;gap:5px;padding:4px 10px;border-radius:6px;
+                    background:rgba(0,230,118,0.07);border:1px solid rgba(0,230,118,0.2);">
+                    <span style="font-size:8px;font-weight:700;color:rgba(0,230,118,0.6);letter-spacing:1px;">S1</span>
+                    <span style="font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:700;color:#00e676;">{s1_display}</span>
+                    {f'<span style="font-size:8px;color:rgba(0,230,118,0.45);">{pts_to_s1}pt</span>' if pts_to_s1 else ''}
+                  </div>
+                  <span style="font-size:9px;color:rgba(120,160,180,0.3);">·</span>
+                  <div style="display:flex;align-items:center;gap:5px;padding:4px 10px;border-radius:6px;
+                    background:rgba(255,77,109,0.07);border:1px solid rgba(255,77,109,0.2);">
+                    <span style="font-size:8px;font-weight:700;color:rgba(255,77,109,0.6);letter-spacing:1px;">R1</span>
+                    <span style="font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:700;color:#ff4d6d;">{r1_display}</span>
+                    {f'<span style="font-size:8px;color:rgba(255,77,109,0.45);">{pts_to_r1}pt</span>' if pts_to_r1 else ''}
+                  </div>
+                  <div style="width:100%;text-align:center;font-size:8px;font-family:'JetBrains Mono',monospace;
+                    color:{hint_col};opacity:0.75;margin-top:2px;">{proximity_hint}</div>
+                </div>"""
+        else:
+            neutral_sr_html = ''  # Not NEUTRAL — show nothing
+
+        return f"""
+    <div class="section">
+        <div class="section-title"><span>&#129517;</span> MARKET DIRECTION (Algorithmic)</div>
+
+        <!-- Price Ticker Strip — compact -->
+        <div style="background:linear-gradient(135deg,rgba(8,24,44,0.95),rgba(4,14,26,0.98));
+          border:1px solid {widget_border};border-radius:14px;padding:8px 16px;
+          display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;
+          margin-bottom:12px;position:relative;overflow:hidden;">
+          <div style="position:absolute;top:0;left:0;right:0;height:2px;
+            background:linear-gradient(90deg,transparent,{top_line},transparent);"></div>
+          <div>
+            <div style="font-family:'JetBrains Mono',monospace;font-size:7px;letter-spacing:2px;
+              color:rgba(120,160,180,0.45);text-transform:uppercase;margin-bottom:2px;">BANKNIFTY · SPOT PRICE</div>
+            <div style="display:flex;align-items:baseline;gap:10px;">
+              <span style="font-family:'Orbitron',monospace;font-size:clamp(18px,2.8vw,26px);font-weight:900;
+                color:{score_color};line-height:1;">&#8377;{d['current_price']:,.2f}</span>
+              <span style="font-family:'JetBrains Mono',monospace;font-size:11px;color:rgba(180,210,230,0.5);">
+                ATM &#8377;{d['atm_strike']:,} &nbsp;·&nbsp; {d.get('expiry','N/A')}</span>
+            </div>
+          </div>
+          <div style="display:flex;gap:16px;flex-wrap:wrap;">
+            {''.join([
+              f'<div style="text-align:center;">'
+              f'<div style="font-family:JetBrains Mono,monospace;font-size:7px;letter-spacing:1.5px;'
+              f'color:rgba(120,160,180,0.4);text-transform:uppercase;margin-bottom:2px;">{lbl}</div>'
+              f'<div style="font-family:Orbitron,monospace;font-size:12px;font-weight:700;color:{col};">{val}</div>'
+              f'</div>'
+              for lbl, val, col in [
+                ('PCR (OI)', f"{d.get('pcr',0):.3f}" if d.get('has_option_data') else 'N/A',
+                 '#ff5252' if d.get('pcr',1)<0.9 else '#00e676' if d.get('pcr',1)>1.1 else '#ffb74d'),
+                ('Max Pain', f"&#8377;{d.get('max_pain',0):,}" if d.get('has_option_data') else 'N/A', '#ffb74d'),
+                ('RSI (14)', f"{d.get('rsi',0):.1f}", '#ffb74d'),
+                ('MACD', 'Bullish' if d.get('macd_bullish') else 'Bearish',
+                 '#00e676' if d.get('macd_bullish') else '#ff5252'),
+              ]
+            ])}
+          </div>
+        </div>
+
+        <!-- Main Direction Widget -->
+        <div class="md-widget" style="border-color:{widget_border};">
+            <div class="md-glow"></div>
+            <div class="md-row-top">
+                <div class="md-label">
+                  <div class="md-live-dot" style="background:{pulse_color};box-shadow:0 0 8px {pulse_color};"></div>
+                  MARKET DIRECTION &nbsp;·&nbsp; ALGORITHMIC
+                </div>
+                <div class="md-pills-top">
+                  <span class="md-pill md-pill-bull">BULL {bull_score}</span>
+                  <span class="md-pill md-pill-bear">BEAR {bear_score}</span>
+                  <span class="md-pill {conf_cls}">{confidence} CONFIDENCE</span>
+                </div>
+            </div>
+
+            <!-- Direction + Dial + Signals grid — compact -->
+            <div style="display:grid;grid-template-columns:1fr auto 1fr;gap:12px;align-items:center;margin-top:8px;">
+
+              <!-- Left: Direction label + score + confidence dots -->
+              <div style="display:flex;flex-direction:column;gap:5px;">
+                <div class="md-direction" style="background:{dir_gradient};
+                  -webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;">
+                  {bias}</div>
+                <div style="font-family:'JetBrains Mono',monospace;font-size:10px;color:rgba(180,210,230,0.4);">
+                  Score: <span style="color:{score_color};font-weight:700;">{score_sign}{total_score}</span>
+                  / {bull_score + bear_score} signals
+                </div>
+                <div style="display:flex;align-items:center;gap:5px;">
+                  <span style="font-family:'JetBrains Mono',monospace;font-size:7px;letter-spacing:2px;
+                    color:rgba(120,160,180,0.35);text-transform:uppercase;">Conf</span>
+                  {dots_html}
+                </div>
+              </div>
+
+              <!-- Centre: SVG Sentiment Dial — smaller -->
+              <div style="display:flex;flex-direction:column;align-items:center;gap:2px;">
+                <div style="font-family:'JetBrains Mono',monospace;font-size:7px;letter-spacing:1.5px;
+                  color:rgba(120,160,180,0.35);text-transform:uppercase;">Sentiment</div>
+                <svg width="110" height="65" viewBox="0 0 160 95" style="overflow:visible;">
+                  <defs>
+                    <linearGradient id="gaugeGradMD" x1="0%" y1="0%" x2="100%" y2="0%">
+                      <stop offset="0%" stop-color="#00ff88"/>
+                      <stop offset="45%" stop-color="#ffaa00"/>
+                      <stop offset="100%" stop-color="#ff3355"/>
+                    </linearGradient>
+                  </defs>
+                  <path d="M 15 82 A 65 65 0 0 1 145 82" fill="none"
+                    stroke="rgba(255,255,255,0.06)" stroke-width="10" stroke-linecap="round"/>
+                  <path d="M 15 82 A 65 65 0 0 1 145 82" fill="none"
+                    stroke="url(#gaugeGradMD)" stroke-width="10" stroke-linecap="round" opacity="0.65"/>
+                  <g style="transform:rotate({needle_deg}deg);transform-origin:80px 82px;">
+                    <line x1="80" y1="82" x2="80" y2="28" stroke="{score_color}"
+                      stroke-width="2.5" stroke-linecap="round"/>
+                    <circle cx="80" cy="82" r="6" fill="{score_color}"
+                      stroke="rgba(2,12,20,0.9)" stroke-width="2"/>
+                    <circle cx="80" cy="82" r="2.5" fill="white"/>
+                  </g>
+                  <text x="10" y="96" fill="#00ff88" font-size="8"
+                    font-family="JetBrains Mono" font-weight="700">BULL</text>
+                  <text x="126" y="96" fill="#ff3355" font-size="8"
+                    font-family="JetBrains Mono" font-weight="700">BEAR</text>
+                </svg>
+                <div style="text-align:center;margin-top:-2px;">
+                  <div style="font-family:'Orbitron',monospace;font-size:18px;font-weight:900;
+                    color:{score_color};line-height:1;">{score_sign}{total_score}</div>
+                  <div style="font-family:'JetBrains Mono',monospace;font-size:7px;letter-spacing:1.5px;
+                    color:rgba(120,160,180,0.35);text-transform:uppercase;">Score</div>
+                </div>
+                {neutral_sr_html}
+              </div>
+
+              <!-- Right: Signal breakdown bars — compact gaps -->
+              <div style="display:flex;flex-direction:column;gap:5px;">
+                <div style="font-family:'JetBrains Mono',monospace;font-size:7px;letter-spacing:1.5px;
+                  color:rgba(120,160,180,0.4);text-transform:uppercase;margin-bottom:2px;">
+                  Signal Breakdown</div>
+                {sig_rows_html}
+              </div>
+            </div>
+        </div>
+
+        <!-- Scoring logic — compact single line -->
+        <div style="margin-top:10px;padding:7px 14px;background:rgba(0,0,0,0.2);border:1px solid rgba(79,195,247,0.07);
+          border-radius:8px;display:flex;gap:16px;flex-wrap:wrap;align-items:center;">
+            <span style="font-family:'JetBrains Mono',monospace;font-size:8px;letter-spacing:1.5px;
+              color:rgba(79,195,247,0.5);text-transform:uppercase;font-weight:700;flex-shrink:0;">Scoring Logic</span>
+            <span style="font-size:9px;color:rgba(176,190,197,0.5);"><span style="color:#00ff88;font-weight:700;">BULLISH</span> &nbsp;Diff &ge; +3</span>
+            <span style="font-size:9px;color:rgba(176,190,197,0.5);"><span style="color:#ff5252;font-weight:700;">BEARISH</span> &nbsp;Diff &le; &minus;3</span>
+            <span style="font-size:9px;color:rgba(176,190,197,0.5);"><span style="color:#ffb74d;font-weight:700;">SIDEWAYS</span> &nbsp;&minus;2 to +2</span>
+            <span style="font-size:9px;color:rgba(176,190,197,0.5);"><span style="color:#4fc3f7;font-weight:700;">CONF</span> &nbsp;HIGH &ge; 4 gap &nbsp;&middot;&nbsp; OI: ATM &plusmn;10 only</span>
+        </div>
+    </div>
+"""
+
+    def _fiidii_section_html(self):
+        data = self.html_data['fii_dii_data']
+        summ = self.html_data['fii_dii_summ']
+        badge_map = {
+            'fii-bull':  ('#00e676','rgba(0,230,118,0.12)','rgba(0,230,118,0.3)'),
+            'fii-cbull': ('#69f0ae','rgba(105,240,174,0.10)','rgba(105,240,174,0.28)'),
+            'fii-neu':   ('#ffd740','rgba(255,215,64,0.10)','rgba(255,215,64,0.28)'),
+            'fii-bear':  ('#ff5252','rgba(255,82,82,0.10)','rgba(255,82,82,0.28)'),
+        }
+        s_color,s_bg,s_border = badge_map.get(summ['badge_cls'],badge_map['fii-neu'])
+        is_fallback = any(r.get('fallback') for r in data)
+        date_range  = f"{data[0]['date']} \u2013 {data[-1]['date']}" if data else ''
+        data_src_html = ('<span class="pf-live-badge pf-estimated">\u26a0 ESTIMATED</span>'
+                         if is_fallback else '<span class="pf-live-badge pf-live">\u25cf LIVE</span>')
+        max_abs = summ['max_abs'] or 1
+
+        # ── Avg values ────────────────────────────────────────────────────
+        fa=summ['fii_avg']; da=summ['dii_avg']; na=summ['net_avg']
+        fs='+' if fa>=0 else ''; ds='+' if da>=0 else ''; ns='+' if na>=0 else ''
+        fc='#00d4ff' if fa>=0 else '#ff4444'
+        dc='#ffb300' if da>=0 else '#ff4444'
+        nc='#c084fc' if na>=0 else '#f87171'
+
+        # ── FII bar width (capped at 100%) ────────────────────────────────
+        fii_bar_w = round(min(100, abs(fa) / max_abs * 100), 1)
+        dii_bar_w = round(min(100, abs(da) / max_abs * 100), 1)
+        fii_bar_col = '#ff4444' if fa < 0 else '#00d4ff'
+        dii_bar_col = '#ffb300' if da >= 0 else '#ff4444'
+
+        # ── Daily dot chips (10 days) ─────────────────────────────────────
+        dots_html = ''
+        for row in data:
+            net_v = row['fii'] + row['dii']
+            dot_col  = '#00e676' if net_v >= 0 else '#ff4757'
+            dot_bg   = 'rgba(0,230,118,0.15)' if net_v >= 0 else 'rgba(255,71,87,0.15)'
+            dot_bdr  = 'rgba(0,230,118,0.3)'  if net_v >= 0 else 'rgba(255,71,87,0.3)'
+            net_sign = '+' if net_v >= 0 else ''
+            net_fmt  = f"{net_v/1000:+.1f}k" if abs(net_v) >= 1000 else f"{net_sign}{net_v:.0f}"
+            dots_html += (
+                f'<div class="pf2-dot" style="border-color:{dot_bdr};background:{dot_bg};">'
+                f'<div class="pf2-dot-date">{row["date"].split(" ")[1]}</div>'
+                f'<div class="pf2-dot-net" style="color:{dot_col};">{net_fmt}</div>'
+                f'</div>'
+            )
+
+        verdict_badge = (f'<span class="pf-verdict-badge" style="color:{s_color};background:{s_bg};border:1px solid {s_border};">'
+                         f'{summ["emoji"]} {summ["label"]}</span>')
+        n_days = len(data)
+
+        return f"""
+<div class="section">
+    <div class="section-title">
+        <span>&#127982;</span> FII / DII INSTITUTIONAL FLOW
+        {data_src_html}
+        <span class="pf-date-range">Last {n_days} Trading Days &nbsp;&middot;&nbsp; {date_range}</span>
+    </div>
+
+    <!-- FII Flow Meter -->
+    <div class="pf2-meter-row">
+        <div class="pf2-meter-head">
+            <div class="pf2-meter-labels">
+                <span class="pf2-lbl">FII</span>
+                <span class="pf2-sublbl">{('Sellers' if fa < 0 else 'Buyers')}</span>
+            </div>
+            <span class="pf2-val" style="color:{fc};">{fs}{fa:,.0f} <span class="pf2-unit">Cr/day avg</span></span>
+        </div>
+        <div class="pf2-track">
+            <div class="pf2-fill" style="width:{fii_bar_w}%;background:{fii_bar_col};{'float:right;' if fa < 0 else ''}"></div>
+        </div>
+    </div>
+
+    <!-- DII Flow Meter -->
+    <div class="pf2-meter-row">
+        <div class="pf2-meter-head">
+            <div class="pf2-meter-labels">
+                <span class="pf2-lbl">DII</span>
+                <span class="pf2-sublbl">{('Buyers' if da >= 0 else 'Sellers')}</span>
+            </div>
+            <span class="pf2-val" style="color:{dc};">{ds}{da:,.0f} <span class="pf2-unit">Cr/day avg</span></span>
+        </div>
+        <div class="pf2-track">
+            <div class="pf2-fill" style="width:{dii_bar_w}%;background:{dii_bar_col};"></div>
+        </div>
+    </div>
+
+    <!-- Daily net dot chips -->
+    <div class="pf2-dots-wrap">{dots_html}</div>
+
+    <!-- Avg strip -->
+    <div class="pf-avg-strip">
+        <div class="pf-avg-cell">
+            <div class="pf-avg-eyebrow">FII {n_days}D Avg</div>
+            <div class="pf-avg-val" style="color:{fc};">{fs}{fa:,.0f}</div>
+            <div class="pf-avg-unit">&#8377; Cr / day</div>
+        </div>
+        <div class="pf-avg-sep"></div>
+        <div class="pf-avg-cell">
+            <div class="pf-avg-eyebrow">DII {n_days}D Avg</div>
+            <div class="pf-avg-val" style="color:{dc};">{ds}{da:,.0f}</div>
+            <div class="pf-avg-unit">&#8377; Cr / day</div>
+        </div>
+        <div class="pf-avg-sep"></div>
+        <div class="pf-avg-cell">
+            <div class="pf-avg-eyebrow">Net Combined</div>
+            <div class="pf-avg-val" style="color:{nc};">{ns}{na:,.0f}</div>
+            <div class="pf-avg-unit">&#8377; Cr / day</div>
+        </div>
+    </div>
+
+    <!-- Insight box -->
+    <div class="pf-insight-box" style="background:{s_bg};border:1px solid {s_border};">
+        <div class="pf-insight-header">
+            <span class="pf-insight-lbl" style="color:{s_color};">&#128202; {n_days}-DAY INSIGHT &amp; DIRECTION</span>
+            {verdict_badge}
+        </div>
+        <div class="pf-insight-text">{summ['insight']}</div>
+    </div>
+</div>
+"""
+
+    def _oi_navy_command_section(self, d):
+        oi_cls=d['oi_class']; direction=d['oi_direction']; signal=d['oi_signal']
+        ce_raw=d['total_ce_oi_change']; pe_raw=d['total_pe_oi_change']
+        bull_force=0; bear_force=0
+        if ce_raw < 0: bull_force += abs(ce_raw)
+        else:          bear_force += abs(ce_raw)
+        if pe_raw > 0: bull_force += abs(pe_raw)
+        else:          bear_force += abs(pe_raw)
+        total_force=bull_force+bear_force
+        bull_pct=round(bull_force/total_force*100) if total_force>0 else 50
+        bear_pct=100-bull_pct
+        if oi_cls=='bearish':
+            dir_bg='rgba(30,10,14,0.92)';dir_border='rgba(239,68,68,0.35)';dir_left_bar='linear-gradient(180deg,#ef4444,#b91c1c)';dir_name_col='#fb7185';dir_desc_col='rgba(251,113,133,0.5)'
+        elif oi_cls=='bullish':
+            dir_bg='rgba(10,30,20,0.92)';dir_border='rgba(16,185,129,0.35)';dir_left_bar='linear-gradient(180deg,#10b981,#047857)';dir_name_col='#34d399';dir_desc_col='rgba(52,211,153,0.5)'
+        else:
+            dir_bg='rgba(20,20,10,0.92)';dir_border='rgba(251,191,36,0.3)';dir_left_bar='linear-gradient(180deg,#f59e0b,#d97706)';dir_name_col='#fbbf24';dir_desc_col='rgba(251,191,36,0.5)'
+        ce_val=d['total_ce_oi_change']; pe_val=d['total_pe_oi_change']; net_val=d['net_oi_change']
+        ce_is_bear=ce_val>0; pe_is_bull=pe_val>0
+        ce_col='#fb7185' if ce_is_bear else '#34d399'; ce_dot_col='#ef4444' if ce_is_bear else '#10b981'
+        ce_lbl='Bearish Signal' if ce_is_bear else 'Bullish Signal'; ce_btn_col='#ef4444' if ce_is_bear else '#10b981'
+        ce_btn_bg='rgba(239,68,68,0.12)' if ce_is_bear else 'rgba(16,185,129,0.12)'; ce_btn_bdr='rgba(239,68,68,0.4)' if ce_is_bear else 'rgba(16,185,129,0.4)'
+        pe_col='#34d399' if pe_is_bull else '#fb7185'; pe_dot_col='#10b981' if pe_is_bull else '#ef4444'
+        pe_lbl='Bullish Signal' if pe_is_bull else 'Bearish Signal'; pe_btn_col='#10b981' if pe_is_bull else '#ef4444'
+        pe_btn_bg='rgba(16,185,129,0.12)' if pe_is_bull else 'rgba(239,68,68,0.12)'; pe_btn_bdr='rgba(16,185,129,0.4)' if pe_is_bull else 'rgba(239,68,68,0.4)'
+        if net_val > 0: net_col='#fb7185';net_dot_col='#ef4444';net_lbl='Bearish Net';net_btn_col='#ef4444';net_btn_bg='rgba(239,68,68,0.12)';net_btn_bdr='rgba(239,68,68,0.4)'
+        elif net_val < 0: net_col='#34d399';net_dot_col='#10b981';net_lbl='Bullish Net';net_btn_col='#10b981';net_btn_bg='rgba(16,185,129,0.12)';net_btn_bdr='rgba(16,185,129,0.4)'
+        else: net_col='#fbbf24';net_dot_col='#f59e0b';net_lbl='Balanced';net_btn_col='#f59e0b';net_btn_bg='rgba(245,158,11,0.12)';net_btn_bdr='rgba(245,158,11,0.4)'
+        def nc_card(label,idc,value,val_col,sub,btn_lbl,btn_col,btn_bg,btn_bdr,icon_char):
+            return (f'<div class="nc-card"><div class="nc-card-header">'
+                    f'<span class="nc-card-label">{label}</span><span style="font-size:18px;line-height:1;color:{idc};">{icon_char}</span></div>'
+                    f'<div class="nc-card-value" style="color:{val_col};">{value:+,}</div>'
+                    f'<div class="nc-card-sub">{sub}</div>'
+                    f'<div class="nc-card-btn" style="color:{btn_col};background:{btn_bg};border:1px solid {btn_bdr};">{btn_lbl}</div></div>')
+        cards_html = (
+            nc_card('CALL OI CHANGE',ce_dot_col,ce_val,ce_col,'CE open interest \u0394',ce_lbl,ce_btn_col,ce_btn_bg,ce_btn_bdr,'🔴' if ce_is_bear else '🟢') +
+            nc_card('PUT OI CHANGE',pe_dot_col,pe_val,pe_col,'PE open interest \u0394',pe_lbl,pe_btn_col,pe_btn_bg,pe_btn_bdr,'🟢' if pe_is_bull else '🔴') +
+            nc_card('NET OI CHANGE',net_dot_col,net_val,net_col,'CE \u0394 \u2212 PE \u0394',net_lbl,net_btn_col,net_btn_bg,net_btn_bdr,'\u2696\ufe0f')
+        )
+        dual_meters = (
+            f'<div class="nc-meters-panel">'
+            f'<div class="nc-meter-row"><div class="nc-meter-head-row"><span class="nc-meter-label">\U0001f7e2 Bull Strength</span><span class="nc-meter-pct" style="color:#34d399;">{bull_pct}%</span></div>'
+            f'<div class="nc-meter-track"><div class="nc-meter-fill" style="width:{bull_pct}%;background:linear-gradient(90deg,#10b981,#34d399);"></div>'
+            f'<div class="nc-meter-head" style="left:{bull_pct}%;background:#34d399;box-shadow:0 0 8px #34d399;"></div></div></div>'
+            f'<div class="nc-meter-row"><div class="nc-meter-head-row"><span class="nc-meter-label">\U0001f534 Bear Strength</span><span class="nc-meter-pct" style="color:#fb7185;">{bear_pct}%</span></div>'
+            f'<div class="nc-meter-track"><div class="nc-meter-fill" style="width:{bear_pct}%;background:linear-gradient(90deg,#ef4444,#f97316);"></div>'
+            f'<div class="nc-meter-head" style="left:{bear_pct}%;background:#fb7185;box-shadow:0 0 8px #fb7185;"></div></div></div></div>'
+        )
+        # ── Compact single-row OI widget (space-saving redesign) ──
+        # All values (ce_val, pe_val, net_val, direction, signal,
+        # bull_pct, bear_pct, dir_name_col, dir_desc_col) come from
+        # the logic above — nothing changed there.
+        return f"""
+<style>
+/* ── OI Navy Command — responsive ── */
+.nc-wrap {{
+    background:#090f1c;
+    border:1px solid rgba(0,200,255,0.1);
+    border-radius:12px;
+    overflow:hidden;
+    font-family:'JetBrains Mono',monospace;
+}}
+.nc-header {{
+    display:flex;align-items:center;justify-content:space-between;
+    padding:8px 14px;
+    background:rgba(0,0,0,0.35);
+    border-bottom:1px solid rgba(0,200,255,0.08);
+    flex-wrap:wrap;gap:6px;
+}}
+.nc-header-left {{display:flex;align-items:center;gap:8px;flex-wrap:wrap;}}
+.nc-header-title {{font-size:15px;font-weight:700;color:#e2eaf5;letter-spacing:.5px;}}
+.nc-header-sub {{font-size:12px;color:#a8c4d8;letter-spacing:1px;}}
+.nc-atm-badge {{
+    font-size:9px;letter-spacing:1.5px;white-space:nowrap;
+    background:rgba(0,212,255,0.08);border:1px solid rgba(0,212,255,0.2);
+    color:#00d4ff;padding:3px 10px;border-radius:5px;
+}}
+/* Desktop: single row — direction+bars merged | divider | CE | PE | Net */
+.nc-grid {{
+    display:grid;
+    grid-template-columns:2.2fr 1px minmax(0,1fr) minmax(0,1fr) minmax(0,1fr);
+    min-height:90px;
+}}
+.nc-divider {{background:rgba(0,200,255,0.08);}}
+
+/* Direction+bars unified cell — left:text  right:bars */
+.nc-dir-cell {{
+    padding:14px 18px;
+    border-left:3px solid {dir_name_col};
+    display:flex;flex-direction:row;align-items:center;gap:0;
+}}
+.nc-dir-text {{
+    display:flex;flex-direction:column;justify-content:center;gap:3px;
+    flex:0 0 auto; min-width:140px;
+}}
+.nc-dir-label {{font-size:10px;letter-spacing:1.5px;color:{dir_desc_col};text-transform:uppercase;}}
+.nc-dir-name {{
+    font-family:'Orbitron',monospace;font-size:22px;font-weight:900;
+    color:{dir_name_col};text-shadow:0 0 18px {dir_name_col}77;line-height:1.2;
+}}
+.nc-dir-sig {{font-size:11px;color:{dir_desc_col};letter-spacing:.3px;margin-top:2px;}}
+
+/* Bars block — fills remaining space of direction cell */
+.nc-bars-block {{
+    flex:1;
+    display:flex;flex-direction:column;justify-content:center;gap:10px;
+    padding:0 18px 0 24px;
+    border-left:1px solid rgba(0,200,255,0.08);
+    margin-left:16px;
+}}
+.nc-bar-row {{display:flex;align-items:center;gap:10px;}}
+.nc-bar-lbl {{
+    font-size:11px;font-weight:700;letter-spacing:1px;
+    width:32px;flex-shrink:0;
+}}
+.nc-bar-track {{flex:1;height:6px;background:rgba(255,255,255,0.07);border-radius:99px;overflow:hidden;}}
+.nc-bar-pct {{
+    font-family:'Orbitron',monospace;font-size:15px;font-weight:900;
+    min-width:42px;text-align:right;flex-shrink:0;
+}}
+.nc-oi-cell {{
+    padding:14px 14px;
+    border-left:1px solid rgba(0,200,255,0.08);
+    display:flex;flex-direction:column;justify-content:center;gap:3px;
+}}
+.nc-oi-label {{font-size:10px;letter-spacing:1px;text-transform:uppercase;color:#a8c4d8;margin-bottom:2px;}}
+.nc-oi-value {{font-family:'Orbitron',monospace;font-size:20px;font-weight:900;line-height:1.15;}}
+.nc-oi-footer {{display:flex;align-items:center;justify-content:space-between;margin-top:4px;flex-wrap:wrap;gap:3px;}}
+.nc-oi-sub {{font-size:10px;color:#a8c4d8;}}
+.nc-oi-btn {{font-size:10px;padding:2px 7px;border-radius:3px;white-space:nowrap;}}
+.nc-legend {{
+    padding:8px 14px;
+    background:rgba(0,0,0,0.25);
+    border-top:1px solid rgba(0,200,255,0.06);
+    display:flex;flex-wrap:wrap;align-items:center;gap:5px 10px;
+    font-size:11px;color:#a8c4d8;
+}}
+
+/* ── MOBILE: stack into 2 rows ── */
+@media (max-width:620px) {{
+    .nc-grid {{
+        display:grid;
+        grid-template-columns:1fr 1fr 1fr;
+        grid-template-rows:auto auto;
+    }}
+    .nc-divider {{ display:none; }}
+
+    /* Direction+bars cell: spans full row 1 */
+    .nc-dir-cell {{
+        grid-column:1 / 4;
+        grid-row:1;
+        border-left:3px solid {dir_name_col};
+        border-bottom:1px solid rgba(0,200,255,0.08);
+        padding:12px 14px;
+        flex-direction:row;
+        align-items:center;
+    }}
+    .nc-dir-text {{ min-width:110px; }}
+    .nc-dir-name {{ font-size:18px; }}
+    .nc-bars-block {{
+        padding:0 10px 0 16px;
+        margin-left:12px;
+    }}
+    .nc-bar-pct {{ font-size:13px; min-width:36px; }}
+
+    /* CE / PE / Net — equal thirds in row 2 */
+    .nc-ce-cell {{
+        grid-column:1 / 2; grid-row:2;
+        border-top:2px solid {ce_col};
+        border-right:1px solid rgba(0,200,255,0.08);
+        padding:10px 10px;
+    }}
+    .nc-pe-cell {{
+        grid-column:2 / 3; grid-row:2;
+        border-top:2px solid {pe_col};
+        border-right:1px solid rgba(0,200,255,0.08);
+        padding:10px 10px;
+    }}
+    .nc-net-cell {{
+        grid-column:3 / 4; grid-row:2;
+        border-top:2px solid {net_col};
+        padding:10px 10px;
+    }}
+
+    .nc-oi-value {{ font-size:13px; }}
+    .nc-oi-footer {{ flex-direction:column; align-items:flex-start; gap:3px; }}
+    .nc-legend-verbose {{ display:none; }}
+}}
+</style>
+
+<div class="section">
+<div class="nc-wrap">
+
+  <!-- ── Header ── -->
+  <div class="nc-header">
+    <div class="nc-header-left">
+      <span style="font-size:13px;">&#128202;</span>
+      <span class="nc-header-title">Change in Open Interest</span>
+      <span class="nc-header-sub">Today's Direction Analysis</span>
+    </div>
+    <div class="nc-atm-badge">ATM &#177;10</div>
+  </div>
+
+  <!-- ── Grid: Direction | divider | Bars | divider | CE | PE | Net ── -->
+  <div class="nc-grid">
+
+    <!-- Direction + Bars — unified cell -->
+    <div class="nc-dir-cell" style="background:linear-gradient(135deg,{dir_bg},{dir_bg.replace('0.92','0.03')});">
+
+      <!-- Left: text -->
+      <div class="nc-dir-text">
+        <div class="nc-dir-label">Market Direction</div>
+        <div class="nc-dir-name">{direction}</div>
+        <div class="nc-dir-sig">{signal}</div>
+      </div>
+
+      <!-- Right: bars -->
+      <div class="nc-bars-block">
+        <div class="nc-bar-row">
+          <div class="nc-bar-lbl" style="color:#00ff88;">&#9679; Bull</div>
+          <div class="nc-bar-track">
+            <div style="height:100%;width:{bull_pct}%;background:linear-gradient(90deg,#00c96b,#00ff88);border-radius:99px;box-shadow:0 0 6px rgba(0,255,136,0.5);"></div>
+          </div>
+          <div class="nc-bar-pct" style="color:#00ff88;">{bull_pct}%</div>
+        </div>
+        <div class="nc-bar-row">
+          <div class="nc-bar-lbl" style="color:#ff3b5c;">&#9679; Bear</div>
+          <div class="nc-bar-track">
+            <div style="height:100%;width:{bear_pct}%;background:linear-gradient(90deg,#c9003a,#ff3b5c);border-radius:99px;box-shadow:0 0 6px rgba(255,59,92,0.5);"></div>
+          </div>
+          <div class="nc-bar-pct" style="color:#ff3b5c;">{bear_pct}%</div>
+        </div>
+      </div>
+
+    </div>
+
+    <!-- Divider -->
+    <div class="nc-divider"></div>
+
+    <!-- Call OI -->
+    <div class="nc-oi-cell nc-ce-cell" style="border-top:2px solid {ce_col};">
+      <div class="nc-oi-label">Call OI &#916;</div>
+      <div class="nc-oi-value" style="color:{ce_col};">{ce_val:+,}</div>
+      <div class="nc-oi-footer">
+        <div class="nc-oi-sub">CE open interest</div>
+        <div class="nc-oi-btn" style="background:{ce_btn_bg};border:1px solid {ce_btn_bdr};color:{ce_btn_col};">{ce_lbl}</div>
+      </div>
+    </div>
+
+    <!-- Put OI -->
+    <div class="nc-oi-cell nc-pe-cell" style="border-top:2px solid {pe_col};">
+      <div class="nc-oi-label">Put OI &#916;</div>
+      <div class="nc-oi-value" style="color:{pe_col};">{pe_val:+,}</div>
+      <div class="nc-oi-footer">
+        <div class="nc-oi-sub">PE open interest</div>
+        <div class="nc-oi-btn" style="background:{pe_btn_bg};border:1px solid {pe_btn_bdr};color:{pe_btn_col};">{pe_lbl}</div>
+      </div>
+    </div>
+
+    <!-- Net OI -->
+    <div class="nc-oi-cell nc-net-cell" style="border-top:2px solid {net_col};">
+      <div class="nc-oi-label">Net OI &#916;</div>
+      <div class="nc-oi-value" style="color:{net_col};">{net_val:+,}</div>
+      <div class="nc-oi-footer">
+        <div class="nc-oi-sub">PE &#916; &#8722; CE &#916;</div>
+        <div class="nc-oi-btn" style="background:{net_btn_bg};border:1px solid {net_btn_bdr};color:{net_btn_col};">&#9878; {net_lbl}</div>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- ── Legend ── -->
+  <div class="nc-legend">
+    <span>&#128214;</span>
+    <span style="background:rgba(255,255,255,0.1);border:1px solid rgba(255,255,255,0.25);border-radius:4px;padding:2px 8px;color:#dde8f0;">Call OI +</span>
+    <span class="nc-legend-verbose">Writers selling calls</span>
+    <span style="background:rgba(255,59,92,0.18);border:1px solid rgba(255,59,92,0.35);border-radius:4px;padding:2px 8px;color:#ff6b85;">Bearish</span>
+    <span style="color:rgba(255,255,255,0.3);" class="nc-legend-verbose">|</span>
+    <span style="background:rgba(255,255,255,0.1);border:1px solid rgba(255,255,255,0.25);border-radius:4px;padding:2px 8px;color:#dde8f0;" class="nc-legend-verbose">Call OI &#8722;</span>
+    <span class="nc-legend-verbose">Unwinding</span>
+    <span style="background:rgba(0,255,136,0.15);border:1px solid rgba(0,255,136,0.35);border-radius:4px;padding:2px 8px;color:#00ff88;" class="nc-legend-verbose">Bullish</span>
+    <span style="color:rgba(255,255,255,0.3);" class="nc-legend-verbose">|</span>
+    <span style="background:rgba(255,255,255,0.1);border:1px solid rgba(255,255,255,0.25);border-radius:4px;padding:2px 8px;color:#dde8f0;">Put OI +</span>
+    <span class="nc-legend-verbose">Writers selling puts</span>
+    <span style="background:rgba(0,255,136,0.15);border:1px solid rgba(0,255,136,0.35);border-radius:4px;padding:2px 8px;color:#00ff88;">Bullish</span>
+    <span style="color:rgba(255,255,255,0.3);" class="nc-legend-verbose">|</span>
+    <span style="background:rgba(255,255,255,0.1);border:1px solid rgba(255,255,255,0.25);border-radius:4px;padding:2px 8px;color:#dde8f0;">Net OI</span>
+    <span style="background:rgba(0,255,136,0.15);border:1px solid rgba(0,255,136,0.35);border-radius:4px;padding:2px 8px;color:#00ff88;">+ = Bullish</span>
+    <span style="background:rgba(255,59,92,0.18);border:1px solid rgba(255,59,92,0.35);border-radius:4px;padding:2px 8px;color:#ff6b85;">&#8722; = Bearish</span>
+    <span style="color:rgba(255,255,255,0.3);" class="nc-legend-verbose">|</span>
+    <span style="background:rgba(255,255,255,0.1);border:1px solid rgba(255,255,255,0.25);border-radius:4px;padding:2px 8px;color:#dde8f0;" class="nc-legend-verbose">Bull % + Bear %</span>
+    <span class="nc-legend-verbose">= 100% &middot; relative dominance</span>
+  </div>
+
+</div>
+</div>
+"""
+
+    def _top10_oi_widget_html(self, d):
+        """
+        TOP 10 OPEN INTEREST widget — same format as Neon Ledger image.
+        Shows Top 5 CE (calls) and Top 5 PE (puts) by Open Interest.
+        Reads from d['df'] — zero logic changes anywhere.
+        """
+        _df = d.get('df', None)
+        atm = d.get('atm_strike', 0)
+        spot = d.get('current_price', 0)
+
+        if _df is None or _df.empty:
+            return ''
+
+        # ── Top 5 CE by OI (resistance side — above ATM) ──
+        ce_top5 = _df.nlargest(5, 'CE_OI')[['Strike','CE_OI','CE_OI_Change','CE_LTP','CE_Vol']].reset_index(drop=True)
+        # ── Top 5 PE by OI (support side — below ATM) ──
+        pe_top5 = _df.nlargest(5, 'PE_OI')[['Strike','PE_OI','PE_OI_Change','PE_LTP','PE_Vol']].reset_index(drop=True)
+
+        # Max OI for bar width scaling
+        ce_max_oi = ce_top5['CE_OI'].max() or 1
+        pe_max_oi = pe_top5['PE_OI'].max() or 1
+
+        def strike_type(strike, atm_s):
+            if strike == atm_s:   return 'ATM', '#00d4ff', 'rgba(0,212,255,0.12)', 'rgba(0,212,255,0.4)'
+            elif strike > atm_s:  return 'OTM', '#546e7a', 'rgba(84,110,122,0.1)', 'rgba(84,110,122,0.3)'
+            else:                 return 'ITM', '#ffb74d', 'rgba(255,183,77,0.12)', 'rgba(255,183,77,0.35)'
+
+        def fmt_oi(v):
+            if v >= 1_000_000: return f"{v/1_000_000:.1f}M"
+            if v >= 1_000:     return f"{v/1_000:.1f}K"
+            return str(v)
+
+        def fmt_vol(v):
+            if v >= 1_000_000: return f"{v/1_000_000:.1f}M"
+            if v >= 1_000:     return f"{v/1_000:.1f}K"
+            return str(int(v))
+
+        def chg_color(v):
+            return '#00e676' if v > 0 else ('#ff5252' if v < 0 else '#546e7a')
+
+        def chg_fmt(v):
+            return f"+{int(v):,}" if v > 0 else f"{int(v):,}"
+
+        # ── Build CE rows ──
+        ce_rows = ''
+        for i, row in ce_top5.iterrows():
+            strike   = int(row['Strike'])
+            oi_val   = int(row['CE_OI'])
+            oi_chg   = row['CE_OI_Change']
+            ltp      = row['CE_LTP']
+            vol      = row['CE_Vol']
+            bar_w    = round(oi_val / ce_max_oi * 100)
+            stype, sc, sbg, sbdr = strike_type(strike, atm)
+            rank_bg  = 'rgba(255,51,85,0.2)' if i == 0 else 'rgba(255,255,255,0.05)'
+            ce_rows += f"""
+                <tr style="border-bottom:1px solid rgba(255,255,255,0.04);">
+                  <td style="padding:9px 10px;text-align:center;">
+                    <span style="display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;border-radius:5px;background:{rank_bg};font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:700;color:#ff3355;">{i+1}</span>
+                  </td>
+                  <td style="padding:9px 10px;font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:700;color:#e2eaf5;">&#8377;{strike:,}</td>
+                  <td style="padding:9px 10px;">
+                    <span style="font-size:9px;padding:2px 7px;border-radius:4px;font-family:'JetBrains Mono',monospace;font-weight:700;
+                                 color:{sc};background:{sbg};border:1px solid {sbdr};">{stype}</span>
+                  </td>
+                  <td style="padding:9px 14px 9px 10px;min-width:130px;">
+                    <div style="font-family:'JetBrains Mono',monospace;font-size:13px;font-weight:700;color:#ff3355;margin-bottom:4px;">{fmt_oi(oi_val)}</div>
+                    <div style="height:3px;background:rgba(255,255,255,0.06);border-radius:99px;overflow:hidden;">
+                      <div style="height:100%;width:{bar_w}%;background:linear-gradient(90deg,#ff3355,#ff6b6b);border-radius:99px;"></div>
+                    </div>
+                  </td>
+                  <td style="padding:9px 10px;font-family:'JetBrains Mono',monospace;font-size:12px;color:{chg_color(oi_chg)};">{chg_fmt(oi_chg)}</td>
+                  <td style="padding:9px 10px;font-family:'JetBrains Mono',monospace;font-size:12px;color:#c8d8e0;">&#8377;{ltp:.2f}</td>
+                  <td style="padding:9px 10px;font-family:'JetBrains Mono',monospace;font-size:12px;color:#8faabe;">{fmt_vol(vol)}</td>
+                </tr>"""
+
+        # ── Build PE rows ──
+        pe_rows = ''
+        for i, row in pe_top5.iterrows():
+            strike   = int(row['Strike'])
+            oi_val   = int(row['PE_OI'])
+            oi_chg   = row['PE_OI_Change']
+            ltp      = row['PE_LTP']
+            vol      = row['PE_Vol']
+            bar_w    = round(oi_val / pe_max_oi * 100)
+            stype, sc, sbg, sbdr = strike_type(strike, atm)
+            rank_bg  = 'rgba(0,230,118,0.18)' if i == 0 else 'rgba(255,255,255,0.05)'
+            pe_rows += f"""
+                <tr style="border-bottom:1px solid rgba(255,255,255,0.04);">
+                  <td style="padding:9px 10px;text-align:center;">
+                    <span style="display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;border-radius:5px;background:{rank_bg};font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:700;color:#00e676;">{i+1}</span>
+                  </td>
+                  <td style="padding:9px 10px;font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:700;color:#e2eaf5;">&#8377;{strike:,}</td>
+                  <td style="padding:9px 10px;">
+                    <span style="font-size:9px;padding:2px 7px;border-radius:4px;font-family:'JetBrains Mono',monospace;font-weight:700;
+                                 color:{sc};background:{sbg};border:1px solid {sbdr};">{stype}</span>
+                  </td>
+                  <td style="padding:9px 14px 9px 10px;min-width:130px;">
+                    <div style="font-family:'JetBrains Mono',monospace;font-size:13px;font-weight:700;color:#00e676;margin-bottom:4px;">{fmt_oi(oi_val)}</div>
+                    <div style="height:3px;background:rgba(255,255,255,0.06);border-radius:99px;overflow:hidden;">
+                      <div style="height:100%;width:{bar_w}%;background:linear-gradient(90deg,#00e676,#69f0ae);border-radius:99px;"></div>
+                    </div>
+                  </td>
+                  <td style="padding:9px 10px;font-family:'JetBrains Mono',monospace;font-size:12px;color:{chg_color(oi_chg)};">{chg_fmt(oi_chg)}</td>
+                  <td style="padding:9px 10px;font-family:'JetBrains Mono',monospace;font-size:12px;color:#c8d8e0;">&#8377;{ltp:.2f}</td>
+                  <td style="padding:9px 10px;font-family:'JetBrains Mono',monospace;font-size:12px;color:#8faabe;">{fmt_vol(vol)}</td>
+                </tr>"""
+
+        th_style = "padding:8px 10px;font-family:'JetBrains Mono',monospace;font-size:9px;letter-spacing:1.5px;text-transform:uppercase;color:#8faabe;font-weight:600;border-bottom:1px solid rgba(255,255,255,0.06);"
+
+        return f"""
+<style>
+.top10-oi-widget {{ background:#060d18;border:1px solid rgba(0,200,255,0.1);border-radius:14px;overflow:hidden;margin-bottom:4px;font-family:'JetBrains Mono',monospace; }}
+.top10-oi-header {{ display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;padding:11px 18px;background:rgba(0,0,0,0.3);border-bottom:1px solid rgba(0,200,255,0.08); }}
+.top10-oi-header-left {{ display:flex;align-items:center;gap:10px; }}
+.top10-oi-header-right {{ display:flex;align-items:center;gap:8px;flex-wrap:wrap; }}
+.top10-oi-grid {{ display:grid;grid-template-columns:1fr 1fr;gap:0; }}
+.top10-oi-table {{ width:100%;border-collapse:collapse;overflow-x:auto;display:block; }}
+.top10-oi-sub-header {{ display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:4px;padding:8px 12px; }}
+@media(max-width:900px) {{
+  .top10-oi-grid {{ grid-template-columns:1fr !important; }}
+  .top10-oi-ce-panel {{ border-right:none !important;border-bottom:1px solid rgba(255,255,255,0.06); }}
+  .top10-oi-header {{ padding:8px 12px; }}
+  .top10-oi-sub-header span:last-child {{ display:none; }}
+}}
+@media(max-width:600px) {{
+  .top10-oi-table th:nth-child(3),
+  .top10-oi-table td:nth-child(3),
+  .top10-oi-table th:nth-child(6),
+  .top10-oi-table td:nth-child(6) {{ display:none; }}
+}}
+</style>
+<div class="top10-oi-widget">
+
+  <!-- ── Widget Header ── -->
+  <div class="top10-oi-header">
+    <div class="top10-oi-header-left">
+      <div style="width:32px;height:32px;background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.1);border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:14px;flex-shrink:0;">&#9651;</div>
+      <div>
+        <div style="font-size:12px;font-weight:700;color:#e2eaf5;letter-spacing:1px;">TOP 10 OPEN INTEREST</div>
+        <div style="font-size:9px;color:#8faabe;letter-spacing:1px;margin-top:1px;">BANKNIFTY &middot; &plusmn;10 STRIKES FROM ATM &middot; HIGHEST OI IN WINDOW</div>
+      </div>
+    </div>
+    <div class="top10-oi-header-right">
+      <div style="font-size:10px;padding:4px 12px;border-radius:6px;background:rgba(255,51,85,0.12);border:1px solid rgba(255,51,85,0.3);color:#ff3355;font-weight:700;">5 CE</div>
+      <div style="font-size:10px;padding:4px 14px;border-radius:6px;background:rgba(0,212,255,0.1);border:1px solid rgba(0,212,255,0.3);color:#00d4ff;font-weight:700;">ATM &#8377;{atm:,}</div>
+      <div style="font-size:10px;padding:4px 12px;border-radius:6px;background:rgba(0,230,118,0.1);border:1px solid rgba(0,230,118,0.3);color:#00e676;font-weight:700;">5 PE</div>
+      <div style="width:8px;height:8px;border-radius:50%;background:#00e676;box-shadow:0 0 6px #00e676;flex-shrink:0;"></div>
+    </div>
+  </div>
+
+  <!-- ── Two-column table layout ── -->
+  <div class="top10-oi-grid">
+
+    <!-- LEFT: CE Table -->
+    <div class="top10-oi-ce-panel" style="border-right:1px solid rgba(255,255,255,0.05);">
+      <div class="top10-oi-sub-header" style="background:rgba(255,51,85,0.04);border-bottom:1px solid rgba(255,51,85,0.12);">
+        <div style="display:flex;align-items:center;gap:6px;">
+          <div style="width:7px;height:7px;border-radius:50%;background:#ff3355;box-shadow:0 0 5px #ff3355;flex-shrink:0;"></div>
+          <span style="font-size:11px;font-weight:700;color:#ff3355;letter-spacing:1px;">TOP 5 CALL OPTIONS (CE)</span>
+        </div>
+        <span style="font-size:9px;color:#8faabe;letter-spacing:1px;">10 STRIKES ABOVE ATM</span>
+      </div>
+      <table class="top10-oi-table">
+        <thead>
+          <tr style="background:rgba(0,0,0,0.2);">
+            <th style="{th_style}text-align:center;">#</th>
+            <th style="{th_style}">Strike</th>
+            <th style="{th_style}">Type</th>
+            <th style="{th_style}">Open Interest</th>
+            <th style="{th_style}">Chg OI</th>
+            <th style="{th_style}">LTP</th>
+            <th style="{th_style}">Volume</th>
+          </tr>
+        </thead>
+        <tbody>{ce_rows}</tbody>
+      </table>
+    </div>
+
+    <!-- RIGHT: PE Table -->
+    <div>
+      <div class="top10-oi-sub-header" style="background:rgba(0,230,118,0.04);border-bottom:1px solid rgba(0,230,118,0.12);">
+        <div style="display:flex;align-items:center;gap:6px;">
+          <div style="width:7px;height:7px;border-radius:50%;background:#00e676;box-shadow:0 0 5px #00e676;flex-shrink:0;"></div>
+          <span style="font-size:11px;font-weight:700;color:#00e676;letter-spacing:1px;">TOP 5 PUT OPTIONS (PE)</span>
+        </div>
+        <span style="font-size:9px;color:#8faabe;letter-spacing:1px;">10 STRIKES BELOW ATM</span>
+      </div>
+      <table class="top10-oi-table">
+        <thead>
+          <tr style="background:rgba(0,0,0,0.2);">
+            <th style="{th_style}text-align:center;">#</th>
+            <th style="{th_style}">Strike</th>
+            <th style="{th_style}">Type</th>
+            <th style="{th_style}">Open Interest</th>
+            <th style="{th_style}">Chg OI</th>
+            <th style="{th_style}">LTP</th>
+            <th style="{th_style}">Volume</th>
+          </tr>
+        </thead>
+        <tbody>{pe_rows}</tbody>
+      </table>
+    </div>
+
+  </div>
+
+  <!-- ── Footer ── -->
+  <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:6px;padding:7px 18px;background:rgba(0,0,0,0.25);border-top:1px solid rgba(0,200,255,0.06);">
+    <span style="font-size:9px;color:#8899aa;letter-spacing:1.5px;text-transform:uppercase;">Neon Ledger &middot; Top OI &middot; &plusmn;10 ATM Strikes Window</span>
+    <div style="display:flex;align-items:center;gap:5px;">
+      <div style="width:6px;height:6px;border-radius:50%;background:#00e676;box-shadow:0 0 5px #00e676;"></div>
+      <span style="font-size:9px;color:#00e676;letter-spacing:1px;">LIVE</span>
+    </div>
+  </div>
+
+</div>
+"""
+
+    def _option_chain_pivot_section_html(self, d):
+        """
+        Renders TWO sub-panels:
+          1. Option Chain Analysis  — PCR, OI sentiment, Max Pain, Call/Put buildup, OI walls
+          2. Pivot Points (Traditional) — auto-calc from prev H/L/C stored in html_data
+        Placed between KEY LEVELS and FII/DII sections in the main tab.
+        """
+        # ── Option Chain panel values ─────────────────────────────────────────
+        pcr        = d.get('pcr', 0)
+        pcr_str    = f"{pcr:.2f}" if pcr else "N/A"
+        max_pain   = d.get('max_pain', 0)
+        ce_chg     = d.get('total_ce_oi_change', 0)
+        pe_chg     = d.get('total_pe_oi_change', 0)
+        oi_dir     = d.get('oi_direction', 'N/A')
+        oi_class   = d.get('oi_class', 'neutral')
+        max_ce     = d.get('max_ce_oi', 0)
+        max_pe     = d.get('max_pe_oi', 0)
+
+        def _oi_color(cls):
+            return {'bullish':'#26c6da','bearish':'#f44336','neutral':'#ffb74d'}.get(cls,'#ffb74d')
+
+        oi_col = _oi_color(oi_class)
+
+        # OI sentiment label
+        if oi_class == 'bullish':
+            sent_icon = '&#9650;'; sent_lbl = 'BULLISH'; sent_col = '#26c6da'
+        elif oi_class == 'bearish':
+            sent_icon = '&#9660;'; sent_lbl = 'BEARISH'; sent_col = '#f44336'
+        else:
+            sent_icon = '&#8596;'; sent_lbl = 'NEUTRAL'; sent_col = '#ffb74d'
+
+        # CE / PE bar widths (proportional, max bar = 100%)
+        max_abs = max(abs(ce_chg), abs(pe_chg), 1)
+        ce_w    = round(abs(ce_chg) / max_abs * 100)
+        pe_w    = round(abs(pe_chg) / max_abs * 100)
+        ce_k    = f"{ce_chg/1000:+.0f}K" if ce_chg else "0"
+        pe_k    = f"{pe_chg/1000:+.0f}K" if pe_chg else "0"
+        ce_col  = '#f44336' if ce_chg >= 0 else '#26c6da'   # call build = bearish
+        pe_col  = '#26c6da' if pe_chg >= 0 else '#f44336'   # put build  = bullish
+
+        # Max CE / PE OI wall bars (proportional to each other)
+        wall_max = max(max_ce, max_pe, 1)
+        ce_wall_w = round(max_ce / wall_max * 100)
+        pe_wall_w = round(max_pe / wall_max * 100)
+
+        # ── R2 / S2: 2nd highest CE OI strike (resistance) and PE OI strike (support) ──
+        # Derived purely from the existing df — zero logic changes elsewhere
+        _df = d.get('df', None)
+        if _df is not None and not _df.empty and len(_df) >= 2:
+            _ce_sorted = _df.nlargest(2, 'CE_OI')
+            _pe_sorted = _df.nlargest(2, 'PE_OI')
+            max_ce_r2  = int(_ce_sorted.iloc[1]['Strike']) if len(_ce_sorted) > 1 else max_ce
+            max_pe_s2  = int(_pe_sorted.iloc[1]['Strike']) if len(_pe_sorted) > 1 else max_pe
+            max_ce_r2_val = int(_ce_sorted.iloc[1]['CE_OI']) if len(_ce_sorted) > 1 else 0
+            max_pe_s2_val = int(_pe_sorted.iloc[1]['PE_OI']) if len(_pe_sorted) > 1 else 0
+        else:
+            max_ce_r2 = max_ce; max_pe_s2 = max_pe
+            max_ce_r2_val = 0;  max_pe_s2_val = 0
+
+        # Bar widths for R2/S2 (relative to R1/S1 = 100%)
+        ce_wall_r2_w = round(max_ce_r2_val / max(_df['CE_OI'].max(), 1) * 100) if _df is not None and not _df.empty else 60
+        pe_wall_s2_w = round(max_pe_s2_val / max(_df['PE_OI'].max(), 1) * 100) if _df is not None and not _df.empty else 60
+
+        pcr_badge_col = '#26c6da' if pcr > 1.0 else ('#f44336' if pcr < 0.8 else '#ffb74d')
+
+        oc_panel = "" if not d['has_option_data'] else f"""
+        <!-- ── Option Chain Analysis Sub-Panel · Sample 1 Command Terminal ── -->
+        <div style="background:#080f18;border:1px solid rgba(0,200,255,0.15);border-radius:6px;flex:1;min-width:280px;overflow:hidden;">
+
+            <!-- header bar -->
+            <div style="display:flex;align-items:center;justify-content:space-between;padding:10px 16px;background:rgba(0,0,0,0.5);border-bottom:1px solid rgba(0,200,255,0.1);">
+                <span style="font-family:'Space Mono',monospace;font-size:10px;letter-spacing:3px;color:#00c8ff;text-transform:uppercase;">&#11043; Option Chain Analysis</span>
+                <span style="font-family:'Space Mono',monospace;font-size:8px;padding:2px 8px;border-radius:2px;background:rgba(0,200,255,0.08);border:1px solid rgba(0,200,255,0.2);color:rgba(0,200,255,0.7);letter-spacing:1px;">BANKNIFTY &middot; LIVE</span>
+            </div>
+
+            <div style="padding:16px;">
+
+                <!-- PCR / Sentiment / MaxPain stats row -->
+                <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:1px;background:rgba(0,200,255,0.06);border-radius:4px;overflow:hidden;margin-bottom:14px;">
+                    <div style="background:rgba(0,8,16,0.9);padding:14px 16px;">
+                        <div style="font-family:'Space Mono',monospace;font-size:9px;letter-spacing:2px;color:rgba(0,200,255,0.6);text-transform:uppercase;margin-bottom:8px;">Put / Call</div>
+                        <div style="font-family:'Orbitron',monospace;font-size:28px;font-weight:700;line-height:1;color:{pcr_badge_col};text-shadow:0 0 16px {pcr_badge_col}99;">{pcr_str}</div>
+                        <div style="font-family:'Space Mono',monospace;font-size:9px;color:rgba(200,216,224,0.6);margin-top:6px;">PCR RATIO</div>
+                    </div>
+                    <div style="background:rgba(0,8,16,0.9);padding:14px 16px;">
+                        <div style="font-family:'Space Mono',monospace;font-size:9px;letter-spacing:2px;color:rgba(0,200,255,0.6);text-transform:uppercase;margin-bottom:8px;">OI Sentiment</div>
+                        <div style="font-family:'Orbitron',monospace;font-size:22px;font-weight:700;line-height:1;color:{sent_col};text-shadow:0 0 16px {sent_col}99;">{sent_icon} {sent_lbl}</div>
+                        <div style="font-family:'Space Mono',monospace;font-size:9px;color:rgba(200,216,224,0.6);margin-top:6px;">{oi_dir}</div>
+                    </div>
+                    <div style="background:rgba(0,8,16,0.9);padding:14px 16px;">
+                        <div style="font-family:'Space Mono',monospace;font-size:9px;letter-spacing:2px;color:rgba(0,200,255,0.6);text-transform:uppercase;margin-bottom:8px;">Max Pain</div>
+                        <div style="font-family:'Orbitron',monospace;font-size:22px;font-weight:700;line-height:1;color:#ffd700;text-shadow:0 0 16px rgba(255,215,0,0.5);">&#8377;{max_pain:,}</div>
+                        <div style="font-family:'Space Mono',monospace;font-size:9px;color:rgba(200,216,224,0.6);margin-top:6px;">Expiry magnet</div>
+                    </div>
+                </div>
+
+                <!-- OI Direction bars -->
+                <div style="margin-bottom:14px;">
+                    <div style="font-family:'Space Mono',monospace;font-size:9px;letter-spacing:2px;color:rgba(0,200,255,0.6);text-transform:uppercase;margin-bottom:10px;display:flex;align-items:center;gap:8px;">
+                        OI DIRECTION <span style="flex:1;height:1px;background:rgba(0,200,255,0.12);display:inline-block;"></span>
+                    </div>
+                    <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;">
+                        <div style="font-family:'Space Mono',monospace;font-size:11px;font-weight:700;color:#ff4d6d;width:26px;flex-shrink:0;">CE</div>
+                        <div style="flex:1;height:7px;background:rgba(255,255,255,0.06);position:relative;overflow:hidden;">
+                            <div style="height:100%;width:{ce_w}%;background:linear-gradient(90deg,rgba(255,77,109,0.4),#ff4d6d);position:relative;">
+                                <span style="position:absolute;right:0;top:0;bottom:0;width:2px;background:#ff4d6d;filter:brightness(2);box-shadow:0 0 8px #ff4d6d;"></span>
+                            </div>
+                        </div>
+                        <div style="font-family:'Orbitron',monospace;font-size:14px;font-weight:700;color:#ff6b85;width:64px;text-align:right;flex-shrink:0;">{ce_k}</div>
+                    </div>
+                    <div style="display:flex;align-items:center;gap:10px;">
+                        <div style="font-family:'Space Mono',monospace;font-size:11px;font-weight:700;color:#00e676;width:26px;flex-shrink:0;">PE</div>
+                        <div style="flex:1;height:7px;background:rgba(255,255,255,0.06);position:relative;overflow:hidden;">
+                            <div style="height:100%;width:{pe_w}%;background:linear-gradient(90deg,rgba(0,230,118,0.4),#00e676);position:relative;">
+                                <span style="position:absolute;right:0;top:0;bottom:0;width:2px;background:#00e676;filter:brightness(2);box-shadow:0 0 8px #00e676;"></span>
+                            </div>
+                        </div>
+                        <div style="font-family:'Orbitron',monospace;font-size:14px;font-weight:700;color:#00e676;width:64px;text-align:right;flex-shrink:0;">{pe_k}</div>
+                    </div>
+                </div>
+
+                <!-- OI Resistance Walls -->
+                <div style="margin-bottom:12px;">
+                    <div style="font-family:'Space Mono',monospace;font-size:9px;letter-spacing:2px;color:rgba(0,200,255,0.6);text-transform:uppercase;margin-bottom:10px;display:flex;align-items:center;gap:8px;">
+                        OI RESISTANCE WALLS <span style="flex:1;height:1px;background:rgba(0,200,255,0.12);display:inline-block;"></span>
+                    </div>
+                    <div style="display:flex;align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid rgba(0,200,255,0.06);">
+                        <span style="font-family:'Space Mono',monospace;font-size:10px;font-weight:700;padding:3px 8px;border-radius:2px;background:rgba(255,77,109,0.15);color:#ff4d6d;border:1px solid rgba(255,77,109,0.35);width:32px;text-align:center;flex-shrink:0;">R1</span>
+                        <div style="flex:1;height:6px;background:rgba(255,255,255,0.04);">
+                            <div style="height:100%;width:{ce_wall_w}%;background:linear-gradient(90deg,rgba(255,77,109,0.3),#ff4d6d);box-shadow:0 0 6px rgba(255,77,109,0.3);"></div>
+                        </div>
+                        <span style="font-family:'Orbitron',monospace;font-size:14px;font-weight:700;color:#ff6b85;flex-shrink:0;min-width:80px;text-align:right;">&#8377;{max_ce:,}</span>
+                    </div>
+                    <div style="display:flex;align-items:center;gap:10px;padding:8px 0;">
+                        <span style="font-family:'Space Mono',monospace;font-size:10px;font-weight:700;padding:3px 8px;border-radius:2px;background:rgba(255,77,109,0.08);color:rgba(255,100,130,0.85);border:1px solid rgba(255,77,109,0.2);width:32px;text-align:center;flex-shrink:0;">R2</span>
+                        <div style="flex:1;height:6px;background:rgba(255,255,255,0.04);">
+                            <div style="height:100%;width:{ce_wall_r2_w}%;background:linear-gradient(90deg,rgba(255,77,109,0.15),rgba(255,77,109,0.7));"></div>
+                        </div>
+                        <span style="font-family:'Orbitron',monospace;font-size:14px;font-weight:700;color:rgba(255,143,163,0.85);flex-shrink:0;min-width:80px;text-align:right;">&#8377;{max_ce_r2:,}</span>
+                    </div>
+                </div>
+
+                <!-- OI Support Floors -->
+                <div>
+                    <div style="font-family:'Space Mono',monospace;font-size:9px;letter-spacing:2px;color:rgba(0,200,255,0.6);text-transform:uppercase;margin-bottom:10px;display:flex;align-items:center;gap:8px;">
+                        OI SUPPORT FLOORS <span style="flex:1;height:1px;background:rgba(0,200,255,0.12);display:inline-block;"></span>
+                    </div>
+                    <div style="display:flex;align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid rgba(0,200,255,0.06);">
+                        <span style="font-family:'Space Mono',monospace;font-size:10px;font-weight:700;padding:3px 8px;border-radius:2px;background:rgba(0,230,118,0.15);color:#00e676;border:1px solid rgba(0,230,118,0.35);width:32px;text-align:center;flex-shrink:0;">S1</span>
+                        <div style="flex:1;height:6px;background:rgba(255,255,255,0.04);">
+                            <div style="height:100%;width:{pe_wall_w}%;background:linear-gradient(90deg,rgba(0,230,118,0.3),#00e676);box-shadow:0 0 6px rgba(0,230,118,0.3);"></div>
+                        </div>
+                        <span style="font-family:'Orbitron',monospace;font-size:14px;font-weight:700;color:#00e676;flex-shrink:0;min-width:80px;text-align:right;">&#8377;{max_pe:,}</span>
+                    </div>
+                    <div style="display:flex;align-items:center;gap:10px;padding:8px 0;">
+                        <span style="font-family:'Space Mono',monospace;font-size:10px;font-weight:700;padding:3px 8px;border-radius:2px;background:rgba(0,230,118,0.08);color:rgba(0,200,100,0.85);border:1px solid rgba(0,230,118,0.2);width:32px;text-align:center;flex-shrink:0;">S2</span>
+                        <div style="flex:1;height:6px;background:rgba(255,255,255,0.04);">
+                            <div style="height:100%;width:{pe_wall_s2_w}%;background:linear-gradient(90deg,rgba(0,230,118,0.15),rgba(0,230,118,0.7));"></div>
+                        </div>
+                        <span style="font-family:'Orbitron',monospace;font-size:14px;font-weight:700;color:rgba(105,240,174,0.85);flex-shrink:0;min-width:80px;text-align:right;">&#8377;{max_pe_s2:,}</span>
+                    </div>
+                </div>
+
+            </div>
+        </div>"""
+
+        # ── Pivot Points (Traditional) calculation ────────────────────────────
+        ph = d.get('prev_high', 0)
+        pl = d.get('prev_low', 0)
+        pc = d.get('prev_close', 0)
+        cp = d.get('current_price', 0)
+
+        if ph and pl and pc:
+            pp = round((ph + pl + pc) / 3, 2)
+            r1p = round(2 * pp - pl, 2)
+            r2p = round(pp + (ph - pl), 2)
+            r3p = round(ph + 2 * (pp - pl), 2)
+            s1p = round(2 * pp - ph, 2)
+            s2p = round(pp - (ph - pl), 2)
+            s3p = round(pl - 2 * (ph - pp), 2)
+        else:
+            pp = r1p = r2p = r3p = s1p = s2p = s3p = 0
+
+        # ── Dynamic NEAREST R: lowest R level strictly ABOVE LTP ─────────────
+        r_levels = [('R1', r1p), ('R2', r2p), ('R3', r3p)]
+        above_r  = [(lbl, val) for lbl, val in r_levels if val > cp]
+        nearest_r_lbl = above_r[0][0] if above_r else 'R3'
+        nearest_r_val = dict(r_levels)[nearest_r_lbl]
+
+        # ── Dynamic NEAREST S: highest level strictly BELOW LTP ──────────────
+        s_candidates = [('R1', r1p), ('PP', pp), ('S1', s1p), ('S2', s2p), ('S3', s3p)]
+        below_s  = [(lbl, val) for lbl, val in s_candidates if val < cp]
+        nearest_s_lbl = below_s[0][0] if below_s else 'S1'
+        nearest_s_val = dict(s_candidates)[nearest_s_lbl]
+
+        # Position of LTP on the bar — uses NEAREST S and NEAREST R (not hardcoded S1/R1)
+        if nearest_r_val and nearest_s_val and nearest_r_val != nearest_s_val:
+            ltp_pct = round(max(3, min(97, (cp - nearest_s_val) / (nearest_r_val - nearest_s_val) * 100)), 1)
+        else:
+            ltp_pct = 50
+        pp_dist = round(cp - pp, 2) if pp else 0
+        # pp_dist = LTP minus PP  →  positive means LTP is ABOVE PP
+        pp_dist_sign = '+' if pp_dist >= 0 else ''
+        pp_dist_lbl  = f"{pp_dist_sign}{pp_dist:.2f} from PP"
+
+        # ── Zone detection (which pivot band does LTP sit in) ─────────────────
+        if pp and r3p and r2p and r1p and s1p and s2p and s3p:
+            if   cp >= r3p: zone_lbl = "Above R3";          zone_col = "#ff1744"; zone_dot = "#ff1744"
+            elif cp >= r2p: zone_lbl = "Between R2 and R3"; zone_col = "#ff4d6d"; zone_dot = "#ff4d6d"
+            elif cp >= r1p: zone_lbl = "Between R1 and R2"; zone_col = "#ff6b85"; zone_dot = "#ff6b85"
+            elif cp >= s1p: zone_lbl = "Between S1 and R1"; zone_col = "#4fc3f7"; zone_dot = "#26c6da"
+            elif cp >= s2p: zone_lbl = "Between S2 and S1"; zone_col = "#26c6da"; zone_dot = "#26c6da"
+            elif cp >= s3p: zone_lbl = "Between S3 and S2"; zone_col = "#00bcd4"; zone_dot = "#00bcd4"
+            else:           zone_lbl = "Below S3";          zone_col = "#00e676"; zone_dot = "#00e676"
+        else:
+            zone_lbl = "N/A"; zone_col = "#8faabe"; zone_dot = "#8faabe"
+
+        pp_above_below = "above PP" if pp_dist >= 0 else "below PP"
+
+        pv_panel = f"""
+        <!-- ── Pivot Points Widget · Neon Runway · Phantom Slate Edition ── -->
+        <div style="background:#060d15;border:1px solid rgba(0,200,255,0.18);border-radius:6px;flex:1;min-width:320px;overflow:hidden;font-family:'Space Mono',monospace;">
+
+            <!-- ── TOP BANNER ─────────────────────────────────────────────── -->
+            <div style="background:rgba(0,25,45,0.95);border-bottom:1px solid rgba(0,200,255,0.2);padding:9px 18px;display:flex;align-items:center;justify-content:center;gap:10px;">
+                <span style="color:rgba(0,200,255,0.5);font-size:9px;">&#9658;</span>
+                <span style="font-size:9px;letter-spacing:3px;color:#00c8ff;font-weight:700;text-transform:uppercase;">PIVOT POINTS (TRADITIONAL - DAILY)</span>
+                <span style="color:rgba(0,200,255,0.5);font-size:9px;">&#9658;</span>
+            </div>
+
+            <div style="padding:16px 18px;">
+
+                <!-- ── TITLE ROW ───────────────────────────────────────────── -->
+                <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:3px;">
+                    <div style="display:flex;align-items:center;gap:8px;">
+                        <span style="font-size:14px;">&#128205;</span>
+                        <span style="font-size:12px;font-weight:700;color:#e2eaf5;letter-spacing:1.5px;">PIVOT POINTS</span>
+                    </div>
+                    <span style="font-size:8px;font-weight:700;padding:3px 10px;border-radius:3px;background:rgba(0,200,255,0.12);border:1px solid rgba(0,200,255,0.35);color:#00c8ff;letter-spacing:2px;">DAILY</span>
+                </div>
+                <div style="font-size:9px;color:rgba(200,216,224,0.75);letter-spacing:1px;margin-bottom:16px;">Traditional Method &middot; Daily Candle &middot; Auto-calculated</div>
+
+                <!-- ── PROGRESS BAR (S1 ─── LTP ──→ R1) ──────────────────── -->
+                <div style="position:relative;height:8px;background:linear-gradient(90deg,#00e676 0%,#00c8a0 30%,#4fc3f7 55%,#ff6b85 80%,#f44336 100%);border-radius:4px;margin-bottom:10px;box-shadow:0 0 8px rgba(0,200,255,0.2);">
+                    <div style="position:absolute;left:{ltp_pct}%;top:50%;transform:translate(-50%,-50%);width:16px;height:16px;border-radius:50%;background:#0a1929;border:2.5px solid #00c8ff;box-shadow:0 0 12px rgba(0,200,255,0.9);z-index:5;"></div>
+                </div>
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+                    <!-- NEAREST SUPPORT (left) -->
+                    <div style="text-align:left;">
+                        <div style="font-size:8px;font-weight:700;color:#26c6da;letter-spacing:1px;margin-bottom:2px;">&#9660; NEAREST SUPPORT</div>
+                        <div style="font-family:'Orbitron',monospace;font-size:13px;font-weight:800;color:#00e676;">&#8377;{nearest_s_val:,.2f} <span style="font-size:9px;font-weight:700;padding:1px 6px;border-radius:2px;background:rgba(0,230,118,0.15);border:1px solid rgba(0,230,118,0.4);color:#00e676;">{nearest_s_lbl}</span></div>
+                    </div>
+                    <!-- LTP centre -->
+                    <div style="text-align:center;">
+                        <div style="font-size:8px;font-weight:700;color:rgba(200,216,224,0.6);letter-spacing:1px;margin-bottom:2px;">CURRENT</div>
+                        <div style="font-size:14px;font-weight:800;color:#e2eaf5;">&#9650; &#8377;{cp:,.2f} <span style="background:rgba(0,200,255,0.18);border:1px solid rgba(0,200,255,0.45);border-radius:2px;padding:2px 7px;color:#00c8ff;font-size:10px;font-weight:700;letter-spacing:1px;">LTP</span></div>
+                    </div>
+                    <!-- NEAREST RESISTANCE (right) -->
+                    <div style="text-align:right;">
+                        <div style="font-size:8px;font-weight:700;color:#f44336;letter-spacing:1px;margin-bottom:2px;">NEAREST RESISTANCE &#9650;</div>
+                        <div style="font-family:'Orbitron',monospace;font-size:13px;font-weight:800;color:#ff6b85;"><span style="font-size:9px;font-weight:700;padding:1px 6px;border-radius:2px;background:rgba(255,77,109,0.15);border:1px solid rgba(255,77,109,0.4);color:#ff4d6d;">{nearest_r_lbl}</span> &#8377;{nearest_r_val:,.2f}</div>
+                    </div>
+                </div>
+
+                <!-- ── ZONE LABEL + PP DISTANCE ───────────────────────────── -->
+                <div style="display:flex;justify-content:space-between;align-items:center;background:rgba(0,200,255,0.04);border:1px solid rgba(0,200,255,0.1);border-radius:3px;padding:7px 12px;margin-bottom:14px;">
+                    <span style="font-size:9px;color:{zone_col};display:flex;align-items:center;gap:6px;font-weight:700;">
+                        <span style="width:7px;height:7px;border-radius:50%;background:{zone_dot};display:inline-block;flex-shrink:0;box-shadow:0 0 6px {zone_dot};"></span>
+                        {zone_lbl}
+                    </span>
+                    <span style="font-size:9px;font-weight:600;color:rgba(200,216,224,0.85);">{'+' if pp_dist >= 0 else ''}{pp_dist:.2f} {pp_above_below}</span>
+                </div>
+
+                <!-- ── PREV HIGH / LOW / CLOSE ─────────────────────────────── -->
+                <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:1px;background:rgba(0,200,255,0.08);border-radius:4px;overflow:hidden;margin-bottom:14px;">
+                    <div style="background:#07111c;padding:10px 12px;">
+                        <div style="font-size:9px;letter-spacing:1.5px;font-weight:600;color:rgba(252,165,165,0.9);margin-bottom:5px;display:flex;align-items:center;gap:4px;">
+                            <span style="color:#fca5a5;">&#9650;</span> PREV HIGH
+                        </div>
+                        <div style="font-family:'Orbitron',monospace;font-size:14px;font-weight:700;color:#fca5a5;">&#8377;{ph:,.2f}</div>
+                    </div>
+                    <div style="background:#07111c;padding:10px 12px;border-left:1px solid rgba(0,200,255,0.07);border-right:1px solid rgba(0,200,255,0.07);">
+                        <div style="font-size:9px;letter-spacing:1.5px;font-weight:600;color:rgba(134,239,172,0.9);margin-bottom:5px;display:flex;align-items:center;gap:4px;">
+                            <span style="color:#86efac;">&#9660;</span> PREV LOW
+                        </div>
+                        <div style="font-family:'Orbitron',monospace;font-size:14px;font-weight:700;color:#86efac;">&#8377;{pl:,.2f}</div>
+                    </div>
+                    <div style="background:#07111c;padding:10px 12px;">
+                        <div style="font-size:9px;letter-spacing:1.5px;font-weight:600;color:rgba(200,216,224,0.85);margin-bottom:5px;display:flex;align-items:center;gap:4px;">
+                            <span style="color:#94a3b8;">&#9679;</span> PREV CLOSE
+                        </div>
+                        <div style="font-family:'Orbitron',monospace;font-size:14px;font-weight:700;color:#c9d1d9;">&#8377;{pc:,.2f}</div>
+                    </div>
+                </div>
+
+                <!-- ── MAIN 3-COLUMN GRID: R Levels | Pivot Centre | S Levels ── -->
+                <div style="display:grid;grid-template-columns:1fr 130px 1fr;gap:1px;background:rgba(0,200,255,0.08);border-radius:4px;overflow:hidden;">
+
+                    <!-- LEFT: Resistance R3 / R2 / R1 — NEAREST R is dynamic -->
+                    <div style="background:#07111c;padding:12px 14px;">
+                        <!-- R3 -->
+                        <div style="display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid rgba(255,77,109,0.07);{'background:rgba(255,77,109,0.06);border-radius:2px;' if nearest_r_lbl=='R3' else ''}">
+                            <div style="display:flex;align-items:center;gap:5px;flex-wrap:wrap;">
+                                <span style="font-size:9px;font-weight:700;padding:2px 7px;border-radius:2px;background:rgba(255,77,109,{'0.18' if nearest_r_lbl=='R3' else '0.05'});color:{'#ff4d6d' if nearest_r_lbl=='R3' else 'rgba(255,100,130,0.5)'};border:1px solid rgba(255,77,109,{'0.4' if nearest_r_lbl=='R3' else '0.12'});">R3</span>
+                                {'<span style="font-size:7px;font-weight:700;padding:1px 5px;border-radius:2px;background:rgba(255,77,109,0.1);border:1px solid rgba(255,77,109,0.28);color:#ff6b85;letter-spacing:0.5px;">NEAREST R</span>' if nearest_r_lbl=='R3' else ''}
+                            </div>
+                            <div style="display:flex;align-items:center;gap:4px;">
+                                <span style="font-family:'Orbitron',monospace;font-size:{'14' if nearest_r_lbl=='R3' else '12'}px;font-weight:700;color:{'#ff6b85' if nearest_r_lbl=='R3' else 'rgba(255,143,163,0.5)'};">&#8377;{r3p:,.2f}</span>
+                                {'<span style="color:#ff6b85;font-size:11px;">&#9650;</span>' if nearest_r_lbl=='R3' else ''}
+                            </div>
+                        </div>
+                        <!-- R2 -->
+                        <div style="display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid rgba(255,77,109,0.1);{'background:rgba(255,77,109,0.06);border-radius:2px;' if nearest_r_lbl=='R2' else ''}">
+                            <div style="display:flex;align-items:center;gap:5px;flex-wrap:wrap;">
+                                <span style="font-size:9px;font-weight:700;padding:2px 7px;border-radius:2px;background:rgba(255,77,109,{'0.18' if nearest_r_lbl=='R2' else '0.08'});color:{'#ff4d6d' if nearest_r_lbl=='R2' else 'rgba(255,100,130,0.8)'};border:1px solid rgba(255,77,109,{'0.4' if nearest_r_lbl=='R2' else '0.18'});">R2</span>
+                                {'<span style="font-size:7px;font-weight:700;padding:1px 5px;border-radius:2px;background:rgba(255,77,109,0.1);border:1px solid rgba(255,77,109,0.28);color:#ff6b85;letter-spacing:0.5px;">NEAREST R</span>' if nearest_r_lbl=='R2' else ''}
+                            </div>
+                            <div style="display:flex;align-items:center;gap:4px;">
+                                <span style="font-family:'Orbitron',monospace;font-size:{'14' if nearest_r_lbl=='R2' else '13'}px;font-weight:700;color:{'#ff6b85' if nearest_r_lbl=='R2' else 'rgba(255,143,163,0.85)'};">&#8377;{r2p:,.2f}</span>
+                                {'<span style="color:#ff6b85;font-size:11px;">&#9650;</span>' if nearest_r_lbl=='R2' else ''}
+                            </div>
+                        </div>
+                        <!-- R1 -->
+                        <div style="display:flex;justify-content:space-between;align-items:center;padding:8px 0;{'background:rgba(255,77,109,0.04);border-radius:2px;margin-top:1px;' if nearest_r_lbl=='R1' else 'margin-top:1px;'}">
+                            <div style="display:flex;align-items:center;gap:5px;flex-wrap:wrap;">
+                                <span style="font-size:9px;font-weight:700;padding:2px 7px;border-radius:2px;background:rgba(255,77,109,{'0.18' if nearest_r_lbl=='R1' else '0.06'});color:{'#ff4d6d' if nearest_r_lbl=='R1' else 'rgba(255,100,130,0.45)'};border:1px solid rgba(255,77,109,{'0.4' if nearest_r_lbl=='R1' else '0.15'});">R1</span>
+                                {'<span style="font-size:7px;font-weight:700;padding:1px 5px;border-radius:2px;background:rgba(255,77,109,0.1);border:1px solid rgba(255,77,109,0.28);color:#ff6b85;letter-spacing:0.5px;">NEAREST R</span>' if nearest_r_lbl=='R1' else ''}
+                            </div>
+                            <div style="display:flex;align-items:center;gap:4px;">
+                                <span style="font-family:'Orbitron',monospace;font-size:{'14' if nearest_r_lbl=='R1' else '12'}px;font-weight:700;color:{'#ff6b85' if nearest_r_lbl=='R1' else 'rgba(255,143,163,0.38)'};">&#8377;{r1p:,.2f}</span>
+                                {'<span style="color:#ff6b85;font-size:11px;">&#9650;</span>' if nearest_r_lbl=='R1' else ''}
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- CENTRE: Pivot Point + NEAREST R + LTP -->
+                    <div style="background:#040c14;padding:10px 8px;display:flex;flex-direction:column;align-items:center;justify-content:space-between;gap:6px;border-left:1px solid rgba(79,195,247,0.14);border-right:1px solid rgba(79,195,247,0.14);">
+
+                        <!-- Pivot Point block -->
+                        <div style="text-align:center;width:100%;">
+                            <div style="font-size:8px;letter-spacing:2px;font-weight:700;color:#4fc3f7;text-transform:uppercase;margin-bottom:4px;">PIVOT POINT</div>
+                            <div style="font-family:'Orbitron',monospace;font-size:15px;font-weight:900;color:#4fc3f7;text-shadow:0 0 12px rgba(79,195,247,0.6);line-height:1;">&#8377;{pp:,.2f}</div>
+                            <div style="font-size:9px;font-weight:700;color:{'#00e676' if pp_dist >= 0 else '#f44336'};margin-top:4px;">LTP {pp_dist_sign}{pp_dist:.2f} pts {'above' if pp_dist >= 0 else 'below'} PP</div>
+                        </div>
+
+                        <!-- NEAREST R block — highlighted in red -->
+                        <div style="width:100%;background:rgba(255,77,109,0.1);border:1px solid rgba(255,77,109,0.38);border-radius:3px;padding:7px 8px;text-align:center;">
+                            <div style="font-size:8px;letter-spacing:1.5px;font-weight:700;color:#ff6b85;margin-bottom:4px;">&#9650; NEXT RES ({nearest_r_lbl})</div>
+                            <div style="font-family:'Orbitron',monospace;font-size:13px;font-weight:800;color:#ff4d6d;text-shadow:0 0 10px rgba(255,77,109,0.5);line-height:1;">&#8377;{dict(r_levels)[nearest_r_lbl]:,.2f}</div>
+                            <div style="font-size:9px;font-weight:700;color:#fca5a5;margin-top:4px;">+{round(dict(r_levels)[nearest_r_lbl]-cp,2):,.2f} pts away</div>
+                        </div>
+
+                        <!-- LTP chip -->
+                        <div style="background:rgba(79,195,247,0.12);border:1px solid rgba(79,195,247,0.35);border-radius:3px;padding:6px 8px;text-align:center;width:100%;">
+                            <div style="font-size:8px;letter-spacing:2px;font-weight:700;color:#00c8ff;margin-bottom:3px;">LTP</div>
+                            <div style="font-family:'Orbitron',monospace;font-size:13px;font-weight:700;color:#80deea;">&#8377;{cp:,.2f}</div>
+                        </div>
+
+                    </div>
+
+                    <!-- RIGHT: Support S1 / S2 / S3 — NEAREST S is dynamic -->
+                    <div style="background:#07111c;padding:12px 14px;">
+                        <!-- S1 -->
+                        <div style="display:flex;justify-content:space-between;align-items:center;padding:8px 0;{'background:rgba(0,230,118,0.04);border-radius:2px;' if nearest_s_lbl=='S1' else ''}margin-bottom:1px;">
+                            <div style="display:flex;align-items:center;gap:4px;">
+                                {'<span style="color:#26c6da;font-size:11px;">&#9660;</span>' if nearest_s_lbl=='S1' else ''}
+                                {'<span style="font-size:7px;font-weight:700;padding:1px 5px;border-radius:2px;background:rgba(0,230,118,0.1);border:1px solid rgba(0,230,118,0.28);color:#00e676;letter-spacing:0.5px;">NEAREST S</span>' if nearest_s_lbl=='S1' else ''}
+                            </div>
+                            <div style="display:flex;align-items:center;gap:4px;">
+                                <span style="font-size:9px;font-weight:700;padding:2px 7px;border-radius:2px;background:rgba(0,230,118,{'0.18' if nearest_s_lbl=='S1' else '0.06'});color:{'#00e676' if nearest_s_lbl=='S1' else 'rgba(0,200,100,0.5)'};border:1px solid rgba(0,230,118,{'0.4' if nearest_s_lbl=='S1' else '0.15'});">S1</span>
+                                <span style="font-family:'Orbitron',monospace;font-size:{'14' if nearest_s_lbl=='S1' else '12'}px;font-weight:700;color:{'#00e676' if nearest_s_lbl=='S1' else 'rgba(105,240,174,0.45)'};">&#8377;{s1p:,.2f}</span>
+                            </div>
+                        </div>
+                        <!-- S2 -->
+                        <div style="display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid rgba(0,230,118,0.1);border-top:1px solid rgba(0,230,118,0.07);{'background:rgba(0,230,118,0.04);border-radius:2px;' if nearest_s_lbl=='S2' else ''}">
+                            <div style="display:flex;align-items:center;gap:4px;">
+                                {'<span style="color:#26c6da;font-size:11px;">&#9660;</span>' if nearest_s_lbl=='S2' else ''}
+                                {'<span style="font-size:7px;font-weight:700;padding:1px 5px;border-radius:2px;background:rgba(0,230,118,0.1);border:1px solid rgba(0,230,118,0.28);color:#00e676;letter-spacing:0.5px;">NEAREST S</span>' if nearest_s_lbl=='S2' else ''}
+                            </div>
+                            <div style="display:flex;align-items:center;gap:4px;">
+                                <span style="font-size:9px;font-weight:700;padding:2px 7px;border-radius:2px;background:rgba(0,230,118,{'0.18' if nearest_s_lbl=='S2' else '0.08'});color:{'#00e676' if nearest_s_lbl=='S2' else 'rgba(0,200,100,0.8)'};border:1px solid rgba(0,230,118,{'0.4' if nearest_s_lbl=='S2' else '0.18'});">S2</span>
+                                <span style="font-family:'Orbitron',monospace;font-size:{'14' if nearest_s_lbl=='S2' else '13'}px;font-weight:700;color:{'#00e676' if nearest_s_lbl=='S2' else 'rgba(105,240,174,0.85)'};">&#8377;{s2p:,.2f}</span>
+                            </div>
+                        </div>
+                        <!-- S3 -->
+                        <div style="display:flex;justify-content:space-between;align-items:center;padding:8px 0;{'background:rgba(0,230,118,0.04);border-radius:2px;' if nearest_s_lbl=='S3' else ''}">
+                            <div style="display:flex;align-items:center;gap:4px;">
+                                {'<span style="color:#26c6da;font-size:11px;">&#9660;</span>' if nearest_s_lbl=='S3' else ''}
+                                {'<span style="font-size:7px;font-weight:700;padding:1px 5px;border-radius:2px;background:rgba(0,230,118,0.1);border:1px solid rgba(0,230,118,0.28);color:#00e676;letter-spacing:0.5px;">NEAREST S</span>' if nearest_s_lbl=='S3' else ''}
+                            </div>
+                            <div style="display:flex;align-items:center;gap:4px;">
+                                <span style="font-size:9px;font-weight:700;padding:2px 7px;border-radius:2px;background:rgba(0,230,118,{'0.18' if nearest_s_lbl=='S3' else '0.05'});color:{'#00e676' if nearest_s_lbl=='S3' else 'rgba(0,230,118,0.5)'};border:1px solid rgba(0,230,118,{'0.4' if nearest_s_lbl=='S3' else '0.12'});">S3</span>
+                                <span style="font-family:'Orbitron',monospace;font-size:{'14' if nearest_s_lbl=='S3' else '12'}px;font-weight:700;color:{'#00e676' if nearest_s_lbl=='S3' else 'rgba(105,240,174,0.45)'};">&#8377;{s3p:,.2f}</span>
+                            </div>
+                        </div>
+                    </div>
+
+                </div>
+            </div>
+
+            <!-- ── FOOTER BAR ──────────────────────────────────────────────── -->
+            <div style="background:rgba(0,0,0,0.45);border-top:1px solid rgba(0,200,255,0.1);padding:8px 18px;display:flex;justify-content:space-between;align-items:center;">
+                <span style="font-size:9px;font-weight:600;color:rgba(200,216,224,0.65);letter-spacing:1px;">Traditional &middot; Daily Candle</span>
+                <span style="font-size:9px;color:rgba(79,195,247,0.6);font-weight:700;letter-spacing:1px;">LTP &#8377;{cp:,.2f}</span>
+            </div>
+
+        </div>"""
+
+        return f"""
+    <div class="section">
+        <div class="section-title"><span>&#128204;</span> OPTION CHAIN &amp; PIVOT POINTS</div>
+        <div style="display:flex;gap:2px;flex-wrap:wrap;background:rgba(0,200,255,0.06);border:1px solid rgba(0,200,255,0.15);border-radius:6px;overflow:hidden;">
+            {oc_panel if d['has_option_data'] else '<div style="color:#8faabe;font-size:13px;padding:16px;">Option data unavailable</div>'}
+            {pv_panel}
+        </div>
+    </div>
+"""
+
+    def _key_levels_visual_section(self, d, _pct_cp, _pts_to_res, _pts_to_sup, _mp_node):
+        mp_row = f'<tr><td style="color:#ffb74d;">&#127919; Max Pain</td><td style="color:#ffb74d;">&#8377;{d["max_pain"]:,}</td></tr>' if d['has_option_data'] else ''
+        return f"""
+    <div class="section">
+        <div class="section-title"><span>&#128202;</span> KEY LEVELS</div>
+
+        <!-- Desktop/Tablet: visual bar (hidden on mobile <520px) -->
+        <div class="kl-bar-section">
+            <div style="display:flex;justify-content:space-between;margin-bottom:8px;">
+                <span style="font-size:11px;color:#26c6da;font-weight:700;letter-spacing:1px;">&#9668; SUPPORT ZONE</span>
+                <span style="font-size:11px;color:#f44336;font-weight:700;letter-spacing:1px;">RESISTANCE ZONE &#9658;</span>
+            </div>
+            <div style="position:relative;height:62px;">
+                <div class="rl-node-a" style="left:3%;"><div class="rl-lbl" style="color:#26c6da;">Strong<br>Support</div><div class="rl-val" style="color:#26c6da;">&#8377;{d['strong_support']:,.0f}</div><div class="rl-dot" style="background:#26c6da;margin:6px auto 0;"></div></div>
+                <div class="rl-node-a" style="left:22%;"><div class="rl-lbl" style="color:#00bcd4;">Support</div><div class="rl-val" style="color:#00bcd4;">&#8377;{d['support']:,.0f}</div><div class="rl-dot" style="background:#00bcd4;box-shadow:0 0 8px #00bcd4;margin:6px auto 0;"></div></div>
+                <div style="position:absolute;left:{_pct_cp}%;transform:translateX(-50%);bottom:4px;background:#4fc3f7;color:#000;font-size:11px;font-weight:700;padding:4px 13px;border-radius:6px;white-space:nowrap;z-index:10;box-shadow:0 0 16px rgba(79,195,247,0.7);">&#9660; NOW &nbsp;&#8377;{d['current_price']:,.0f}</div>
+                <div class="rl-node-a" style="left:75%;"><div class="rl-lbl" style="color:#ff7043;">Resistance</div><div class="rl-val" style="color:#ff7043;">&#8377;{d['resistance']:,.0f}</div><div class="rl-dot" style="background:#ff7043;box-shadow:0 0 8px #ff7043;margin:6px auto 0;"></div></div>
+                <div class="rl-node-a" style="left:95%;"><div class="rl-lbl" style="color:#f44336;">Strong<br>Resistance</div><div class="rl-val" style="color:#f44336;">&#8377;{d['strong_resistance']:,.0f}</div><div class="rl-dot" style="background:#f44336;margin:6px auto 0;"></div></div>
+            </div>
+            <div style="position:relative;height:8px;border-radius:4px;background:linear-gradient(90deg,#26c6da 0%,#00bcd4 20%,#4fc3f7 40%,#ffb74d 58%,#ff7043 76%,#f44336 100%);box-shadow:0 2px 14px rgba(0,0,0,0.5);">
+                <div style="position:absolute;left:{_pct_cp}%;top:50%;transform:translate(-50%,-50%);width:4px;height:22px;background:#fff;border-radius:2px;box-shadow:0 0 16px rgba(255,255,255,1);z-index:10;"></div>
+            </div>
+            <div style="position:relative;height:58px;">{_mp_node}</div>
+        </div>
+
+        <!-- Mobile: compact table (shown only on <520px) -->
+        <table class="kl-mobile-table">
+            <tr><td style="color:#26c6da;">&#9660; Strong Support</td><td style="color:#26c6da;">&#8377;{d['strong_support']:,.0f}</td></tr>
+            <tr><td style="color:#00bcd4;">&#9660; Support (S1)</td><td style="color:#00bcd4;">&#8377;{d['support']:,.0f}</td></tr>
+            <tr><td style="color:#4fc3f7;font-weight:700;">&#9654; NOW</td><td style="color:#4fc3f7;font-weight:700;">&#8377;{d['current_price']:,.0f}</td></tr>
+            {mp_row}
+            <tr><td style="color:#ff7043;">&#9650; Resistance (R1)</td><td style="color:#ff7043;">&#8377;{d['resistance']:,.0f}</td></tr>
+            <tr><td style="color:#f44336;">&#9650; Strong Resistance</td><td style="color:#f44336;">&#8377;{d['strong_resistance']:,.0f}</td></tr>
+        </table>
+
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:12px;">
+            <div style="background:rgba(244,67,54,0.08);border:1px solid rgba(244,67,54,0.25);border-radius:8px;padding:10px 16px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:4px;">
+                <span style="font-size:12px;color:#c8d8e0;">&#128205; To Resistance</span>
+                <span style="font-size:15px;font-weight:700;color:#f44336;">+{_pts_to_res:,} pts</span>
+            </div>
+            <div style="background:rgba(0,188,212,0.08);border:1px solid rgba(0,188,212,0.25);border-radius:8px;padding:10px 16px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:4px;">
+                <span style="font-size:12px;color:#c8d8e0;">&#128205; To Support</span>
+                <span style="font-size:15px;font-weight:700;color:#00bcd4;">\u2212{_pts_to_sup:,} pts</span>
+            </div>
+        </div>
+    </div>
+"""
+
+    def generate_html_email(self, vol_support=None, vol_resistance=None, global_bias=None, vol_view="normal"):
+        d=self.html_data
+        # ── Header derived values ─────────────────────────────────────────
+        # Expiry countdown
+        try:
+            from datetime import datetime as _dt
+            expiry_dt = _dt.strptime(d.get('expiry',''), '%d-%b-%Y')
+            days_left = (expiry_dt.date() - _dt.now().date()).days
+            expiry_days_str = f"{days_left}d left" if days_left >= 0 else "Expired"
+            expiry_days_col = '#00e676' if days_left > 3 else ('#ff9800' if days_left > 0 else '#ff4757')
+        except Exception:
+            expiry_days_str = '—'; expiry_days_col = '#ffb74d'
+        # VIX
+        vix_val   = d.get('vix_val')
+        vix_trend = d.get('vix_trend','')
+        vix_str   = f"{vix_val:.1f}" if vix_val else 'N/A'
+        vix_arrow = ' ▲' if vix_trend == 'rising' else (' ▼' if vix_trend == 'falling' else '')
+        vix_col   = '#ff9800' if vix_val and vix_val > 16 else ('#00e676' if vix_val and vix_val < 13 else '#ffb74d')
+        # FII/DII net
+        fii_summ  = d.get('fii_dii_summ', {})
+        fii_avg   = fii_summ.get('fii_avg', 0)
+        dii_avg   = fii_summ.get('dii_avg', 0)
+        fii_col   = '#ff4757' if fii_avg < 0 else '#00e676'
+        dii_col   = '#00e676' if dii_avg >= 0 else '#ff4757'
+        fii_hdr   = f"{'+'if fii_avg>=0 else ''}{fii_avg:,.0f}Cr"
+        dii_hdr   = f"{'+'if dii_avg>=0 else ''}{dii_avg:,.0f}Cr"
+        # Global bias
+        gb_str  = (global_bias or 'N/A').upper()
+        gb_col  = '#00e676' if gb_str=='BULLISH' else ('#ff4757' if gb_str=='BEARISH' else '#ffb74d')
+        # Spot + PCR colours
+        pcr_v   = d.get('pcr', 1.0) if d.get('has_option_data') else 1.0
+        pcr_col = '#00e676' if pcr_v > 1.1 else ('#ff4757' if pcr_v < 0.9 else '#ffb74d')
+        sma20_bar ='bar-teal' if d['sma_20_above']  else 'bar-red'
+        sma50_bar ='bar-teal' if d['sma_50_above']  else 'bar-red'
+        sma200_bar='bar-teal' if d['sma_200_above'] else 'bar-red'
+        macd_bar  ='bar-teal' if d['macd_bullish']  else 'bar-red'
+        sma20_badge ='bullish' if d['sma_20_above']  else 'bearish'
+        sma50_badge ='bullish' if d['sma_50_above']  else 'bearish'
+        sma200_badge='bullish' if d['sma_200_above'] else 'bearish'
+        macd_badge  ='bullish' if d['macd_bullish']  else 'bearish'
+        sma20_lbl ='Above'  if d['sma_20_above']  else 'Below'
+        sma50_lbl ='Above'  if d['sma_50_above']  else 'Below'
+        sma200_lbl='Above'  if d['sma_200_above'] else 'Below'
+        macd_lbl  ='Bullish' if d['macd_bullish']  else 'Bearish'
+        sma20_ico ='\u2705' if d['sma_20_above']  else '\u274c'
+        sma50_ico ='\u2705' if d['sma_50_above']  else '\u274c'
+        sma200_ico='\u2705' if d['sma_200_above'] else '\u274c'
+        macd_ico  ='\U0001f7e2' if d['macd_bullish'] else '\U0001f534'
+        # ── Technical Indicators: Option A pill strip ────────────────────
+        def _pill(lbl, val, badge, badge_cls):
+            if   badge_cls == 'bullish': col='#00e676'; bg='rgba(0,230,118,0.08)';  bdr='rgba(0,230,118,0.25)';  bdg_bg='rgba(0,230,118,0.14)';  bdg_col='#00e676'
+            elif badge_cls == 'bearish': col='#ff4757'; bg='rgba(255,71,87,0.08)';  bdr='rgba(255,71,87,0.25)';  bdg_bg='rgba(255,71,87,0.14)';  bdg_col='#ff4757'
+            else:                        col='#ffb74d'; bg='rgba(255,183,77,0.07)'; bdr='rgba(255,183,77,0.22)'; bdg_bg='rgba(255,183,77,0.14)'; bdg_col='#ffb74d'
+            return (
+                f'<div style="display:flex;align-items:center;gap:7px;padding:6px 13px;border-radius:20px;'
+                f'border:1px solid {bdr};background:{bg};white-space:nowrap;">'
+                f'<span style="font-size:9px;letter-spacing:1.5px;color:rgba(128,222,234,0.6);text-transform:uppercase;">{lbl}</span>'
+                f'<span style="font-family:JetBrains Mono,monospace;font-size:13px;font-weight:700;color:{col};">{val}</span>'
+                f'<span style="font-size:8px;font-weight:700;padding:1px 7px;border-radius:8px;letter-spacing:0.5px;'
+                f'background:{bdg_bg};color:{bdg_col};">{badge}</span>'
+                f'</div>'
+            )
+        rsi_val   = d['rsi'];      rsi_badge_cls = 'bullish' if rsi_val < 30 else ('bearish' if rsi_val > 70 else 'neutral')
+        rsi_badge = d['rsi_status']
+        tech_pills = (
+            _pill('RSI 14',    f"{d['rsi']:.1f}",          rsi_badge,   rsi_badge_cls) +
+            _pill('SMA 20',    f"\u20b9{d['sma_20']:,.0f}", sma20_lbl,   sma20_badge) +
+            _pill('SMA 50',    f"\u20b9{d['sma_50']:,.0f}", sma50_lbl,   sma50_badge) +
+            _pill('SMA 200',   f"\u20b9{d['sma_200']:,.0f}",sma200_lbl,  sma200_badge) +
+            _pill('MACD',      f"{d['macd']:.0f}",          macd_lbl,    macd_badge)
+        )
+        if d.get('has_option_data'):
+            pcr_v = d.get('pcr', 1.0)
+            pcr_badge_cls = 'bullish' if pcr_v > 1.1 else ('bearish' if pcr_v < 0.9 else 'neutral')
+            pcr_lbl = 'Bullish' if pcr_v > 1.1 else ('Bearish' if pcr_v < 0.9 else 'Neutral')
+            tech_pills += _pill('PCR', f"{pcr_v:.3f}", pcr_lbl, pcr_badge_cls)
+        tech_cards = tech_pills  # kept same variable name so injection point unchanged
+        oc_cards = self._build_enhanced_oc_cards()
+        _cp  = d['current_price']
+        _ss  = d['strong_support']    if d.get('strong_support')    is not None else (_cp - 300)
+        _sr  = d['strong_resistance'] if d.get('strong_resistance') is not None else (_cp + 300)
+        _rng = (_sr - _ss) if _sr != _ss else 1
+        def _pct_real(val): return round(max(3,min(97,(val-_ss)/_rng*100)),2)
+        _pct_cp     = _pct_real(_cp)
+        _pts_to_res = int(d['resistance'] - _cp) if d.get('resistance') is not None else 0
+        _pts_to_sup = int(_cp - d['support'])     if d.get('support')    is not None else 0
+        _mp_node=""
+        if d['has_option_data']:
+            _mp_node=(f'<div class="rl-node-b" style="left:43%;">'
+                      f'<div class="rl-dot" style="background:#ffb74d;box-shadow:0 0 8px #ffb74d;margin:0 auto 5px;"></div>'
+                      f'<div class="rl-lbl" style="color:#ffb74d;">Max Pain</div>'
+                      f'<div class="rl-val" style="color:#ffb74d;">\u20b9{d["max_pain"]:,}</div></div>')
+
+        checklist_tab_html = build_strategy_checklist_html(
+            d, vol_support=vol_support, vol_resistance=vol_resistance,
+            global_bias=global_bias, vol_view=vol_view,
+            vix_val=d.get('vix_val'), vix_trend=d.get('vix_trend')
+        )
+        intraday_oi_tab_html = build_intraday_oi_tab_html()
+        pretrade_tab_html = build_pretrade_checklist_tab_html()
+
+        # ── Weekly Outlook tab HTML ───────────────────────────────────
+        weekly_outlook_data = compute_weekly_outlook(d, vix_val=d.get('vix_val'))
+        weekly_outlook_tab_html = build_weekly_outlook_tab_html(weekly_outlook_data)
+
+        # ── Heatmap tab HTML ─────────────────────────────────────────
+        heatmap_tab_html = build_heatmap_tab_html(
+            self.heatmap_data,
+            self.heatmap_timestamp,
+            self.heatmap_advance,
+            self.heatmap_decline,
+            self.heatmap_neutral,
+        )
+
+        # ── Heatmap-specific CSS ─────────────────────────────────────
+        heatmap_css = get_heatmap_css()
+        pretrade_css = get_pretrade_checklist_css()
+
+        # ── Heatmap JavaScript ───────────────────────────────────────
+        heatmap_js = get_heatmap_javascript()
+
+        # ── Main JavaScript (all tabs + OI trend logic) ──────────────
+        all_js = """
 <script>
-// ── Logo rotator ────────────────────────────────────────────────
 (function() {
-  const NAMES = ['NIFTYLENS','Options Analytics Hub','OI Signal Dashboard','Smart PoP Engine','PCR & Max Pain Tracker'];
-  const wrap = document.getElementById('logoWrap');
-  if (!wrap) return;
-  NAMES.forEach((name, i) => {
-    const el = document.createElement('div');
-    el.className = 'logo-slide' + (i === 0 ? ' active' : '');
-    el.textContent = name;
-    wrap.appendChild(el);
-  });
-  let cur = 0;
-  setInterval(() => {
-    const slides = wrap.querySelectorAll('.logo-slide');
-    slides[cur].classList.remove('active');
-    slides[cur].classList.add('exit');
-    setTimeout(() => slides[cur].classList.remove('exit'), 600);
-    cur = (cur + 1) % slides.length;
-    slides[cur].classList.add('active');
-  }, 4000);
+    var INTERVAL  = 30000;
+    var countdown = INTERVAL / 1000;
+
+    function istNow() { return new Date(new Date().toLocaleString('en-US',{timeZone:'Asia/Kolkata'})); }
+    function pad(n){ return String(n).padStart(2,'0'); }
+
+    // ── Sidebar offset: measures sticky header height and sets CSS var ──────
+    function setSidebarOffset() {
+        var hdr = document.querySelector('.header');
+        if (hdr) {
+            var h = hdr.getBoundingClientRect().height;
+            document.documentElement.style.setProperty('--header-h', h + 'px');
+        }
+    }
+    setSidebarOffset();
+    window.addEventListener('resize', setSidebarOffset);
+    function fmtTime(d){ return pad(d.getHours())+':'+pad(d.getMinutes())+':'+pad(d.getSeconds()); }
+    function fmtDate(d){
+        var M=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+        return pad(d.getDate())+'-'+M[d.getMonth()]+'-'+d.getFullYear();
+    }
+    function tick() {
+        var now = istNow();
+        var clockEl = document.getElementById('live-ist-clock');
+        if (clockEl) clockEl.textContent = fmtDate(now) + '  ' + fmtTime(now) + ' IST';
+        countdown--;
+        if (countdown < 0) countdown = INTERVAL / 1000;
+        var cdEl = document.getElementById('refresh-countdown');
+        if (cdEl) { var s=countdown%60; var m=Math.floor(countdown/60); cdEl.textContent=(m>0?m+'m ':'')+s+'s'; }
+    }
+    setInterval(tick, 1000);
+    tick();
+
+    // ── Option 2: JSON timestamp polling ──────────────────────────────────
+    // Polls latest_report_banknifty.json every 30s. Only reloads the page when the
+    // Python script has actually re-run and the timestamp changed.
+    // Saves active tab before reload → restores it after → no tab jump.
+    var _lastKnownTimestamp = null;
+
+    function getActiveTab() {
+        var active = document.querySelector('.tab-btn.active');
+        return active ? active.getAttribute('data-tab') : null;
+    }
+
+    function pollForUpdate() {
+        fetch('latest_report_banknifty.json?_=' + Date.now())   // cache-bust
+            .then(function(r) { return r.json(); })
+            .then(function(data) {
+                var ts = data.timestamp || null;
+                if (_lastKnownTimestamp === null) {
+                    // First load — just store the current timestamp, don't reload
+                    _lastKnownTimestamp = ts;
+                } else if (ts && ts !== _lastKnownTimestamp) {
+                    // Save scroll position + active tab before reload
+                    var activeTab = getActiveTab();
+                    if (activeTab) sessionStorage.setItem('activeTab', activeTab);
+                    var scrollY = window.scrollY || window.pageYOffset;
+                    sessionStorage.setItem('scrollY', scrollY);
+                    console.log('[AutoRefresh] New data (' + ts + ') — fading out then reloading…');
+                    // Smooth fade-out before reload — no white flash
+                    document.body.style.transition = 'opacity 0.25s ease';
+                    document.body.style.opacity = '0';
+                    setTimeout(function(){ location.reload(); }, 260);
+                }
+                // else: same timestamp → do nothing
+            })
+            .catch(function(err) {
+                // latest_report_banknifty.json not found or server not running — silently ignore
+                console.warn('[AutoRefresh] Could not fetch latest_report_banknifty.json:', err);
+            });
+        countdown = INTERVAL / 1000;
+    }
+    setInterval(pollForUpdate, INTERVAL);
+    pollForUpdate();   // run once immediately on page load to capture baseline timestamp
+
+    // ── Restore tab + scroll position after reload ────────────────────────
+    (function restoreTabAfterReload() {
+        var savedTab = sessionStorage.getItem('activeTab');
+        var savedScroll = sessionStorage.getItem('scrollY');
+
+        if (savedTab) {
+            sessionStorage.removeItem('activeTab');
+            setTimeout(function() { switchTab(savedTab); }, 50);
+        }
+        if (savedScroll) {
+            sessionStorage.removeItem('scrollY');
+            // Restore scroll while page is still hidden (hidden by <head> script)
+            window.scrollTo(0, parseInt(savedScroll, 10));
+            // Wait for browser to apply scroll, then fade in
+            requestAnimationFrame(function() {
+                requestAnimationFrame(function() {
+                    document.documentElement.style.transition = 'opacity 0.3s ease';
+                    document.documentElement.style.opacity = '1';
+                    document.documentElement.style.overflow = '';
+                    document.body.style.opacity = '1';
+                });
+            });
+        }
+    })();
 })();
 
-// ── Silent Background Refresh Engine (v18.3) ───────────────────
-(function() {
-  const TOTAL_SECS = 30;
-  const R = 7, C = 2 * Math.PI * R;
+function switchTab(tab) {
+    document.querySelectorAll('.tab-panel').forEach(function(p){ p.classList.remove('active'); });
+    document.querySelectorAll('.tab-btn').forEach(function(b){ b.classList.remove('active'); });
+    var panel=document.getElementById('tab-'+tab);
+    var btn=document.querySelector('[data-tab="'+tab+'"]');
+    if(panel) panel.classList.add('active');
+    if(btn)   btn.classList.add('active');
+    if(tab==='oi-trend') loadOILog();
+    if(tab==='heatmap') { window.renderHeatmap && window.renderHeatmap(); }
+}
 
-  function setCountdownUI(secs) {
-    const numEl = document.getElementById('cdNum');
-    const arcEl = document.getElementById('cdArc');
-    if (numEl) {
-      numEl.textContent = secs;
-      numEl.className = 'countdown-num' +
-        (secs <= 5 ? ' urgent' : secs <= 15 ? ' halfway' : '');
-    }
-    if (arcEl) {
-      arcEl.style.strokeDashoffset = (C * (1 - secs / TOTAL_SECS)).toFixed(2);
-      arcEl.style.stroke = secs <= 5 ? '#ff6b6b' : secs <= 15 ? '#ffd166' : '#00c896';
-    }
-  }
-
-  function showSpinner(on) {
-    const ring = document.getElementById('refreshRing');
-    if (ring) ring.classList.toggle('active', on);
-  }
-
-  function flashUpdated() {
-    const txt = document.getElementById('refreshStatus');
-    if (!txt) return;
-    txt.textContent = 'Updated \u2713';
-    txt.classList.add('updated');
-    setTimeout(() => { txt.textContent = ''; txt.classList.remove('updated'); }, 2500);
-  }
-
-  const PATCH_IDS = [
-    'heroWidget','oi','kl','strikes','greeksTable','greeksPanel','tkTrack','lastUpdatedTs','mainPanelStrat'
-  ];
-
-  function microDiff(newDoc) {
-    let changed = false;
-
-    // ── 1. Capture ALL scroll positions BEFORE touching DOM ──────
-    const winScrollY   = window.scrollY || window.pageYOffset || 0;
-    const winScrollX   = window.scrollX || window.pageXOffset || 0;
-    const contentEl    = document.querySelector('.content');
-    const sidebarEl    = document.querySelector('.sidebar-scroll') || document.querySelector('.sidebar');
-    const bodyEl       = document.documentElement;
-    const contentST    = contentEl  ? contentEl.scrollTop  : 0;
-    const contentSL    = contentEl  ? contentEl.scrollLeft : 0;
-    const sidebarST    = sidebarEl  ? sidebarEl.scrollTop  : 0;
-
-    function restoreScroll() {
-      if (contentEl)  { contentEl.scrollTop  = contentST; contentEl.scrollLeft = contentSL; }
-      if (sidebarEl)  { sidebarEl.scrollTop  = sidebarST; }
-      try { window.scrollTo({ left: winScrollX, top: winScrollY, behavior: 'instant' }); } catch(e) {
-        try { window.scrollTo(winScrollX, winScrollY); } catch(e2) {}
-      }
-      if (bodyEl) { bodyEl.scrollTop = winScrollY; }
-    }
-
-    // ── 2. Capture UI state BEFORE patching ─────────────────────
-    const expandedCard = document.querySelector('.sc-card.expanded');
-    const expandedId   = expandedCard ? expandedCard.id : null;
-
-    // Read active filter from button state (not innerHTML — survives patch)
-    const activeFilter = (function() {
-      const tabs = document.querySelectorAll('.sc-tab');
-      for (let i = 0; i < tabs.length; i++) {
-        const bc = tabs[i].style.borderColor;
-        if (bc && bc !== 'rgba(255, 255, 255, 0.15)' && bc !== 'transparent' && bc !== '') {
-          const txt = tabs[i].textContent.toUpperCase();
-          if (txt.includes('BEAR')) return 'bearish';
-          if (txt.includes('NON'))  return 'nondirectional';
-          return 'bullish';
+function filterStrats(type, btn) {
+    document.querySelectorAll('.filter-btn').forEach(function(b){ b.classList.remove('active'); });
+    btn.classList.add('active');
+    // Close all open panels first
+    document.querySelectorAll('.sc-dp').forEach(function(p){ p.classList.remove('sc-dp-open'); });
+    document.querySelectorAll('.sc-row').forEach(function(r){ r.classList.remove('sc-selected'); });
+    // Show/hide rows and their paired panels
+    document.querySelectorAll('.sc-row').forEach(function(r){
+        var show = (type === 'all' || r.dataset.type === type);
+        r.style.display = show ? '' : 'none';
+        var chev = r.querySelector('.sc-row-chevron');
+        if (chev) {
+            var pid = chev.id.replace('chev-', '');
+            var panel = document.getElementById(pid);
+            if (panel) panel.style.display = show ? '' : 'none';
         }
-      }
-      return 'bullish';
-    })();
+    });
+}
 
-    // Read main tab from button active class (buttons not patched)
-    const mainTab = (function() {
-      const btn = document.getElementById('mainTabStrat');
-      return (btn && btn.classList.contains('active')) ? 'strat' : 'oi';
-    })();
+/* ── Compact row toggle / close / load ─────────────────────── */
+function scToggle(row, panelId) {
+    var panel      = document.getElementById(panelId);
+    var wasOpen    = panel && panel.classList.contains('sc-dp-open');
+    var wasSelected = row.classList.contains('sc-selected');
+    // Close everything
+    document.querySelectorAll('.sc-dp').forEach(function(p){ p.classList.remove('sc-dp-open'); });
+    document.querySelectorAll('.sc-row').forEach(function(r){ r.classList.remove('sc-selected'); });
+    // If it wasn't already open, open it
+    if (!wasSelected || !wasOpen) {
+        row.classList.add('sc-selected');
+        if (panel) {
+            panel.classList.add('sc-dp-open');
+            setTimeout(function(){ panel.scrollIntoView({ behavior:'smooth', block:'nearest' }); }, 50);
+        }
+        selectStrat(row);
+    }
+}
 
-    const greeksSelEl  = document.getElementById('greeksStrikeSelect');
-    const greeksSelVal = greeksSelEl ? greeksSelEl.value : null;
-    const activeInstr  = (typeof _activeInstrument !== 'undefined') ? _activeInstrument : 'BANKNIFTY';
+function scClose(panelId, evt) {
+    if (evt) evt.stopPropagation();
+    var panel = document.getElementById(panelId);
+    if (panel) panel.classList.remove('sc-dp-open');
+    document.querySelectorAll('.sc-row').forEach(function(r){ r.classList.remove('sc-selected'); });
+}
 
-    // ── 3. Patch sections — SKIP mainPanelStrat if card is open ──
-    PATCH_IDS.forEach(function(id) {
-      if (id === 'mainPanelStrat' && expandedId) return;
-      const curEl = document.getElementById(id);
-      const newEl = newDoc.getElementById(id);
-      if (!curEl || !newEl) return;
-      if (curEl.innerHTML !== newEl.innerHTML) {
-        curEl.innerHTML = newEl.innerHTML;
-        changed = true;
-      }
+function scLoadPlan(safeName, evt) {
+    if (evt) evt.stopPropagation();
+    // Decode HTML entities
+    var tmp = document.createElement('textarea');
+    tmp.innerHTML = safeName;
+    var stratName = tmp.value;
+    var mapEl = document.getElementById('stratDataMap');
+    var stratMap = {};
+    try { stratMap = JSON.parse(mapEl.textContent || mapEl.innerHTML); } catch(e){}
+    var info = stratMap[stratName] || {};
+    _applyTradePlan(stratName, info.strike || 'N/A', info.rank || 'PRIMARY', typeof info.rr === 'number' ? info.rr : 0);
+    // Button flash
+    if (evt && evt.target) {
+        var btn = evt.target, orig = btn.innerHTML;
+        btn.innerHTML = '&#10003; Loaded!';
+        btn.style.background = 'linear-gradient(135deg,#00e676,#00796b)';
+        setTimeout(function(){ btn.innerHTML = orig; btn.style.background = ''; }, 1500);
+    }
+    // Scroll to trade plan
+    var bannerEl = document.getElementById('tp-banner');
+    if (bannerEl) { var s = bannerEl.closest('.section'); if (s) s.scrollIntoView({ behavior:'smooth', block:'start' }); }
+}
+
+function _applyTradePlan(stratName, strikeRec, rank, rr) {
+    var nameEl   = document.getElementById('tp-strat-name');
+    var strikeEl = document.getElementById('tp-strike-rec');
+    var rankEl   = document.getElementById('tp-rank-badge');
+    var bannerEl = document.getElementById('tp-banner');
+    if (nameEl)   nameEl.textContent = stratName;
+    if (strikeEl) strikeEl.innerHTML = '&#127919; ' + strikeRec;
+    if (rankEl)   { rankEl.textContent = rank; rankEl.className = 'tp-rank-badge tp-rank-' + rank.toLowerCase(); }
+    if (bannerEl) { bannerEl.classList.add('tp-banner-flash'); setTimeout(function(){ bannerEl.classList.remove('tp-banner-flash'); }, 600); }
+}
+
+function selectStrat(row) {
+    if (!row || !row.dataset) return;
+    var tmp = document.createElement('textarea');
+    tmp.innerHTML = row.dataset.strat || '';
+    var stratName = tmp.value;
+    var mapEl = document.getElementById('stratDataMap');
+    var stratMap = {};
+    try { stratMap = JSON.parse(mapEl.textContent || mapEl.innerHTML); } catch(e){}
+    var info = stratMap[stratName] || {};
+    _applyTradePlan(stratName, info.strike || 'N/A', info.rank || 'PRIMARY', typeof info.rr === 'number' ? info.rr : 0);
+}
+
+var _oiInterval = 3;
+var _oiData     = [];
+
+function setOIInterval(mins, btn) {
+    _oiInterval = mins;
+    document.querySelectorAll('.oi-int-btn').forEach(function(b){ b.classList.remove('active'); });
+    btn.classList.add('active');
+    renderOITable(_oiData);
+}
+
+function fmtIN(n) {
+    var abs = Math.abs(n);
+    var sign = n < 0 ? '-' : '+';
+    if (abs >= 10000000) return sign + (abs/10000000).toFixed(2) + ' Cr';
+    if (abs >= 100000)   return sign + (abs/100000).toFixed(2)   + ' L';
+    if (abs === 0)       return '0';
+    return (n < 0 ? '-' : '+') + abs.toLocaleString('en-IN');
+}
+
+function signalHtml(sig) {
+    var s = (sig||'').toUpperCase().trim();
+    if (s === 'STRONG SELL') return '<span class="oi-signal-ssell">STRONG SELL</span>';
+    if (s === 'SELL')        return '<span class="oi-signal-sell">SELL</span>';
+    if (s === 'STRONG BUY')  return '<span class="oi-signal-sbuy">STRONG BUY</span>';
+    if (s === 'BUY')         return '<span class="oi-signal-buy">BUY</span>';
+    return '<span class="oi-signal-neutral">NEUTRAL</span>';
+}
+
+function vsigHtml(sig) {
+    return (sig||'').toUpperCase() === 'BUY'
+        ? '<span class="oi-vsig-buy">BUY</span>'
+        : '<span class="oi-vsig-sell">SELL</span>';
+}
+
+function filterByInterval(data, mins) {
+    // Step 1: Restrict to today only (use date from most-recent entry's timestamp)
+    var todayData = data;
+    if (data && data.length > 0) {
+        var latestTs  = data[0].timestamp || '';
+        var todayDate = latestTs.split(' ')[0]; // "04-Mar-2026"
+        if (todayDate) {
+            todayData = data.filter(function(row) {
+                return (row.timestamp || '').startsWith(todayDate);
+            });
+        }
+    }
+    if (mins === 3) return todayData;
+    // Step 2: Group by date+hour:slot so same time on different days never merges
+    var grouped = {};
+    todayData.forEach(function(row) {
+        var ts      = row.timestamp || '';
+        var dateKey = ts.split(' ')[0] || 'unknown';
+        var parts   = (row.time||'00:00').split(':');
+        var h       = parseInt(parts[0]||0);
+        var m       = parseInt(parts[1]||0);
+        var slotMin = Math.floor(m / mins) * mins;
+        var key     = dateKey + '|' + String(h).padStart(2,'0') + ':' + String(slotMin).padStart(2,'0');
+        if (!grouped[key]) grouped[key] = [];
+        grouped[key].push(row);
+    });
+    var keys = Object.keys(grouped).sort().reverse();
+    return keys.map(function(key) {
+        var rows    = grouped[key];
+        // rows[0] = newest snapshot in this window (data is reverse-chronological)
+        var latest  = rows[0];
+        var displayTime = key.split('|')[1];
+        return {
+            time:          displayTime,
+            // FIX: OI values are cumulative snapshots (today vs yesterday), NOT deltas.
+            // Summing them across snapshots was wrong (5x inflation). Use latest snapshot.
+            call_oi_chg:   latest.call_oi_chg || 0,
+            put_oi_chg:    latest.put_oi_chg  || 0,
+            diff:          (latest.put_oi_chg||0) - (latest.call_oi_chg||0),
+            pcr:           latest.pcr,
+            opt_signal:    latest.opt_signal,
+            vwap:           latest.vwap,
+            spot_price:     latest.spot_price,
+            nifty_move_pct: latest.nifty_move_pct,
+            nearest_level:  latest.nearest_level,
+            nearest_label:  latest.nearest_label,
+            distance_pts:   latest.distance_pts,
+            vwap_signal:    latest.vwap_signal,
+            rsi_15m:        latest.rsi_15m,
+            ema_signal:     latest.ema_signal,
+            ema5:           latest.ema5,
+            ema13:          latest.ema13,
+            bias:           latest.bias,
+            support:        latest.support,
+            resistance:     latest.resistance,
+            strong_support:     latest.strong_support,
+            strong_resistance:  latest.strong_resistance,
+            timestamp:      latest.timestamp,
+            _isLive:       rows[0]._isLive,
+        };
+    });
+}
+
+/* ── FOCUS / DETAIL view toggle ───────────────────────────── */
+var _oiViewMode = 'focus';
+function setOIView(mode) {
+    _oiViewMode = mode;
+    try { history.replaceState(null, '', mode === 'detail' ? '#oi-detail' : ' '); } catch(e) {}
+    var tableWrap = document.querySelector('.oi-table-wrap');
+    if (!tableWrap) return;
+    if (mode === 'detail') {
+        tableWrap.classList.add('oi-detail-mode');
+    } else {
+        tableWrap.classList.remove('oi-detail-mode');
+    }
+    var btnFocus  = document.getElementById('btnFocus');
+    var btnDetail = document.getElementById('btnDetail');
+    if (btnFocus)  btnFocus.classList.toggle('oi-view-active',  mode === 'focus');
+    if (btnDetail) btnDetail.classList.toggle('oi-view-active', mode === 'detail');
+}
+/* Restore last chosen OI view mode (default: focus) */
+window.addEventListener('load', function(){ setOIView(location.hash === '#oi-detail' ? 'detail' : 'focus'); });
+
+/* ══ ELAPSED TIMER SYSTEM — replaces static LIVE badge ══════════════════ */
+var _elapsedTimerRef = null;   // Date.now() when current live entry was first seen
+var _elapsedTimerKey = '';     // time string of the current live entry (e.g. "09:20")
+var _elapsedTimerInterval = null;
+
+function _startElapsedTimer(entryTime) {
+    // If the live entry changed, reset the reference
+    if (entryTime !== _elapsedTimerKey) {
+        _elapsedTimerKey = entryTime;
+        _elapsedTimerRef = Date.now();
+    }
+    // Clear any previous interval
+    if (_elapsedTimerInterval) clearInterval(_elapsedTimerInterval);
+    // Tick every second
+    _elapsedTimerInterval = setInterval(_updateElapsedDisplays, 1000);
+    _updateElapsedDisplays();
+}
+
+function _fmtElapsed(ms) {
+    var totalSec = Math.floor(ms / 1000);
+    var m = Math.floor(totalSec / 60);
+    var s = totalSec % 60;
+    return m + 'm:' + (s < 10 ? '0' : '') + s + 's';
+}
+
+function _updateElapsedDisplays() {
+    if (!_elapsedTimerRef) return;
+    var elapsed = Date.now() - _elapsedTimerRef;
+    var txt = _fmtElapsed(elapsed);
+    // Update all elapsed badges in OI table
+    var oiBadges = document.querySelectorAll('.oi-elapsed');
+    oiBadges.forEach(function(el){ el.textContent = txt; });
+    // Update all elapsed badges in NLF panel
+    var nlfBadges = document.querySelectorAll('.nlf-elapsed');
+    nlfBadges.forEach(function(el){ el.textContent = txt; });
+}
+
+function renderOITable(data) {
+    var tbody = document.getElementById('oiTableBody');
+    if (!tbody) return;
+    if (!data || data.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="15" class="oi-empty-state">&#128218; No data yet.</td></tr>';
+        return;
+    }
+    var filtered = filterByInterval(data, _oiInterval);
+    var latest = filtered[0];
+
+    // ── Update summary cards (text only, no DOM rebuild) ──
+    if (latest) {
+        var el;
+        el = document.getElementById('oiLatestPCR'); if (el) el.textContent = latest.pcr || '—';
+        el = document.getElementById('oiLatestDiff');
+        if (el) { el.textContent = fmtIN(latest.diff || 0); el.className = 'oi-sum-val ' + ((latest.diff||0) >= 0 ? 'oi-diff-pos' : 'oi-diff-neg'); }
+        el = document.getElementById('oiLatestSpot'); if (el) el.textContent = '₹' + ((latest.spot_price||0).toLocaleString('en-IN'));
+        el = document.getElementById('oiLatestSignal'); if (el) el.innerHTML = signalHtml(latest.opt_signal);
+    }
+    var ce = document.getElementById('oiChartEntries');
+    if (ce) ce.textContent = filtered.length + ' candles';
+
+    // ── Redraw sparkline (canvas, no flicker) ──
+    drawSparkline(filtered);
+
+    // ── Table rebuild: full rebuild on interval change, smart append on same interval ──
+    var existingRows = tbody.querySelectorAll('tr[data-time]');
+    var existingTimes = {};
+    existingRows.forEach(function(r){ existingTimes[r.getAttribute('data-time')] = r; });
+
+    // Detect if the current table rows match the filtered set — if not, full rebuild
+    var filteredTimes = filtered.map(function(r){ return r.time || ''; });
+    var existingTimesList = Object.keys(existingTimes);
+    var needsFullRebuild = (existingTimesList.length > 0) && (
+        existingTimesList.length !== filteredTimes.length ||
+        filteredTimes.some(function(t){ return !existingTimes[t]; }) ||
+        existingTimesList.some(function(t){ return filteredTimes.indexOf(t) < 0; })
+    );
+    if (needsFullRebuild) {
+        tbody.innerHTML = '';
+        existingTimes = {};
+    }
+
+    // Remove elapsed badge from previous live row
+    var prevLive = tbody.querySelector('.oi-live-row');
+    if (prevLive) {
+        prevLive.classList.remove('oi-live-row');
+        var liveInd = prevLive.querySelector('.oi-live-ind');
+        if (liveInd) liveInd.remove();
+        var elapsedInd = prevLive.querySelector('.oi-elapsed');
+        if (elapsedInd) elapsedInd.remove();
+        var td = prevLive.querySelector('td:first-child');
+        if (td) { var div = td.querySelector('.oi-time-cell'); if (div) td.textContent = div.textContent.replace('LIVE','').trim(); }
+    }
+
+    // Build new rows for times not yet in table, prepend them
+    var newRowsHtml = '';
+    filtered.forEach(function(row, idx) {
+        var t = row.time || '';
+        if (!existingTimes[t]) {
+            var isLive  = (idx === 0);
+            var diffCls = (row.diff||0) >= 0 ? 'oi-diff-pos' : 'oi-diff-neg';
+            var timeCell = isLive
+                ? '<div class="oi-time-cell"><span class="oi-time-val">' + t + '</span>&nbsp;<span class="oi-elapsed"></span></div>'
+                : '<div class="oi-time-cell"><span class="oi-time-val">' + t + '</span></div>';
+            var isBuy = (row.opt_signal||'').toUpperCase().indexOf('BUY') >= 0;
+            var isSell = (row.opt_signal||'').toUpperCase().indexOf('SELL') >= 0;
+            var nlabel = row.nearest_label || (isBuy ? 'R1' : isSell ? 'S1' : '—');
+            var nval   = row.nearest_level ? '₹' + row.nearest_level.toLocaleString('en-IN') : '—';
+            var isNeutral = !isBuy && !isSell;
+            var nlevelHtml, distHtml;
+            if (row.nearest_level) {
+                nlevelHtml = '<span class="oi-nlevel-badge ' + (isBuy ? 'oi-nlevel-res' : 'oi-nlevel-sup') + '">'
+                  + '<span class="oi-nlevel-label">' + nlabel + '</span>'
+                  + nval + '</span>';
+                distHtml = '<span class="oi-dist-val ' + (isBuy ? 'oi-dist-res' : 'oi-dist-sup') + '">'
+                  + (isBuy ? '+' : '-') + Math.abs(row.distance_pts) + ' pts'
+                  + (row.nearest_label === 'S2' || row.nearest_label === 'R2'
+                      ? ' <span style="font-size:8px;opacity:0.6;">(to ' + (row.nearest_label||'') + ')</span>'
+                      : '')
+                  + '</span>';
+            } else if (isNeutral) {
+                // FIX v11: NEUTRAL OI signal → use ONLY spot price momentum.
+                // Technical bias (SMA/RSI/MACD) is ignored here because it can lag.
+                // Simple rule: price rising → WATCH BULL, price falling → WATCH BEAR.
+                var wbHtml, wdHtml;
+                var curSpot  = row.spot_price || 0;
+                var oldestRow = null;
+                for (var mi = 3; mi >= 1; mi--) {
+                    if (filtered[idx + mi] && filtered[idx + mi].spot_price) {
+                        oldestRow = filtered[idx + mi]; break;
+                    }
+                }
+                var momDelta = oldestRow ? (curSpot - oldestRow.spot_price) : 0;
+
+                if (momDelta > 15) {
+                    // Price rising → WATCH BULL with R1 target
+                    var wbR1 = row.resistance || row.nearest_level;
+                    var wbRDist = (wbR1 && curSpot) ? Math.round(wbR1 - curSpot) : null;
+                    wbHtml = '<div style="display:flex;flex-direction:column;align-items:center;gap:3px;">'
+                        + '<span style="display:inline-flex;align-items:center;gap:4px;padding:3px 10px;border-radius:6px;'
+                        + 'font-size:10px;font-weight:800;background:rgba(181,234,58,0.12);color:#b5ea3a;'
+                        + 'border:1px solid rgba(181,234,58,0.3);">⚡ WATCH BULL</span>'
+                        + (wbR1 ? '<span style="font-size:11px;font-family:monospace;font-weight:700;"><span style="color:#00e676;font-weight:800;">R1</span> <span style="color:#00e676;">₹' + Number(wbR1).toLocaleString('en-IN') + '</span></span>' : '<span style="font-size:8px;color:rgba(181,234,58,0.5);font-family:monospace;">spot momentum</span>')
+                        + '</div>';
+                    wdHtml = (wbRDist !== null && wbRDist > 0)
+                        ? '<span style="font-size:13px;color:#00e676;font-family:monospace;font-weight:700;">▲ +' + wbRDist + ' pts</span>'
+                        : '<span style="font-size:9px;color:rgba(181,234,58,0.6);font-family:monospace;font-weight:600;">▲ +' + Math.abs(momDelta).toFixed(1) + ' pts drift</span>';
+                } else if (momDelta < -15) {
+                    // Price falling → WATCH BEAR with S1 target
+                    var wbS1 = row.support || row.nearest_level;
+                    var wbSDist = (wbS1 && curSpot) ? Math.round(curSpot - wbS1) : null;
+                    wbHtml = '<div style="display:flex;flex-direction:column;align-items:center;gap:3px;">'
+                        + '<span style="display:inline-flex;align-items:center;gap:4px;padding:3px 10px;border-radius:6px;'
+                        + 'font-size:10px;font-weight:800;background:rgba(255,152,0,0.12);color:#ff9800;'
+                        + 'border:1px solid rgba(255,152,0,0.3);">⚠ WATCH BEAR</span>'
+                        + (wbS1 ? '<span style="font-size:11px;font-family:monospace;font-weight:700;"><span style="color:#ff4757;font-weight:800;">S1</span> <span style="color:#ff4757;">₹' + Number(wbS1).toLocaleString('en-IN') + '</span></span>' : '<span style="font-size:8px;color:rgba(255,152,0,0.5);font-family:monospace;">spot momentum</span>')
+                        + '</div>';
+                    wdHtml = (wbSDist !== null && wbSDist > 0)
+                        ? '<span style="font-size:13px;color:#ff4757;font-family:monospace;font-weight:700;">▼ -' + wbSDist + ' pts</span>'
+                        : '<span style="font-size:9px;color:rgba(255,152,0,0.6);font-family:monospace;font-weight:600;">▼ -' + Math.abs(momDelta).toFixed(1) + ' pts drift</span>';
+                } else {
+                    // Truly flat — price barely moving
+                    wbHtml = '<span style="display:inline-flex;align-items:center;gap:4px;padding:3px 10px;border-radius:6px;'
+                        + 'font-size:10px;font-weight:700;background:rgba(176,190,197,0.06);color:#78909c;'
+                        + 'border:1px solid rgba(176,190,197,0.15);">→ Flat</span>';
+                    wdHtml = '<span style="font-size:9px;color:rgba(176,190,197,0.35);font-family:monospace;">'
+                        + (oldestRow ? '±' + Math.abs(momDelta).toFixed(1) + ' pts' : 'no data') + '</span>';
+                }
+                nlevelHtml = wbHtml;
+                distHtml   = wdHtml;
+            } else {
+                nlevelHtml = '<span style="color:rgba(176,190,197,0.3);">—</span>';
+                distHtml   = '<span style="color:rgba(176,190,197,0.3);">—</span>';
+            }
+
+            // ── Spot Δ ──
+            var prevRow = filtered[idx + 1];
+            var spotDelta = (prevRow && prevRow.spot_price && row.spot_price)
+                ? Math.round((row.spot_price - prevRow.spot_price) * 10) / 10
+                : null;
+            var spotDeltaHtml;
+            if (spotDelta === null) {
+                spotDeltaHtml = '<span style="color:rgba(176,190,197,0.2);">—</span>';
+            } else if (Math.abs(spotDelta) < 0.5) {
+                spotDeltaHtml = '<span class="oi-sdelta oi-sdelta-fl">→ 0.0</span>';
+            } else if (spotDelta > 0) {
+                spotDeltaHtml = '<span class="oi-sdelta oi-sdelta-up">▲ +' + spotDelta.toFixed(1) + '</span>';
+            } else {
+                spotDeltaHtml = '<span class="oi-sdelta oi-sdelta-dn">▼ ' + spotDelta.toFixed(1) + '</span>';
+            }
+
+            // ── BankNifty Move % ──
+            var nmp = row.nifty_move_pct;
+            var niftyMovePctHtml;
+            if (nmp === null || nmp === undefined) {
+                niftyMovePctHtml = '<span style="color:rgba(176,190,197,0.2);">—</span>';
+            } else {
+                var sign  = nmp >= 0 ? '+' : '';
+                var arrow, cls;
+                if (Math.abs(nmp) < 0.1) {
+                    arrow = '→'; cls = 'oi-nifty-flat';
+                } else if (nmp >= 1.0) {
+                    arrow = '▲'; cls = 'oi-nifty-up-strong';
+                } else if (nmp >= 0.5) {
+                    arrow = '▲'; cls = 'oi-nifty-up-mid';
+                } else if (nmp > 0) {
+                    arrow = '▲'; cls = 'oi-nifty-up-weak';
+                } else if (nmp <= -1.0) {
+                    arrow = '▼'; cls = 'oi-nifty-dn-strong';
+                } else if (nmp <= -0.5) {
+                    arrow = '▼'; cls = 'oi-nifty-dn-mid';
+                } else {
+                    arrow = '▼'; cls = 'oi-nifty-dn-weak';
+                }
+                niftyMovePctHtml = '<span class="oi-nifty-move ' + cls + '">'
+                    + arrow + ' ' + sign + nmp.toFixed(2) + '%</span>';
+            }
+
+            // ── Signal Streak — Intensity Badge ──
+            var streakCount = 1;
+            var curSig = (row.opt_signal || '').toUpperCase();
+            for (var si = idx + 1; si < filtered.length; si++) {
+                if ((filtered[si].opt_signal || '').toUpperCase() === curSig) streakCount++;
+                else break;
+            }
+            // Intensity: opacity scales with streak count (min 0.06, max 0.30)
+            var intensity = Math.min(0.30, 0.06 + streakCount * 0.04);
+            var sColor, sBorder, sLabel;
+            if (isBuy)       { sColor = '0,200,83';  sBorder = '#00c853'; sLabel = 'BUY'; }
+            else if (isSell) { sColor = '255,58,74';  sBorder = '#ff3a4a'; sLabel = 'SELL'; }
+            else             { sColor = '255,183,77'; sBorder = 'rgba(255,183,77,0.5)'; sLabel = streakCount === 1 ? 'NEW' : 'HOLD'; }
+            // Dim the border for low streaks, full for high
+            var borderOpacity = Math.min(1, 0.4 + streakCount * 0.12);
+            var streakHtml = '<div class="oi-streak-int" style="background:rgba(' + sColor + ',' + intensity + ');border-left:3px solid rgba(' + sColor + ',' + borderOpacity + ');">'
+                + '<span class="oi-streak-int-num" style="color:rgba(' + sColor + ',' + Math.min(1, 0.5 + streakCount * 0.1) + ');">' + streakCount + '</span>'
+                + '<span class="oi-streak-int-lbl" style="color:rgba(' + sColor + ',' + Math.min(0.85, 0.3 + streakCount * 0.1) + ');">' + sLabel + '</span>'
+                + '</div>';
+
+            newRowsHtml += '<tr class="' + (isLive ? 'oi-live-row' : '') + '" data-time="' + t + '">'
+                + '<td>' + timeCell + '</td>'
+                + '<td class="col-detail oi-call-val">' + fmtIN(row.call_oi_chg||0) + '</td>'
+                + '<td class="col-detail oi-put-val">'  + fmtIN(row.put_oi_chg||0)  + '</td>'
+                + '<td class="col-detail ' + diffCls + '">' + fmtIN(row.diff||0) + '</td>'
+                + (function(){
+                    var pcrV = parseFloat(row.pcr) || 0;
+                    var pcrCls = pcrV >= 1.1 ? 'oi-pcr-bull' : pcrV <= 0.9 ? 'oi-pcr-bear' : 'oi-pcr-neu';
+                    var barW = Math.min(100, Math.round((pcrV / 2) * 100));
+                    return '<td class="oi-pcr-val ' + pcrCls + '"><span class="oi-pcr-cell">'
+                        + (row.pcr || '—')
+                        + '<span class="oi-pcr-bar-wrap"><span class="oi-pcr-bar ' + pcrCls + '-bar" style="width:' + barW + '%"></span></span>'
+                        + '</span></td>';
+                })()
+                + '<td>' + signalHtml(row.opt_signal) + '</td>'
+                + '<td class="oi-spot-cell">'+ (row.spot_price ? row.spot_price.toFixed(2) : '—') + '</td>'
+                + '<td>' + spotDeltaHtml + '</td>'
+                + '<td>' + niftyMovePctHtml + '</td>'
+                + '<td>' + streakHtml + '</td>'
+                + '<td>' + nlevelHtml + '</td>'
+                + '<td>' + distHtml + '</td>'
+                + (function(){
+                    var rsi = row.rsi_15m;
+                    if (rsi == null) return '<td><span style="color:rgba(176,190,197,0.25);">—</span></td>';
+                    var rsiCol, rsiBg, rsiBdr, rsiLbl;
+                    if (rsi >= 70) {
+                        rsiCol='#ff4757'; rsiBg='rgba(255,71,87,0.12)'; rsiBdr='rgba(255,71,87,0.3)'; rsiLbl='OB';
+                    } else if (rsi <= 30) {
+                        rsiCol='#00e676'; rsiBg='rgba(0,230,118,0.12)'; rsiBdr='rgba(0,230,118,0.3)'; rsiLbl='OS';
+                    } else if (rsi >= 55) {
+                        rsiCol='#69f0ae'; rsiBg='rgba(105,240,174,0.08)'; rsiBdr='rgba(105,240,174,0.25)'; rsiLbl='';
+                    } else if (rsi <= 45) {
+                        rsiCol='#fca5a5'; rsiBg='rgba(252,165,165,0.08)'; rsiBdr='rgba(252,165,165,0.25)'; rsiLbl='';
+                    } else {
+                        rsiCol='#ffb74d'; rsiBg='rgba(255,183,77,0.08)'; rsiBdr='rgba(255,183,77,0.2)'; rsiLbl='';
+                    }
+                    var rsiBadge = rsiLbl
+                        ? '<span style="font-size:8px;font-weight:700;letter-spacing:1px;padding:1px 5px;border-radius:3px;background:'+rsiBg+';color:'+rsiCol+';border:1px solid '+rsiBdr+';">'+rsiLbl+'</span>'
+                        : '<span style="font-size:8px;color:rgba(128,222,234,0.3);">neutral</span>';
+                    return '<td><div style="display:flex;flex-direction:column;align-items:center;gap:3px;">'
+                        + '<span style="font-family:monospace;font-size:12px;font-weight:700;color:'+rsiCol+';">'+rsi.toFixed(1)+'</span>'
+                        + rsiBadge
+                        + '</div></td>';
+                })()
+                + (function(){
+                    var emaSig = row.ema_signal;
+                    var e5  = row.ema5;
+                    var e13 = row.ema13;
+                    if (!emaSig || e5 == null || e13 == null) return '<td><span style="color:rgba(176,190,197,0.25);">—</span></td>';
+                    var emaIsBuy = emaSig === 'BUY';
+                    var eCol = emaIsBuy ? '#00e676' : '#ff4757';
+                    var eBg  = emaIsBuy ? 'rgba(0,230,118,0.12)' : 'rgba(255,71,87,0.12)';
+                    var eBdr = emaIsBuy ? 'rgba(0,230,118,0.3)'  : 'rgba(255,71,87,0.3)';
+                    var eArr = emaIsBuy ? '▲' : '▼';
+                    var eGap = Math.abs(e5 - e13).toFixed(1);
+                    return '<td><div style="display:flex;flex-direction:column;align-items:center;gap:3px;">'
+                        + '<span style="display:inline-flex;align-items:center;gap:4px;padding:2px 9px;border-radius:6px;font-size:11px;font-weight:700;background:'+eBg+';color:'+eCol+';border:1px solid '+eBdr+';">'
+                        + eArr + ' ' + emaSig + '</span>'
+                        + '<span style="font-size:10px;color:' + (emaIsBuy ? 'rgba(105,240,174,0.7)' : 'rgba(252,165,165,0.7)') + ';font-family:monospace;font-weight:600;">gap '+eGap+'</span>'
+                        + '</div></td>';
+                })()
+                + (function(){
+                    var vwapVal = row.vwap;
+                    if (vwapVal == null || vwapVal === 0) {
+                        return '<td class="col-detail"><span style="color:rgba(176,190,197,0.3);">—</span></td>';
+                    }
+                    var spot = row.spot_price || 0;
+                    var aboveVwap = spot >= vwapVal;
+                    var vwapCls = aboveVwap ? 'oi-vwap-bull' : 'oi-vwap-bear';
+                    var vwapArrow = aboveVwap ? '▲' : '▼';
+                    var vwapColor = aboveVwap ? '#4ade80' : '#f87171';
+                    return '<td class="col-detail oi-vwap-cell"><span style="color:' + vwapColor + ';font-weight:700;">'
+                        + vwapArrow + ' ₹' + vwapVal.toLocaleString('en-IN', {minimumFractionDigits:2, maximumFractionDigits:2})
+                        + '</span><br><span style="font-size:8px;color:rgba(147,197,253,0.5);letter-spacing:0.5px;">'
+                        + (aboveVwap ? 'Above' : 'Below') + '</span></td>';
+                })()
+                + (function(){
+                    // ══ CONFLUENCE SCORE ══════════════════════════════════════
+                    // Counts how many of 5 independent signals agree on direction.
+                    // Only shows strong BUY/SELL when 3+ signals align.
+                    var cBuy = 0, cSell = 0, cTotal = 0;
+
+                    // 1. PCR: >1.0 = buy bias, <0.9 = sell bias
+                    var pcrV = parseFloat(row.pcr) || 0;
+                    if (pcrV > 0) { cTotal++;
+                        if (pcrV > 1.0) cBuy++; else if (pcrV < 0.9) cSell++;
+                    }
+
+                    // 2. OI Signal
+                    var oiSig = (row.opt_signal || '').toUpperCase();
+                    if (oiSig.indexOf('BUY') >= 0) { cTotal++; cBuy++; }
+                    else if (oiSig.indexOf('SELL') >= 0) { cTotal++; cSell++; }
+                    else if (oiSig === 'NEUTRAL') { cTotal++; }
+
+                    // 3. VWAP: spot above = buy, below = sell
+                    var cVwap = row.vwap;
+                    var cSpot = row.spot_price || 0;
+                    if (cVwap && cVwap > 0 && cSpot > 0) { cTotal++;
+                        if (cSpot >= cVwap) cBuy++; else cSell++;
+                    }
+
+                    // 4. RSI: >55 = buy momentum, <45 = sell momentum
+                    var cRsi = row.rsi_15m;
+                    if (cRsi != null) { cTotal++;
+                        if (cRsi >= 55) cBuy++; else if (cRsi <= 45) cSell++;
+                    }
+
+                    // 5. EMA 5/13: BUY or SELL
+                    var cEma = row.ema_signal;
+                    if (cEma === 'BUY') { cTotal++; cBuy++; }
+                    else if (cEma === 'SELL') { cTotal++; cSell++; }
+
+                    // Determine confluence verdict
+                    var cMax = Math.max(cBuy, cSell);
+                    var cDir = cBuy > cSell ? 'BUY' : (cSell > cBuy ? 'SELL' : 'MIXED');
+                    var cScore = cBuy > cSell ? cBuy : cSell;
+                    var cLabel, cColor, cBg, cBdr, cIcon, cStrength;
+
+                    // Time-of-day penalty: 9:15-9:30 and 15:15-15:30 are noisy
+                    var cTimeParts = (row.time || '00:00').split(':');
+                    var cHour = parseInt(cTimeParts[0] || 0);
+                    var cMin  = parseInt(cTimeParts[1] || 0);
+                    var cTimeMinutes = cHour * 60 + cMin;
+                    var cIsNoisy = (cTimeMinutes >= 555 && cTimeMinutes <= 560)    // 9:15-9:20
+                                || (cTimeMinutes >= 925 && cTimeMinutes <= 930);   // 15:25-15:30
+
+                    if (cTotal === 0) {
+                        cLabel = '—'; cColor = 'rgba(176,190,197,0.3)'; cBg = 'transparent'; cBdr = 'transparent'; cIcon = ''; cStrength = '';
+                    } else if (cScore >= 4) {
+                        cStrength = 'STRONG';
+                        if (cDir === 'BUY') {
+                            cLabel = cScore + '/' + cTotal; cColor = '#00e676'; cBg = 'rgba(0,230,118,0.18)'; cBdr = 'rgba(0,230,118,0.45)'; cIcon = '▲';
+                        } else {
+                            cLabel = cScore + '/' + cTotal; cColor = '#ff4757'; cBg = 'rgba(255,71,87,0.18)'; cBdr = 'rgba(255,71,87,0.45)'; cIcon = '▼';
+                        }
+                    } else if (cScore >= 3) {
+                        cStrength = cDir;
+                        if (cDir === 'BUY') {
+                            cLabel = cScore + '/' + cTotal; cColor = '#69f0ae'; cBg = 'rgba(105,240,174,0.12)'; cBdr = 'rgba(105,240,174,0.3)'; cIcon = '▲';
+                        } else {
+                            cLabel = cScore + '/' + cTotal; cColor = '#fca5a5'; cBg = 'rgba(252,165,165,0.12)'; cBdr = 'rgba(252,165,165,0.3)'; cIcon = '▼';
+                        }
+                    } else {
+                        cStrength = 'WEAK';
+                        cLabel = cScore + '/' + cTotal; cColor = '#ffb74d'; cBg = 'rgba(255,183,77,0.08)'; cBdr = 'rgba(255,183,77,0.2)'; cIcon = '~';
+                    }
+
+                    // Time-of-day noise warning overrides strength display
+                    var cTimeWarn = cIsNoisy
+                        ? '<div style="font-size:10px;color:#ff9800;letter-spacing:1px;margin-top:3px;font-weight:700;background:rgba(255,152,0,0.12);border:1px solid rgba(255,152,0,0.3);border-radius:4px;padding:2px 6px;">⚠ NOISY</div>'
+                        : '';
+
+                    return '<td><div style="display:flex;flex-direction:column;align-items:center;gap:2px;">'
+                        + '<span style="display:inline-flex;align-items:center;gap:4px;padding:4px 10px;border-radius:6px;'
+                        + 'font-size:12px;font-weight:800;background:' + cBg + ';color:' + cColor + ';border:1px solid ' + cBdr + ';">'
+                        + cIcon + ' ' + cLabel + '</span>'
+                        + '<span style="font-size:10px;font-weight:700;color:' + cColor + ';letter-spacing:0.5px;">' + cStrength + '</span>'
+                        + cTimeWarn
+                        + '</div></td>';
+                })()
+                + '</tr>';
+        } else if (idx === 0) {
+            // Mark existing top row as LIVE with elapsed timer
+            var r = existingTimes[t];
+            r.classList.add('oi-live-row');
+            var td = r.querySelector('td:first-child');
+            if (td && !td.querySelector('.oi-elapsed')) {
+                td.innerHTML = '<div class="oi-time-cell"><span class="oi-time-val">' + t + '</span>&nbsp;<span class="oi-elapsed"></span></div>';
+            }
+        }
     });
 
-    // ── 4. Restore scroll IMMEDIATELY after patch ────────────────
-    restoreScroll();
+    if (newRowsHtml) {
+        // ── Bulletproof no-scroll-jump insert ───────────────────────────
+        // overflow-anchor:none on tbody stops Chrome's scroll anchoring from
+        // auto-adjusting when rows are prepended (the main cause of jumps).
+        // We also manually save + restore window.scrollY with double-rAF to
+        // cover Firefox and Safari which don't support overflow-anchor.
+        var winSy   = window.scrollY || window.pageYOffset;
+        var docEl   = document.documentElement;
+        var bodyEl  = document.body;
+        // Disable CSS scroll-behavior so our scrollTo is truly instant
+        var prevDocSB  = docEl.style.scrollBehavior;
+        var prevBodySB = bodyEl.style.scrollBehavior;
+        docEl.style.scrollBehavior  = 'auto';
+        bodyEl.style.scrollBehavior = 'auto';
+        // Disable browser scroll anchoring on the table body
+        tbody.style.overflowAnchor = 'none';
 
-    // ── 5. Restore UI state (badges, filter, greeks) ─────────────
-    if (changed) {
-      setTimeout(function() {
-        try {
-          // Re-compute PoP badges (safe — no DOM reorder)
-          if (typeof initAllCards === 'function') initAllCards();
+        tbody.insertAdjacentHTML('afterbegin', newRowsHtml);
 
-          // Restore filter tab highlight only (no sortGridByPoP — avoids DOM reorder)
-          if (typeof filterStrat === 'function') filterStrat(activeFilter, null);
+        // Double-rAF: frame 1 = layout/reflow, frame 2 = paint → scroll after both
+        requestAnimationFrame(function() {
+            requestAnimationFrame(function() {
+                window.scrollTo(0, winSy);
+                // Restore everything
+                tbody.style.overflowAnchor = '';
+                docEl.style.scrollBehavior  = prevDocSB;
+                bodyEl.style.scrollBehavior = prevBodySB;
+            });
+        });
+    }
 
-          // Restore greeks dropdown
-          if (greeksSelVal) {
-            const sel2 = document.getElementById('greeksStrikeSelect');
-            if (sel2) {
-              sel2.value = greeksSelVal;
-              if (activeInstr === 'FINNIFTY' && typeof _fnGreeksUpdate === 'function') _fnGreeksUpdate(greeksSelVal);
-              else if (typeof greeksUpdateStrike === 'function') greeksUpdateStrike(greeksSelVal);
+    // Remove empty state row if present
+    var emptyRow = tbody.querySelector('.oi-empty-state');
+    if (emptyRow) emptyRow.closest('tr').remove();
+
+    // ── Start elapsed timer for latest entry ──
+    if (filtered.length > 0 && filtered[0].time) {
+        _startElapsedTimer(filtered[0].time);
+    }
+
+    // ── Render BANKNIFTY Live Feed panel ──
+    renderNiftyLiveFeed(filtered);
+}
+
+/* ══ NIFTY LIVE FEED — Compact side panel ══════════════════════════════════ */
+function renderNiftyLiveFeed(filtered) {
+    var body = document.getElementById('nlfBody');
+    if (!body || !filtered || filtered.length === 0) return;
+
+    var latest = filtered[0];
+    var maxEntries = 7;
+    var entries = filtered.slice(0, maxEntries);
+
+    // ── Header: Spot, R1, PCR ──
+    var elSpot = document.getElementById('nlfSpot');
+    if (elSpot) elSpot.textContent = latest.spot_price ? latest.spot_price.toLocaleString('en-IN', {minimumFractionDigits:2, maximumFractionDigits:2}) : '—';
+    var elPCR = document.getElementById('nlfPCR');
+    if (elPCR) elPCR.textContent = latest.pcr || '—';
+    var elR1 = document.getElementById('nlfR1');
+    if (elR1) {
+        var nlabel = latest.nearest_label || 'R1';
+        var nval = latest.nearest_level ? '₹' + latest.nearest_level.toLocaleString('en-IN') : '—';
+        elR1.innerHTML = nlabel + ' <b>' + nval + '</b>';
+    }
+
+    // ── Signal Badges ──
+    var badges = document.getElementById('nlfBadges');
+    if (badges) {
+        var bHtml = '';
+        var sig = (latest.opt_signal || '').toUpperCase();
+        var isBuy = sig.indexOf('BUY') >= 0;
+        var isSell = sig.indexOf('SELL') >= 0;
+        if (isBuy) bHtml += '<span class="nlf-badge nlf-badge-buy">Signal ▲ BUY</span>';
+        else if (isSell) bHtml += '<span class="nlf-badge nlf-badge-sell">Signal ▼ SELL</span>';
+        else bHtml += '<span class="nlf-badge nlf-badge-info">Signal → Neutral</span>';
+
+        var emaSig = latest.ema_signal;
+        if (emaSig === 'BUY') bHtml += '<span class="nlf-badge nlf-badge-buy">EMA 5/13 ▲ BUY</span>';
+        else if (emaSig === 'SELL') bHtml += '<span class="nlf-badge nlf-badge-sell">EMA 5/13 ▼ SELL</span>';
+
+        // Streak
+        var streakCount = 1;
+        for (var si = 1; si < filtered.length; si++) {
+            if ((filtered[si].opt_signal || '').toUpperCase() === sig) streakCount++;
+            else break;
+        }
+        bHtml += '<span class="nlf-badge nlf-badge-warn">Streak *' + streakCount + '</span>';
+
+        // RSI
+        var rsi = latest.rsi_15m;
+        if (rsi != null) {
+            var rsiCls = rsi >= 70 ? 'nlf-badge-danger' : rsi <= 30 ? 'nlf-badge-buy' : 'nlf-badge-info';
+            bHtml += '<span class="nlf-badge ' + rsiCls + '">RSI 15m ' + rsi.toFixed(1) + '</span>';
+        }
+
+        // VWAP
+        var vwapVal = latest.vwap;
+        var spot = latest.spot_price || 0;
+        if (vwapVal && vwapVal > 0) {
+            var aboveVwap = spot >= vwapVal;
+            bHtml += '<span class="nlf-badge ' + (aboveVwap ? 'nlf-badge-buy' : 'nlf-badge-danger') + '">VWAP ' + (aboveVwap ? 'Above' : 'Below') + '</span>';
+        }
+
+        // Distance
+        if (latest.distance_pts != null && latest.nearest_level) {
+            bHtml += '<span class="nlf-badge nlf-badge-info">Dist ' + (latest.distance_pts >= 0 ? '+' : '') + Math.round(latest.distance_pts) + ' pts</span>';
+        }
+
+        // Confluence badge for NLF
+        var nlfCBuy = 0, nlfCSell = 0, nlfCT = 0;
+        var nlfPcr = parseFloat(latest.pcr) || 0;
+        if (nlfPcr > 0) { nlfCT++; if (nlfPcr > 1.0) nlfCBuy++; else if (nlfPcr < 0.9) nlfCSell++; }
+        var nlfOi = (latest.opt_signal || '').toUpperCase();
+        if (nlfOi.indexOf('BUY') >= 0) { nlfCT++; nlfCBuy++; } else if (nlfOi.indexOf('SELL') >= 0) { nlfCT++; nlfCSell++; } else { nlfCT++; }
+        if (latest.vwap && latest.vwap > 0 && spot > 0) { nlfCT++; if (spot >= latest.vwap) nlfCBuy++; else nlfCSell++; }
+        if (rsi != null) { nlfCT++; if (rsi >= 55) nlfCBuy++; else if (rsi <= 45) nlfCSell++; }
+        if (latest.ema_signal === 'BUY') { nlfCT++; nlfCBuy++; } else if (latest.ema_signal === 'SELL') { nlfCT++; nlfCSell++; }
+        var nlfCMax = Math.max(nlfCBuy, nlfCSell);
+        var nlfCDir = nlfCBuy > nlfCSell ? 'BUY' : (nlfCSell > nlfCBuy ? 'SELL' : 'MIXED');
+        var nlfCCls = nlfCMax >= 4 ? (nlfCDir === 'BUY' ? 'nlf-badge-buy' : 'nlf-badge-sell') : nlfCMax >= 3 ? (nlfCDir === 'BUY' ? 'nlf-badge-buy' : 'nlf-badge-danger') : 'nlf-badge-warn';
+        bHtml += '<span class="nlf-badge ' + nlfCCls + '">⚡ ' + nlfCMax + '/' + nlfCT + ' ' + (nlfCMax >= 3 ? nlfCDir : 'WEAK') + '</span>';
+
+        badges.innerHTML = bHtml;
+    }
+
+    // ── Table rows ──
+    var html = '';
+    entries.forEach(function(row, idx) {
+        var isLive = (idx === 0);
+        var t = row.time || '';
+
+        // Spot
+        var spotStr = row.spot_price ? row.spot_price.toLocaleString('en-IN', {minimumFractionDigits:2, maximumFractionDigits:2}) : '';
+        if (isLive) spotStr = '';
+
+        // Delta
+        var prevRow = entries[idx + 1];
+        var spotDelta = (prevRow && prevRow.spot_price && row.spot_price)
+            ? Math.round((row.spot_price - prevRow.spot_price) * 10) / 10
+            : null;
+        var dHtml;
+        if (spotDelta === null) {
+            dHtml = '<span style="color:rgba(176,190,197,0.25);">—</span>';
+        } else if (spotDelta >= 0) {
+            dHtml = '<span style="color:#00e676;">▲+' + spotDelta.toFixed(1) + '</span>';
+        } else {
+            dHtml = '<span style="color:#ff4757;">▼' + spotDelta.toFixed(1) + '</span>';
+        }
+
+        // BankNifty Move %
+        var nmp = row.nifty_move_pct;
+        var nmpHtml, nmpColor;
+        if (nmp == null) {
+            nmpHtml = '—'; nmpColor = 'rgba(176,190,197,0.25)';
+        } else {
+            nmpColor = nmp >= 0 ? '#00e676' : '#ff4757';
+            nmpHtml = '<span style="color:' + nmpColor + ';">' + (nmp >= 0 ? '+' : '') + nmp.toFixed(2) + '%</span>';
+        }
+
+        // VWAP gap (spot vs VWAP distance in points)
+        var vwapVal = row.vwap;
+        var spotVal = row.spot_price || 0;
+        var vwapHtml;
+        if (vwapVal && vwapVal > 0 && spotVal > 0) {
+            var vwapGap = Math.round(spotVal - vwapVal);
+            var aboveVwap = vwapGap >= 0;
+            var vwapColor = aboveVwap ? '#00e676' : '#ff4757';
+            var vwapArrow = aboveVwap ? '▲' : '▼';
+            vwapHtml = '<span style="color:' + vwapColor + ';">' + vwapArrow + Math.abs(vwapGap) + '</span>'
+                + '<br><span style="font-size:9px;color:' + (aboveVwap ? 'rgba(0,230,118,0.45)' : 'rgba(255,71,87,0.45)') + ';">'
+                + (aboveVwap ? 'above' : 'below') + '</span>';
+        } else {
+            vwapHtml = '<span style="color:rgba(176,190,197,0.25);">—</span>';
+        }
+
+        // Net OI diff (CE change - PE change)
+        var diff = row.diff;
+        var netOiHtml;
+        if (diff == null) {
+            netOiHtml = '<span style="color:rgba(176,190,197,0.25);">—</span>';
+        } else {
+            var absDiff = Math.abs(diff);
+            var diffSign = diff >= 0 ? '+' : '-';
+            var diffColor = diff >= 0 ? '#00e676' : '#ff4757';
+            var diffStr;
+            if (absDiff >= 10000000) diffStr = diffSign + (absDiff/10000000).toFixed(1) + 'Cr';
+            else if (absDiff >= 100000) diffStr = diffSign + (absDiff/100000).toFixed(1) + 'L';
+            else if (absDiff >= 1000) diffStr = diffSign + (absDiff/1000).toFixed(1) + 'K';
+            else diffStr = (diff >= 0 ? '+' : '') + diff;
+            netOiHtml = '<span style="color:' + diffColor + ';">' + diffStr + '</span>';
+        }
+
+        // Streak
+        var sCount = 1;
+        var curSig = (row.opt_signal || '').toUpperCase();
+        for (var si = idx + 1; si < entries.length; si++) {
+            if ((entries[si].opt_signal || '').toUpperCase() === curSig) sCount++;
+            else break;
+        }
+        // Add total streak from full filtered data for first entry
+        if (idx === 0) sCount = streakCount;
+
+        // RSI
+        var rsiVal = row.rsi_15m;
+        var rsiHtml, rsiColor;
+        if (rsiVal == null) {
+            rsiHtml = '—'; rsiColor = 'rgba(176,190,197,0.25)';
+        } else {
+            rsiColor = rsiVal >= 70 ? '#ff4757' : rsiVal >= 55 ? '#69f0ae' : rsiVal <= 30 ? '#00e676' : rsiVal <= 45 ? '#fca5a5' : '#ffb74d';
+            rsiHtml = rsiVal.toFixed(1);
+        }
+
+        html += '<div class="nlf-row' + (isLive ? ' nlf-row-live' : '') + '">'
+            + '<span class="nlf-row-time">' + t + (isLive ? '&nbsp;<span class="nlf-elapsed"></span>' : '') + '</span>'
+            + '<span class="nlf-row-spot">' + spotStr + '</span>'
+            + '<span class="nlf-row-delta">' + dHtml + '</span>'
+            + '<span class="nlf-row-nifty">' + nmpHtml + '</span>'
+            + '<span class="nlf-row-vwap">' + vwapHtml + '</span>'
+            + '<span class="nlf-row-netoi">' + netOiHtml + '</span>'
+            + '<span class="nlf-row-stk">*' + sCount + '</span>'
+            + '<span class="nlf-row-rsi" style="color:' + rsiColor + ';">' + rsiHtml + '</span>'
+            + '</div>';
+    });
+    body.innerHTML = html;
+
+    // ── Footer ──
+    var footer = document.getElementById('nlfFooter');
+    if (footer) {
+        var nmp0 = latest.nifty_move_pct;
+        var nmpFmt = (nmp0 != null) ? ((nmp0 >= 0 ? '+' : '') + nmp0.toFixed(2) + '% from prev close') : '';
+        var nmpFootColor = (nmp0 != null && nmp0 >= 0) ? '#00e676' : '#ff4757';
+        footer.innerHTML = '<span class="nlf-footer-left">' + filtered.length + ' candles &middot; signals active</span>'
+            + '<span class="nlf-footer-right" style="color:' + nmpFootColor + ';">▲ ' + nmpFmt + '</span>';
+    }
+}
+function fmtOI(n) {
+    var abs = Math.abs(n);
+    var sign = n >= 0 ? '+' : '-';
+    if (abs >= 10000000) return sign + (abs/10000000).toFixed(2) + ' Cr';
+    if (abs >= 100000)   return sign + (abs/100000).toFixed(2) + ' L';
+    if (n === 0) return '0';
+    return (n >= 0 ? '+' : '') + n.toLocaleString('en-IN');
+}
+
+function drawSparkline(data) {
+    var canvas = document.getElementById('oiSparklineCanvas');
+    if (!canvas || !canvas.getContext) return;
+    var dpr = window.devicePixelRatio || 1;
+
+    var reversed = data.slice().reverse();
+    var diffs = reversed.map(function(r){ return r.diff || 0; });
+    if (diffs.length < 2) return;
+
+    /* ── Stat boxes ── */
+    var latest = diffs[diffs.length - 1];
+    var high   = Math.max.apply(null, diffs);
+    var low    = Math.min.apply(null, diffs);
+    var isBull = latest >= 0;
+    var el;
+    el = document.getElementById('oiStatLatest');
+    if (el) { el.textContent = fmtOI(latest); el.style.color = isBull ? '#34d399' : '#f87171'; }
+    el = document.getElementById('oiStatHigh');   if (el) el.textContent = fmtOI(high);
+    el = document.getElementById('oiStatLow');    if (el) el.textContent = fmtOI(low);
+    el = document.getElementById('oiStatSignal');
+    if (el) { el.textContent = isBull ? 'BUY' : 'SELL'; el.style.color = isBull ? '#34d399' : '#f87171'; }
+    el = document.getElementById('oiStatSignalSub');
+    if (el) el.textContent = isBull ? 'Bias improving' : 'Bias declining';
+
+    /* ── Signal history bar ── */
+    var bar = document.getElementById('oiSignalBar');
+    if (bar) {
+        bar.innerHTML = '';
+        var absMax = Math.max(Math.abs(high), Math.abs(low)) || 1;
+        reversed.forEach(function(r) {
+            var seg = document.createElement('div');
+            seg.style.flex = '1';
+            seg.style.height = '100%';
+            seg.style.borderRadius = '1px';
+            seg.style.background = (r.diff || 0) >= 0 ? '#10b981' : '#ef4444';
+            seg.style.opacity = Math.abs(r.diff || 0) / absMax * 0.75 + 0.25;
+            bar.appendChild(seg);
+        });
+    }
+
+    /* ── Canvas sizing ── */
+    var wrap = canvas.parentElement;
+    var W = wrap ? wrap.clientWidth : 600;
+    var H = 300;
+    canvas.width  = W * dpr;
+    canvas.height = H * dpr;
+    canvas.style.width  = W + 'px';
+    canvas.style.height = H + 'px';
+    var ctx = canvas.getContext('2d');
+    ctx.scale(dpr, dpr);
+    ctx.clearRect(0, 0, W, H);
+
+    var padT = 16, padB = 20, padL = 4, padR = 16;
+    var cW = W - padL - padR;
+    var cH = H - padT - padB;
+    var n  = diffs.length;
+
+    var minV  = Math.min.apply(null, diffs.concat([0]));
+    var maxV  = Math.max.apply(null, diffs.concat([0]));
+    var range = (maxV - minV) || 1;
+
+    function toX(i) { return padL + (i / (n - 1)) * cW; }
+    function toY(v) { return padT + (1 - (v - minV) / range) * cH; }
+    var zeroY = toY(0);
+
+    /* ── Grid lines (5 levels) ── */
+    var gridCount = 5;
+    for (var g = 0; g <= gridCount; g++) {
+        var gv = minV + (range / gridCount) * g;
+        var gy = toY(gv);
+        ctx.beginPath();
+        ctx.strokeStyle = (Math.abs(gv) < range * 0.02)
+            ? 'rgba(79,195,247,0.3)' : 'rgba(79,195,247,0.07)';
+        ctx.lineWidth = (Math.abs(gv) < range * 0.02) ? 1 : 0.5;
+        if (Math.abs(gv) < range * 0.02) ctx.setLineDash([6, 4]);
+        else ctx.setLineDash([]);
+        ctx.moveTo(padL, gy); ctx.lineTo(W - padR, gy);
+        ctx.stroke();
+    }
+    ctx.setLineDash([]);
+
+    /* ── Colored fill segments ── */
+    for (var i = 0; i < n - 1; i++) {
+        var x0 = toX(i),   y0 = toY(diffs[i]);
+        var x1 = toX(i+1), y1 = toY(diffs[i+1]);
+        var pos0 = diffs[i]   >= 0;
+        var pos1 = diffs[i+1] >= 0;
+        if (pos0 === pos1) {
+            ctx.beginPath();
+            ctx.moveTo(x0, zeroY); ctx.lineTo(x0, y0);
+            ctx.lineTo(x1, y1);   ctx.lineTo(x1, zeroY);
+            ctx.closePath();
+            ctx.fillStyle = pos0 ? 'rgba(16,185,129,0.25)' : 'rgba(239,68,68,0.25)';
+            ctx.fill();
+        } else {
+            var ratio = Math.abs(diffs[i]) / (Math.abs(diffs[i]) + Math.abs(diffs[i+1]));
+            var xMid  = x0 + ratio * (x1 - x0);
+            ctx.beginPath();
+            ctx.moveTo(x0, zeroY); ctx.lineTo(x0, y0); ctx.lineTo(xMid, zeroY);
+            ctx.closePath();
+            ctx.fillStyle = pos0 ? 'rgba(16,185,129,0.25)' : 'rgba(239,68,68,0.25)';
+            ctx.fill();
+            ctx.beginPath();
+            ctx.moveTo(xMid, zeroY); ctx.lineTo(x1, y1); ctx.lineTo(x1, zeroY);
+            ctx.closePath();
+            ctx.fillStyle = pos1 ? 'rgba(16,185,129,0.25)' : 'rgba(239,68,68,0.25)';
+            ctx.fill();
+        }
+    }
+
+    /* ── Stroke line ── */
+    for (var i = 0; i < n - 1; i++) {
+        var bothPos = diffs[i] >= 0 && diffs[i+1] >= 0;
+        var bothNeg = diffs[i] <  0 && diffs[i+1] <  0;
+        ctx.beginPath();
+        ctx.strokeStyle = bothPos ? '#34d399' : bothNeg ? '#f87171' : '#fbbf24';
+        ctx.lineWidth = 2; ctx.lineJoin = 'round';
+        ctx.moveTo(toX(i),   toY(diffs[i]));
+        ctx.lineTo(toX(i+1), toY(diffs[i+1]));
+        ctx.stroke();
+    }
+
+    /* ── Glowing endpoint ── */
+    var lx = toX(n-1), ly = toY(diffs[n-1]);
+    var dotCol = diffs[n-1] >= 0 ? '#34d399' : '#f87171';
+    ctx.beginPath(); ctx.arc(lx, ly, 9, 0, Math.PI*2);
+    ctx.fillStyle = dotCol + '22'; ctx.fill();
+    ctx.beginPath(); ctx.arc(lx, ly, 5, 0, Math.PI*2);
+    ctx.fillStyle = dotCol; ctx.fill();
+
+    /* ── Y-axis labels ── */
+    var yEl = document.getElementById('oiYLabels');
+    if (yEl) {
+        yEl.innerHTML = '';
+        for (var g = gridCount; g >= 0; g--) {
+            var gv  = minV + (range / gridCount) * g;
+            var lbl = document.createElement('div');
+            lbl.className   = 'oi-y-label';
+            lbl.style.color = gv >= 0 ? 'rgba(52,211,153,0.4)' : 'rgba(248,113,113,0.4)';
+            lbl.textContent = fmtOI(Math.round(gv));
+            yEl.appendChild(lbl);
+        }
+    }
+
+    /* ── X-axis time labels ── */
+    var xEl = document.getElementById('oiXLabels');
+    if (xEl) {
+        xEl.innerHTML = '';
+        var xStep = Math.max(1, Math.floor(n / 6));
+        reversed.forEach(function(r, i) {
+            if (i % xStep === 0 || i === n - 1) {
+                var sp = document.createElement('span');
+                sp.className   = 'oi-x-label';
+                sp.textContent = r.time || '';
+                xEl.appendChild(sp);
             }
-          }
-
-          // Restore main tab visibility
-          if (typeof switchMainTab === 'function') switchMainTab(mainTab);
-
-        } catch(e) {}
-
-        // Scroll restore after JS state changes
-        restoreScroll();
-
-      }, 60);
-
-      // Final scroll guarantee after layout reflow
-      setTimeout(restoreScroll, 180);
-      setTimeout(restoreScroll, 400);
+        });
     }
 
-    return changed;
-  }
+    /* ── Tooltip + Crosshair ── */
+    var tooltip   = document.getElementById('oiChartTooltip');
+    var crosshair = document.getElementById('oiCrosshair');
 
-  let iframe = document.getElementById('silentRefreshFrame');
-  if (!iframe) {
-    iframe = document.createElement('iframe');
-    iframe.id = 'silentRefreshFrame';
-    iframe.style.cssText = 'position:fixed;width:0;height:0;border:none;' +
-                            'visibility:hidden;pointer-events:none;opacity:0;' +
-                            'top:-9999px;left:-9999px;';
-    document.body.appendChild(iframe);
-  }
+    canvas.onmousemove = function(e) {
+        if (!tooltip || !crosshair) return;
+        var rect = canvas.getBoundingClientRect();
+        var mx   = e.clientX - rect.left;
+        var idx  = Math.round((mx - padL) / cW * (n - 1));
+        if (idx < 0 || idx >= n) {
+            tooltip.style.display = 'none';
+            crosshair.style.display = 'none';
+            return;
+        }
+        var row = reversed[idx];
+        var dv  = row.diff || 0;
+        var dc  = dv >= 0 ? '#34d399' : '#f87171';
 
-  let _lastTimestamp  = null;
-  let _refreshing     = false;
+        crosshair.style.display = 'block';
+        crosshair.style.left    = toX(idx) + 'px';
 
-  function doSilentRefresh() {
-    if (_refreshing) return;
-    _refreshing = true;
-    showSpinner(true);
-    iframe.src = 'index.html?_=' + Date.now();
-  }
+        var ttTime = document.getElementById('oiTTTime');
+        var ttDiff = document.getElementById('oiTTDiff');
+        var ttCE   = document.getElementById('oiTTCE');
+        var ttPE   = document.getElementById('oiTTPE');
+        var ttSig  = document.getElementById('oiTTSignal');
+        if (ttTime) ttTime.textContent = (row.time || '') + ' IST';
+        if (ttDiff) { ttDiff.textContent = fmtOI(dv); ttDiff.style.color = dc; }
+        if (ttCE)   ttCE.textContent   = fmtOI(row.call_oi_chg || 0);
+        if (ttPE)   ttPE.textContent   = fmtOI(row.put_oi_chg  || 0);
+        if (ttSig)  { ttSig.textContent = dv >= 0 ? 'BUY' : 'SELL'; ttSig.style.color = dc; }
 
-  iframe.addEventListener('load', function() {
-    if (!iframe.src || iframe.src === 'about:blank') {
-      _refreshing = false; showSpinner(false); return;
+        var wrapW = wrap ? wrap.clientWidth : W;
+        var tx    = toX(idx) + 14;
+        if (tx + 175 > wrapW) tx = toX(idx) - 189;
+        tooltip.style.left    = tx + 'px';
+        tooltip.style.top     = '10px';
+        tooltip.style.display = 'block';
+    };
+
+    canvas.onmouseleave = function() {
+        if (tooltip)   tooltip.style.display   = 'none';
+        if (crosshair) crosshair.style.display = 'none';
+    };
+}
+
+function loadOILog() {
+    var url = 'oi_log_banknifty.json?_t=' + Date.now();
+    fetch(url, {cache:'no-store'})
+        .then(function(r){ if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+        .then(function(data) {
+            if (Array.isArray(data) && data.length > 0) {
+                data[0]._isLive = true;
+                _oiData = data;
+                window._oiData = data;
+                renderOITable(data);
+                var now = new Date(new Date().toLocaleString('en-US',{timeZone:'Asia/Kolkata'}));
+                var el  = document.getElementById('oiLastFetch');
+                if (el) el.textContent = 'Last fetch: ' + String(now.getHours()).padStart(2,'0') + ':' + String(now.getMinutes()).padStart(2,'0') + ':' + String(now.getSeconds()).padStart(2,'0') + ' IST';
+            }
+        })
+        .catch(function(e) {
+            var tbody = document.getElementById('oiTableBody');
+            if (tbody) tbody.innerHTML = '<tr><td colspan="15" class="oi-empty-state">&#9888; Could not load oi_log_banknifty.json</td></tr>';
+        });
+}
+
+window.addEventListener('load', function(){
+    if (window.location.hash === '#oi-trend') { switchTab('oi-trend'); }
+    else { loadOILog(); }
+    // Auto-select first strategy row so Trade Plan is pre-filled
+    var firstRow = document.querySelector('.sc-row');
+    if (firstRow) { selectStrat(firstRow); }
+});
+
+window.addEventListener('resize', function(){
+    if (_oiData.length > 0) drawSparkline(filterByInterval(_oiData, _oiInterval));
+});
+
+/* ══ SIDEBAR NAV JS ══════════════════════════════════════════════ */
+var _nsbCollapsed = false;
+var _nsbActiveId  = 'signals';
+var _currentTab   = 'main';   /* ← tracks active tab so navSidebarTo works correctly */
+
+/* Patch switchTab to keep _currentTab in sync */
+var _origSwitchTab = switchTab;
+switchTab = function(tab) {
+    _origSwitchTab(tab);
+    _currentTab = tab;
+};
+
+function _scrollToSec(secId) {
+    var target = document.getElementById('sec-' + secId);
+    if (!target) {
+        window.scrollTo({ top: 0, behavior: 'smooth' });
+        return;
     }
-    try {
-      const newDoc = iframe.contentDocument || iframe.contentWindow.document;
-      if (!newDoc || !newDoc.body) throw new Error('empty doc');
-      const newTsEl = newDoc.getElementById('lastUpdatedTs');
-      const newTs   = newTsEl ? newTsEl.textContent.trim() : '';
-      if (_lastTimestamp !== null && newTs === _lastTimestamp) {
-        showSpinner(false); _refreshing = false; return;
-      }
-      _lastTimestamp = newTs;
-      const changed = microDiff(newDoc);
-      showSpinner(false); _refreshing = false;
-      if (changed) flashUpdated();
-    } catch(e) {
-      showSpinner(false); _refreshing = false;
+    /* Get height of sticky bars so we don't hide section title behind them */
+    var offset = 0;
+    var mobBar = document.getElementById('nsbMobBar');
+    if (mobBar && mobBar.offsetParent !== null) {
+        offset += mobBar.offsetHeight;
     }
-    setTimeout(function() { try { iframe.src = 'about:blank'; } catch(e) {} }, 500);
-  });
+    var header = document.querySelector('.header');
+    /* Header is NOT sticky, so no need to add it */
+    var rect   = target.getBoundingClientRect();
+    var absTop = rect.top + window.pageYOffset - offset - 8;
+    window.scrollTo({ top: absTop, behavior: 'smooth' });
+}
 
-  let remaining = TOTAL_SECS;
-  setCountdownUI(remaining);
+function toggleNavSidebar() {
+    _nsbCollapsed = !_nsbCollapsed;
+    var sb = document.getElementById('navSidebar');
+    if (sb) sb.classList.toggle('collapsed', _nsbCollapsed);
+}
 
-  setInterval(function() {
-    remaining -= 1;
-    if (remaining <= 0) {
-      remaining = TOTAL_SECS;
-      setCountdownUI(remaining);
-      doSilentRefresh();
-    } else {
-      setCountdownUI(remaining);
+function navSidebarTo(secId, tabId) {
+    /* 1. Switch tab if needed */
+    if (tabId !== _currentTab) {
+        switchTab(tabId);
     }
-  }, 1000);
+    /* 2. Set active sidebar item */
+    document.querySelectorAll('.nsb-item').forEach(function(el){ el.classList.remove('active'); });
+    var activeEl = document.getElementById('nsi-' + secId);
+    if (activeEl) activeEl.classList.add('active');
+    _nsbActiveId = secId;
+    /* 3. Scroll after tab paint — 150ms is reliable across browsers */
+    setTimeout(function(){ _scrollToSec(secId); }, 150);
+}
 
-  window.addEventListener('load', function() {
-    setTimeout(doSilentRefresh, 2000);
-  });
-})();
+function openNsbDrawer()  { document.getElementById('nsbDrawer').classList.add('open'); }
+function closeNsbDrawer() { document.getElementById('nsbDrawer').classList.remove('open'); }
+
+function mobNavTo(secId, tabId, label) {
+    /* Update mobile drawer active state */
+    document.querySelectorAll('.nsb-mob-item').forEach(function(el){ el.classList.remove('active'); });
+    var el = document.getElementById('nsmd-' + secId);
+    if (el) el.classList.add('active');
+    /* Update mobile title bar */
+    var titleEl = document.getElementById('nsbMobTitle');
+    if (titleEl) titleEl.innerHTML = label;
+    /* Close drawer first, then switch + scroll */
+    closeNsbDrawer();
+    /* Sync desktop sidebar active state */
+    document.querySelectorAll('.nsb-item').forEach(function(el){ el.classList.remove('active'); });
+    var deskEl = document.getElementById('nsi-' + secId);
+    if (deskEl) deskEl.classList.add('active');
+    _nsbActiveId = secId;
+    /* Switch tab if needed */
+    if (tabId !== _currentTab) { switchTab(tabId); }
+    /* Scroll after drawer close animation + tab paint */
+    setTimeout(function(){ _scrollToSec(secId); }, 200);
+}
 </script>
 """
 
-
-def build_greeks_script_html(oc_analysis):
-    if not oc_analysis:
-        return ""
-    all_rows = oc_analysis.get("all_strikes", oc_analysis.get("greeks_table", []))
-    atm      = int(oc_analysis.get("atm_strike", 0))
-    if not all_rows:
-        return ""
-    strikes_json_parts = []
-    for row in all_rows:
-        s = int(row["strike"])
-        strikes_json_parts.append(
-            f'"{s}":{{'
-            + f'"ce_ltp":{round(float(row["ce_ltp"]),2)},'
-            + f'"pe_ltp":{round(float(row["pe_ltp"]),2)},'
-            + f'"ce_delta":{round(float(row["ce_delta"]),4)},'
-            + f'"pe_delta":{round(float(row["pe_delta"]),4)},'
-            + f'"ce_iv":{round(float(row["ce_iv"]),2)},'
-            + f'"pe_iv":{round(float(row["pe_iv"]),2)},'
-            + f'"ce_theta":{round(float(row["ce_theta"]),4)},'
-            + f'"pe_theta":{round(float(row["pe_theta"]),4)},'
-            + f'"ce_vega":{round(float(row["ce_vega"]),4)},'
-            + f'"pe_vega":{round(float(row["pe_vega"]),4)}'
-            + f'}}')
-    strikes_json = "{" + ",".join(strikes_json_parts) + "}"
-    return f"""<script>
-(function() {{
-  var _gData = {strikes_json};
-  var _atm   = {atm};
-  function _initGreeks() {{
-    var sel = document.getElementById('greeksStrikeSelect');
-    if (sel) {{ greeksUpdateStrike(sel.value); }}
-  }}
-  window.greeksUpdateStrike = function(strike) {{
-    var key = String(parseInt(strike, 10));
-    var d   = _gData[key];
-    if (!d) {{
-      var keys = Object.keys(_gData).map(Number);
-      var nearest = keys.reduce((a,b) => Math.abs(b-parseInt(strike))<Math.abs(a-parseInt(strike))?b:a, keys[0]);
-      d = _gData[String(nearest)];
-    }}
-    if (!d) return;
-    var sel  = parseInt(strike, 10);
-    var dist = Math.round(Math.abs(sel - _atm) / 100);
-    var lbl  = sel === _atm ? 'ATM' : (sel > _atm ? 'CE+' + dist : 'PE-' + dist);
-    var e1 = document.getElementById('greeksStrikeTypeLabel'); if(e1) e1.textContent = lbl;
-    var e2 = document.getElementById('greeksStrikeLabel'); if(e2) e2.innerHTML = '&#8377;' + sel.toLocaleString('en-IN');
-    var e3 = document.getElementById('greeksCeLtp'); if(e3) e3.innerHTML = 'CE &#8377;' + (d.ce_ltp||0).toFixed(1);
-    var e4 = document.getElementById('greeksPeLtp'); if(e4) e4.innerHTML = 'PE &#8377;' + (d.pe_ltp||0).toFixed(1);
-    var ceCol='#00c896', peCol='#ff6b6b';
-    var cePct=Math.min(100,Math.abs(d.ce_delta)*100).toFixed(0);
-    var pePct=Math.min(100,Math.abs(d.pe_delta)*100).toFixed(0);
-    var dw = document.getElementById('greeksDeltaWrap');
-    if(dw) dw.innerHTML =
-      '<div style="display:flex;align-items:center;gap:5px;">' +
-        '<div style="width:34px;height:3px;background:rgba(255,255,255,.10);border-radius:2px;overflow:hidden;">' +
-          '<div style="width:'+cePct+'%;height:100%;background:'+ceCol+';border-radius:2px;"></div></div>' +
-        '<span style="font-family:DM Mono,monospace;font-size:15.9px;font-weight:700;color:'+ceCol+';">' +
-             (d.ce_delta>=0?'+':'')+d.ce_delta.toFixed(3)+'</span></div>' +
-      '<div style="display:flex;align-items:center;gap:5px;margin-top:3px;">' +
-        '<div style="width:34px;height:3px;background:rgba(255,255,255,.10);border-radius:2px;overflow:hidden;">' +
-          '<div style="width:'+pePct+'%;height:100%;background:'+peCol+';border-radius:2px;"></div></div>' +
-        '<span style="font-family:DM Mono,monospace;font-size:15.9px;font-weight:700;color:'+peCol+';">' +
-             (d.pe_delta>=0?'+':'')+d.pe_delta.toFixed(3)+'</span></div>';
-    var ice = document.getElementById('greeksIvCe'); if(ice) ice.textContent = (d.ce_iv||0).toFixed(1)+'%';
-    var ipe = document.getElementById('greeksIvPe'); if(ipe) ipe.textContent = (d.pe_iv||0).toFixed(1)+'%';
-    var skew=((d.pe_iv||0)-(d.ce_iv||0)).toFixed(1);
-    var skewEl=document.getElementById('greeksSkewLbl');
-    if(skewEl) {{ skewEl.textContent = parseFloat(skew)>0?'PE Skew +'+skew:'CE Skew '+skew; skewEl.style.color = parseFloat(skew)>1.5?'#ff6b6b':(parseFloat(skew)<-1.5?'#00c896':'#6480ff'); }}
-    function tfmt(t){{ return Math.abs(t)>=0.01?'&#8377;'+Math.abs(t).toFixed(2):t.toFixed(4); }}
-    var tc = document.getElementById('greeksThetaCe'); if(tc) tc.innerHTML = tfmt(d.ce_theta||0);
-    var tp = document.getElementById('greeksThetaPe'); if(tp) tp.innerHTML = tfmt(d.pe_theta||0);
-    function vfmt(v){{ return Math.abs(v)>=0.0001?v.toFixed(4):'&mdash;'; }}
-    var vc = document.getElementById('greeksVegaCe'); if(vc) vc.innerHTML = vfmt(d.ce_vega||0);
-    var vp = document.getElementById('greeksVegaPe'); if(vp) vp.innerHTML = vfmt(d.pe_vega||0);
-    var ivAvg=((d.ce_iv||0)+(d.pe_iv||0))/2;
-    var ivCol=ivAvg>25?'#ff6b6b':(ivAvg>18?'#ffd166':'#00c896');
-    var ivReg=ivAvg>25?'High IV \u00b7 Buy Premium':(ivAvg>15?'Normal IV \u00b7 Balanced':'Low IV \u00b7 Sell Premium');
-    var ivPct=Math.min(100,Math.max(0,(ivAvg/60)*100)).toFixed(1);
-    var barEl=document.getElementById('greeksIvBar');
-    if(barEl) {{barEl.style.width=ivPct+'%'; barEl.style.background=ivCol; barEl.style.boxShadow='0 0 6px '+ivCol+'88';}}
-    var avgEl=document.getElementById('greeksIvAvg');
-    if(avgEl) {{avgEl.textContent=ivAvg.toFixed(1)+'%'; avgEl.style.color=ivCol;}}
-    var regEl=document.getElementById('greeksIvRegime');
-    if(regEl) {{regEl.textContent=ivReg; regEl.style.color=ivCol;}}
-  }};
-  if (document.readyState === 'loading') {{
-    document.addEventListener('DOMContentLoaded', _initGreeks);
-  }} else {{
-    setTimeout(_initGreeks, 80);
-  }}
-}})();
-</script>"""
-
-
-# =================================================================
-#  SECTION 10 -- HTML ASSEMBLER
-# =================================================================
-
-def generate_html(tech, oc, md, ts, vix_data=None, multi_expiry_analyzed=None, expiry_list=None, instrument="BANKNIFTY", lot_size=30, fn_oc=None, fn_md=None, fn_tech=None, fn_multi_expiry=None, fn_expiry_list=None):
-    oi_html        = build_oi_html(oc)               if oc   else ""
-    kl_html        = build_key_levels_html(tech, oc) if tech else ""
-    strat_html     = build_strategies_html(oc, tech, md, multi_expiry_analyzed=multi_expiry_analyzed, expiry_list=expiry_list, lot_size=lot_size, emit_script=True,  instrument_prefix="bn")
-    fn_strat_html  = build_strategies_html(fn_oc, fn_tech, fn_md, multi_expiry_analyzed=fn_multi_expiry, expiry_list=fn_expiry_list, lot_size=60, emit_script=False, instrument_prefix="fn") if fn_oc else ""
-    strikes_html   = build_strikes_html(oc)
-    ticker_html    = build_ticker_bar(tech, oc, vix_data)
-    gauge_html     = build_dual_gauge_hero(oc, tech, md, ts, instrument=instrument)
-    greeks_sidebar = build_greeks_sidebar_html(oc)
-    greeks_script  = build_greeks_script_html(oc)
-    greeks_table   = build_greeks_table_html(oc)
-    # Note: fn_greeks_script_str is built later alongside other FN panel strings
-
-    C = 2 * 3.14159 * 7
-    cp    = tech["price"] if tech else 0
-    bias  = md["bias"]; conf = md["confidence"]
-    bull  = md["bull"]; bear  = md["bear"]; diff = md["diff"]
-
-    # ── BankNifty data for JS INSTRUMENT_DATA blob ──
-    bn_oc = oc; bn_md = md; bn_tech = tech
-    lot_size_bn = lot_size
-    bn_spot   = oc["underlying"]    if oc else 0
-    bn_atm    = oc["atm_strike"]    if oc else 0
-    bn_pcr    = oc["pcr_oi"]        if oc else 1.0
-    bn_maxpain= oc["max_pain"]      if oc else 0
-    bn_max_ce = oc["max_ce_strike"] if oc else 0
-    bn_max_pe = oc["max_pe_strike"] if oc else 0
-    bn_sup    = tech["support"]     if tech else bn_spot - 150
-    bn_res    = tech["resistance"]  if tech else bn_spot + 150
-    bn_ssup   = tech["strong_sup"]  if tech else bn_spot - 300
-    bn_sres   = tech["strong_res"]  if tech else bn_spot + 300
-    bn_bias   = md["bias"]
-    bn_conf   = md["confidence"]
-    bn_bull   = md["bull"]
-    bn_bear   = md["bear"]
-    bn_oi_dir = oc["raw_oi_dir"]    if oc else "UNKNOWN"
-    bn_oi_sig = oc["raw_oi_sig"]    if oc else ""
-    bn_pcr_cls= oc["raw_oi_cls"]    if oc else "neutral"
-    bn_expiry = oc["expiry"]        if oc else "N/A"
-    bn_strikes_json = json.dumps(oc.get("strikes_data", [])) if oc else "[]"
-    # Gauge fields for BN hero widget
-    bn_raw_oi_dir = oc["raw_oi_dir"]       if oc else "UNKNOWN"
-    bn_raw_oi_sig = oc["raw_oi_sig"]       if oc else ""
-    bn_raw_oi_cls = oc["raw_oi_cls"]       if oc else "neutral"
-    bn_chg_bull   = oc["chg_bull_force"]   if oc else 0
-    bn_chg_bear   = oc["chg_bear_force"]   if oc else 0
-    bn_bull_pct   = oc["chg_bull_pct"]     if oc else 50
-    bn_bear_pct   = oc["chg_bear_pct"]     if oc else 50
-    bn_diff       = md["diff"]
-    # Build BN all_expiry dict for JS
-    _bn_all_exp = {}
-    if multi_expiry_analyzed and expiry_list:
-        for _exp in expiry_list:
-            _oc_e = multi_expiry_analyzed.get(_exp)
-            if not _oc_e: continue
-            _bn_all_exp[_exp] = {
-                "spot": round(_oc_e["underlying"], 2),
-                "atm": _oc_e["atm_strike"],
-                "pcr": round(_oc_e["pcr_oi"], 3),
-                "maxCeStrike": _oc_e["max_ce_strike"],
-                "maxPeStrike": _oc_e["max_pe_strike"],
-                "support": round(tech["support"], 2) if tech else bn_spot - 150,
-                "resistance": round(tech["resistance"], 2) if tech else bn_spot + 150,
-                "strongSup": round(tech["strong_sup"], 2) if tech else bn_spot - 300,
-                "strongRes": round(tech["strong_res"], 2) if tech else bn_spot + 300,
-                "strikes": _oc_e.get("strikes_data", []),
-            }
-    bn_all_expiry_json = json.dumps(_bn_all_exp)
-
-    # ── FinNifty data for JS INSTRUMENT_DATA blob ──
-    lot_size_fn = 60
-    fn_spot    = fn_oc["underlying"]    if fn_oc else None
-    fn_atm     = fn_oc["atm_strike"]    if fn_oc else None
-    _fn_sp     = fn_spot or 0
-    fn_spot_js = f"{fn_spot:.2f}" if fn_spot is not None else "null"
-    fn_atm_js  = str(fn_atm) if fn_atm is not None else "null"
-    fn_pcr = fn_oc["pcr_oi"]        if fn_oc else 1.0
-    fn_maxpain = fn_oc["max_pain"]  if fn_oc else 0
-    fn_max_ce  = fn_oc["max_ce_strike"] if fn_oc else 0
-    fn_max_pe  = fn_oc["max_pe_strike"] if fn_oc else 0
-    fn_sup     = fn_tech["support"]     if fn_tech else _fn_sp - 150
-    fn_res     = fn_tech["resistance"]  if fn_tech else _fn_sp + 150
-    fn_ssup    = fn_tech["strong_sup"]  if fn_tech else _fn_sp - 300
-    fn_sres    = fn_tech["strong_res"]  if fn_tech else _fn_sp + 300
-    fn_bias    = fn_md["bias"]          if fn_md else "SIDEWAYS"
-    fn_conf    = fn_md["confidence"]    if fn_md else "LOW"
-    fn_bull    = fn_md["bull"]          if fn_md else 4
-    fn_bear    = fn_md["bear"]          if fn_md else 4
-    fn_oi_dir  = fn_oc["raw_oi_dir"]    if fn_oc else "UNKNOWN"
-    fn_oi_sig  = fn_oc["raw_oi_sig"]    if fn_oc else "FinNifty data unavailable"
-    fn_pcr_cls = fn_oc["raw_oi_cls"]    if fn_oc else "neutral"
-    fn_expiry  = fn_oc["expiry"]        if fn_oc else "N/A"
-    fn_strikes_json = json.dumps(fn_oc.get("strikes_data", [])) if fn_oc else "[]"
-    # Gauge fields for FN hero widget
-    fn_raw_oi_dir = fn_oc["raw_oi_dir"]       if fn_oc else "UNKNOWN"
-    fn_raw_oi_sig = fn_oc["raw_oi_sig"]       if fn_oc else "FinNifty data unavailable"
-    fn_raw_oi_cls = fn_oc["raw_oi_cls"]       if fn_oc else "neutral"
-    fn_chg_bull   = fn_oc["chg_bull_force"]   if fn_oc else 0
-    fn_chg_bear   = fn_oc["chg_bear_force"]   if fn_oc else 0
-    fn_bull_pct   = fn_oc["chg_bull_pct"]     if fn_oc else 50
-    fn_bear_pct   = fn_oc["chg_bear_pct"]     if fn_oc else 50
-    fn_diff       = fn_md["diff"]             if fn_md else 0
-    # Build FN all_expiry dict for JS
-    _fn_all_exp = {}
-    if fn_multi_expiry and fn_expiry_list:
-        for _exp in fn_expiry_list:
-            _oc_e = fn_multi_expiry.get(_exp)
-            if not _oc_e: continue
-            _fn_all_exp[_exp] = {
-                "spot": round(_oc_e["underlying"], 2),
-                "atm": _oc_e["atm_strike"],
-                "pcr": round(_oc_e["pcr_oi"], 3),
-                "maxCeStrike": _oc_e["max_ce_strike"],
-                "maxPeStrike": _oc_e["max_pe_strike"],
-                "support": round(fn_tech["support"], 2) if fn_tech else fn_spot - 150,
-                "resistance": round(fn_tech["resistance"], 2) if fn_tech else fn_spot + 150,
-                "strongSup": round(fn_tech["strong_sup"], 2) if fn_tech else fn_spot - 300,
-                "strongRes": round(fn_tech["strong_res"], 2) if fn_tech else fn_spot + 300,
-                "strikes": _oc_e.get("strikes_data", []),
-            }
-    fn_all_expiry_json = json.dumps(_fn_all_exp)
-    default_instrument = instrument
-
-    # ── Pre-render BN and FN HTML panels for instrument switching ──
-    def _esc(s):
-        """Escape backticks and ${ so the string is safe inside JS template literals."""
-        return s.replace('\\', '\\\\').replace('`', '\\`').replace('${', '\\${')
-
-    bn_oi_html_str      = _esc(build_oi_html(oc))               if oc    else ""
-    bn_kl_html_str      = _esc(build_key_levels_html(tech, oc)) if tech  else ""
-    bn_greeks_panel_str = _esc(build_greeks_sidebar_html(oc))
-    bn_greeks_table_str = _esc(build_greeks_table_html(oc))
-    bn_strikes_html_str = _esc(build_strikes_html(oc))
-
-    _unavail_oi     = "<div style='padding:20px;color:rgba(255,255,255,.5);'>FinNifty OI data unavailable.</div>"
-    _unavail_kl     = "<div style='padding:20px;color:rgba(255,255,255,.5);'>FinNifty Key Levels unavailable.</div>"
-    _unavail_greeks = "<div style='padding:14px 12px;font-size:15.9px;color:rgba(255,255,255,.68);text-align:center;'>FinNifty Greeks unavailable.</div>"
-
-    fn_oi_html_str      = _esc(build_oi_html(fn_oc))                  if fn_oc    else _esc(_unavail_oi)
-    fn_kl_html_str      = _esc(build_key_levels_html(fn_tech, fn_oc)) if fn_tech  else _esc(_unavail_kl)
-    fn_greeks_panel_str = _esc(build_greeks_sidebar_html(fn_oc))      if fn_oc    else _esc(_unavail_greeks)
-    fn_greeks_table_str = _esc(build_greeks_table_html(fn_oc))        if fn_oc    else ""
-    fn_strikes_html_str = _esc(build_strikes_html(fn_oc))             if fn_oc    else ""
-    fn_greeks_script_str = build_greeks_script_html(fn_oc)            if fn_oc    else ""
-
-    return f"""<!DOCTYPE html>
-<html lang="en">
+        html = f"""<!DOCTYPE html>
+<html>
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>{instrument} Options Dashboard v20.0</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Sora:wght@300;400;600;700&family=DM+Mono:wght@300;400;500&display=swap" rel="stylesheet">
-<style>{CSS}</style>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>BankNifty OI Analysis</title>
+    <link href="https://fonts.googleapis.com/css2?family=Oxanium:wght@400;600;700;800&family=Rajdhani:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600;700&family=Outfit:wght@300;400;500;600;700&family=Space+Mono:wght@400;700&family=Orbitron:wght@700;900&display=swap" rel="stylesheet">
+    <style>
+        *{{margin:0;padding:0;box-sizing:border-box;}}
+        html{{scroll-behavior:smooth;background:#04080f;}}
+        body{{font-family:'Rajdhani',sans-serif;background:linear-gradient(135deg,#0f2027 0%,#203a43 50%,#2c5364 100%);min-height:100vh;padding:0;color:#c8d8e0;overflow-x:hidden;-webkit-text-size-adjust:100%;animation:pageIn 0.35s ease forwards;}}
+        @keyframes pageIn{{from{{opacity:0;}}to{{opacity:1;}}}}
+
+        .tab-nav{{display:flex;gap:0;border-bottom:2px solid rgba(79,195,247,0.2);overflow-x:auto;scrollbar-width:none;background:linear-gradient(135deg,#0f2027,#203a43);}}
+        .tab-nav::-webkit-scrollbar{{display:none;}}
+        .tab-btn{{display:flex;align-items:center;gap:8px;padding:13px clamp(14px,2.5vw,28px);font-family:'Oxanium',sans-serif;font-size:clamp(10px,1.4vw,13px);font-weight:700;letter-spacing:1.5px;text-transform:uppercase;color:rgba(176,190,197,0.5);cursor:pointer;border:none;background:transparent;border-bottom:3px solid transparent;white-space:nowrap;transition:all 0.25s ease;position:relative;bottom:-2px;}}
+        .tab-btn:hover{{color:#4fc3f7;background:rgba(79,195,247,0.05);}}
+        .tab-btn.active{{color:#4fc3f7;border-bottom-color:#4fc3f7;background:rgba(79,195,247,0.08);}}
+        .tab-dot{{width:7px;height:7px;border-radius:50%;background:rgba(79,195,247,0.3);flex-shrink:0;transition:all 0.25s ease;}}
+        .tab-btn.active .tab-dot{{background:#4fc3f7;box-shadow:0 0 8px #4fc3f7;}}
+        .tab-badge{{font-size:9px;padding:2px 7px;border-radius:10px;background:rgba(79,195,247,0.12);border:1px solid rgba(79,195,247,0.25);color:#4fc3f7;}}
+        .new-badge .tab-badge{{background:rgba(0,230,118,0.12);border-color:rgba(0,230,118,0.3);color:#00e676;}}
+        .tab-panel{{display:none;}}
+        .tab-panel.active{{display:block;}}
+
+        .container{{max-width:100%;width:100%;margin:0;background:rgba(15,32,39,0.85);backdrop-filter:blur(20px);border-radius:0;overflow:visible;box-shadow:0 20px 60px rgba(0,0,0,0.5);border:none;min-width:0;}}
+
+        /* ══ OPTION B HEADER ══════════════════════════════════════════ */
+        .header{{background:linear-gradient(180deg,#061828 0%,#04111f 100%);border-bottom:2px solid rgba(79,195,247,0.2);padding:0;position:sticky;top:0;z-index:150;overflow:hidden;}}
+        .header::before{{content:'';position:absolute;inset:0;background:radial-gradient(circle at 30% 50%,rgba(79,195,247,0.05) 0%,transparent 60%);pointer-events:none;}}
+
+        /* Banner row */
+        .hb-banner{{display:flex;align-items:center;justify-content:space-between;padding:14px 22px;border-bottom:1px solid rgba(79,195,247,0.12);flex-wrap:wrap;gap:12px;position:relative;z-index:1;}}
+        .hb-left{{display:flex;align-items:center;gap:14px;}}
+        .hb-nse-badge{{padding:5px 14px;border-radius:6px;font-family:'Oxanium',sans-serif;font-size:13px;font-weight:900;letter-spacing:2px;color:#000;background:linear-gradient(135deg,#4fc3f7,#00e5ff);flex-shrink:0;}}
+        .hb-title-main{{font-family:'Oxanium',sans-serif;font-size:clamp(18px,2.5vw,26px);font-weight:900;color:#ffffff;letter-spacing:0.5px;}}
+        .hb-title-sub{{font-size:11px;letter-spacing:2px;color:#4fc3f7;text-transform:uppercase;margin-top:4px;font-weight:700;}}
+        .hb-chips{{display:flex;gap:8px;flex-wrap:wrap;}}
+        .hb-chip{{text-align:center;padding:7px 16px;border-radius:9px;background:rgba(0,0,0,0.4);border:1px solid rgba(79,195,247,0.22);flex-shrink:0;}}
+        .hb-chip-lbl{{font-family:'JetBrains Mono',monospace;font-size:10px;letter-spacing:1.5px;color:#80deea;text-transform:uppercase;margin-bottom:4px;font-weight:700;}}
+        .hb-chip-val{{font-family:'Oxanium',sans-serif;font-size:17px;font-weight:800;line-height:1;}}
+
+        /* Status row */
+        .hb-status{{display:flex;align-items:center;justify-content:space-between;padding:9px 22px;background:rgba(0,0,0,0.3);flex-wrap:wrap;gap:8px;position:relative;z-index:1;border-bottom:1px solid rgba(79,195,247,0.08);}}
+        .hb-s-item{{display:flex;align-items:center;gap:6px;font-family:'JetBrains Mono',monospace;font-size:12px;color:#c8dde8;white-space:nowrap;font-weight:600;}}
+        .hb-s-dot{{width:8px;height:8px;border-radius:50%;flex-shrink:0;animation:sb-pulse 2s ease-in-out infinite;}}
+        .hb-s-val{{font-weight:700;color:#ffffff;margin-left:3px;font-size:13px;}}
+
+        /* Tabs */
+        .tab-nav{{display:flex;gap:0;border-bottom:none;overflow-x:auto;scrollbar-width:none;background:rgba(0,0,0,0.2);position:relative;z-index:1;}}
+        .tab-nav::-webkit-scrollbar{{display:none;}}
+        .tab-btn{{display:flex;align-items:center;gap:8px;padding:13px clamp(14px,2vw,24px);font-family:'Oxanium',sans-serif;font-size:clamp(11px,1.4vw,13px);font-weight:700;letter-spacing:1.5px;text-transform:uppercase;color:rgba(200,221,232,0.65);cursor:pointer;border:none;background:transparent;border-bottom:2px solid transparent;white-space:nowrap;transition:all 0.2s ease;position:relative;bottom:-1px;}}
+        .tab-btn:hover{{color:#4fc3f7;background:rgba(79,195,247,0.05);}}
+        .tab-btn.active{{color:#4fc3f7;border-bottom-color:#4fc3f7;background:rgba(79,195,247,0.07);}}
+        .tab-dot{{width:6px;height:6px;border-radius:50%;background:rgba(79,195,247,0.3);flex-shrink:0;transition:all 0.25s ease;}}
+        .tab-btn.active .tab-dot{{background:#4fc3f7;box-shadow:0 0 8px #4fc3f7;}}
+        .tab-badge{{font-size:8px;padding:2px 6px;border-radius:8px;background:rgba(79,195,247,0.12);border:1px solid rgba(79,195,247,0.25);color:#4fc3f7;}}
+        .new-badge .tab-badge{{background:rgba(192,132,252,0.12);border-color:rgba(192,132,252,0.3);color:#c084fc;}}
+        .tab-panel{{display:none;}}
+        .tab-panel.active{{display:block;}}
+
+        /* Status bar dots kept for JS compatibility */
+        .sb-dot-gen{{background:#00e676;box-shadow:0 0 8px #00e676;}}
+        .sb-dot-clock{{background:#4fc3f7;box-shadow:0 0 8px #4fc3f7;}}
+        .sb-dot-cd{{background:#b388ff;box-shadow:0 0 8px #b388ff;}}
+        @keyframes sb-pulse{{50%{{opacity:0.25;}}}}
+
+        /* Responsive header */
+        @media(max-width:900px){{
+            .hb-chips .hb-chip:nth-child(n+4){{display:none;}}
+        }}
+        @media(max-width:600px){{
+            .hb-banner{{padding:10px 12px;gap:8px;}}
+            .hb-chips{{display:none;}}
+            .hb-title-main{{font-size:13px;}}
+            .hb-status{{padding:6px 12px;gap:4px;}}
+            .hb-s-item{{font-size:9px;}}
+            .tab-btn{{padding:9px 10px;font-size:9px;letter-spacing:0.8px;}}
+        }}
+
+        .section{{padding:clamp(14px,2.5vw,28px) clamp(12px,2.5vw,26px);border-bottom:1px solid rgba(79,195,247,0.08);}}
+        .section:last-child{{border-bottom:none;}}
+        .section-title{{font-family:'Oxanium',sans-serif;font-size:clamp(10px,1.5vw,13px);font-weight:700;letter-spacing:clamp(1px,0.3vw,2.5px);color:#4fc3f7;text-transform:uppercase;display:flex;align-items:center;gap:10px;margin-bottom:clamp(12px,2vw,20px);padding-bottom:12px;border-bottom:1px solid rgba(79,195,247,0.18);flex-wrap:wrap;}}
+        .section-title span{{font-size:clamp(14px,2vw,18px);}}
+
+
+        /* ── COMPACT STAT CARDS ─────────────────────────────────── */
+        .g-compact{{background:#111827;border:1px solid #1e2a3a;border-radius:8px;padding:8px 10px;position:relative;overflow:hidden;transition:transform .2s,border-color .2s;}}
+        .g-compact:hover{{transform:translateY(-2px);border-color:rgba(79,195,247,0.4)!important;}}
+        /* ── ENHANCED STAT CARDS ──────────────────────────────────── */
+        .g-compact{{transition:transform .25s ease,border-color .25s ease,box-shadow .25s ease;}}
+        .g-compact:hover{{transform:translateY(-4px)!important;box-shadow:0 16px 40px rgba(0,0,0,0.45)!important;}}
+        .cc-top{{display:flex;align-items:center;gap:6px;margin-bottom:4px;}}
+        .cc-ico{{font-size:13px;line-height:1;flex-shrink:0;}}
+        .cc-lbl{{font-size:8px;letter-spacing:.1em;text-transform:uppercase;color:#8896b3;font-weight:600;flex:1;}}
+        .cc-val{{font-family:'JetBrains Mono',monospace;font-size:19px;font-weight:700;line-height:1;color:#e2e8f8;margin-bottom:4px;letter-spacing:-.02em;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}}
+        .cc-sub{{font-size:8px;color:#4a5578;margin-bottom:3px;font-family:'JetBrains Mono',monospace;}}
+        .cc-bar{{height:2px;background:#1e2a3a;border-radius:1px;overflow:hidden;}}
+        .cc-bar-fill{{height:100%;border-radius:1px;}}
+        .cc-bar-fill.bar-teal{{background:linear-gradient(90deg,#00bcd4,#4fc3f7);}}
+        .cc-bar-fill.bar-red{{background:linear-gradient(90deg,#f44336,#ff5722);}}
+        .cc-bar-fill.bar-gold{{background:linear-gradient(90deg,#ffb74d,#ffd54f);}}
+        .g-compact .tag{{font-size:8px;padding:1px 6px;border-radius:3px;white-space:nowrap;flex-shrink:0;}}
+        .g{{background:rgba(255,255,255,0.04);backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);border:1px solid rgba(79,195,247,0.18);border-radius:16px;position:relative;overflow:hidden;transition:all 0.35s cubic-bezier(0.4,0,0.2,1);min-width:0;}}
+        .g::before{{content:'';position:absolute;top:0;left:0;right:0;height:1px;background:linear-gradient(90deg,transparent,rgba(255,255,255,0.25),transparent);z-index:1;}}
+        .g::after{{content:'';position:absolute;top:-60%;left:-30%;width:50%;height:200%;background:linear-gradient(105deg,transparent,rgba(255,255,255,0.04),transparent);transform:skewX(-15deg);transition:left 0.6s ease;z-index:0;}}
+        .g:hover::after{{left:130%;}}
+        .g:hover{{background:rgba(79,195,247,0.09);border-color:rgba(79,195,247,0.45);box-shadow:0 12px 40px rgba(0,0,0,0.35),inset 0 1px 0 rgba(255,255,255,0.1);transform:translateY(-4px);}}
+        .g-hi{{background:rgba(79,195,247,0.09);border-color:rgba(79,195,247,0.35);}}
+        .g-red{{background:rgba(244,67,54,0.06);border-color:rgba(244,67,54,0.25);}}
+        .g-red:hover{{background:rgba(244,67,54,0.1);border-color:rgba(244,67,54,0.45);}}
+        .card-grid{{display:grid;gap:6px;}}
+        .grid-5{{grid-template-columns:repeat(5,minmax(0,1fr));}}
+        .grid-4{{grid-template-columns:repeat(4,minmax(0,1fr));}}
+        .g .card-top-row{{display:flex;align-items:center;gap:10px;margin-bottom:10px;position:relative;z-index:2;padding:14px 16px 0;}}
+        .card-ico{{font-size:clamp(16px,2vw,22px);line-height:1;flex-shrink:0;}}
+        .lbl{{font-size:clamp(8px,1vw,9px);letter-spacing:2.5px;color:rgba(128,222,234,0.65);text-transform:uppercase;font-weight:600;line-height:1.3;word-break:break-word;}}
+        .val{{font-family:'Oxanium',sans-serif;font-size:clamp(16px,2.5vw,24px);font-weight:700;color:#fff;display:block;margin-bottom:10px;position:relative;z-index:2;padding:0 16px;word-break:break-word;overflow:hidden;text-overflow:ellipsis;}}
+        .bar-wrap{{height:5px;background:rgba(0,0,0,0.35);border-radius:3px;margin:0 16px 12px;overflow:hidden;position:relative;z-index:2;}}
+        .bar-fill{{height:100%;border-radius:3px;transition:width 1.2s cubic-bezier(0.4,0,0.2,1);}}
+        .bar-teal{{background:linear-gradient(90deg,#00bcd4,#4fc3f7);box-shadow:0 0 8px rgba(79,195,247,0.6);}}
+        .bar-red{{background:linear-gradient(90deg,#f44336,#ff5722);box-shadow:0 0 8px rgba(244,67,54,0.5);}}
+        .bar-gold{{background:linear-gradient(90deg,#ffb74d,#ffd54f);box-shadow:0 0 8px rgba(255,183,77,0.5);}}
+        .card-foot{{display:flex;justify-content:space-between;align-items:center;padding:0 16px 14px;position:relative;z-index:2;flex-wrap:wrap;gap:4px;}}
+        .sub{{font-size:10px;color:#8fa8b8;font-family:'JetBrains Mono',monospace;}}
+        .tag{{display:inline-flex;align-items:center;padding:3px 11px;border-radius:20px;font-size:clamp(9px,1.2vw,11px);font-weight:700;letter-spacing:0.5px;font-family:'Rajdhani',sans-serif;white-space:nowrap;}}
+        .tag-neu{{background:rgba(255,183,77,0.15);color:#ffb74d;border:1px solid rgba(255,183,77,0.35);}}
+        .tag-bull{{background:rgba(0,229,255,0.12);color:#00e5ff;border:1px solid rgba(0,229,255,0.35);}}
+        .tag-bear{{background:rgba(255,82,82,0.12);color:#ff5252;border:1px solid rgba(255,82,82,0.35);}}
+
+        .snap-grid{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px;}}
+        .snap-card{{padding:18px 16px;}}
+        .snap-card .card-top-row{{margin-bottom:8px;padding:0;}}
+        .snap-card .val{{font-size:clamp(18px,3vw,26px);padding:0;margin-bottom:0;}}
+
+        .md-widget{{position:relative;overflow:hidden;background:linear-gradient(135deg,rgba(255,255,255,0.07),rgba(255,255,255,0.02));border:1px solid rgba(255,255,255,0.1);border-radius:16px;padding:10px 16px;backdrop-filter:blur(20px);display:flex;flex-direction:column;gap:4px;}}
+        .md-glow{{position:absolute;top:-80%;left:-80%;width:260%;height:260%;background:conic-gradient(from 180deg,#ff6b35 0deg,#ffcd3c 120deg,#4ecdc4 240deg,#ff6b35 360deg);opacity:0.05;animation:md-rotate 8s linear infinite;border-radius:50%;pointer-events:none;}}
+        @keyframes md-rotate{{to{{transform:rotate(360deg);}}}}
+        .md-row-top{{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;position:relative;z-index:1;}}
+        .md-label{{display:flex;align-items:center;gap:7px;font-family:'Space Mono',monospace;font-size:clamp(7px,1vw,8px);letter-spacing:3px;color:rgba(255,255,255,0.3);text-transform:uppercase;}}
+        .md-live-dot{{width:6px;height:6px;border-radius:50%;background:#4ecdc4;box-shadow:0 0 8px #4ecdc4;animation:md-pulse 2s ease-in-out infinite;flex-shrink:0;}}
+        @keyframes md-pulse{{50%{{opacity:0.25;}}}}
+        .md-pills-top{{display:flex;gap:8px;flex-wrap:wrap;}}
+        .md-pill{{font-family:'Space Mono',monospace;font-size:clamp(8px,1.2vw,10px);font-weight:700;padding:4px clamp(8px,1.5vw,14px);border-radius:20px;letter-spacing:1px;white-space:nowrap;}}
+        .md-pill-bull{{background:rgba(78,205,196,0.12);border:1px solid rgba(78,205,196,0.4);color:#4ecdc4;}}
+        .md-pill-bear{{background:rgba(255,100,100,0.12);border:1px solid rgba(255,100,100,0.4);color:#ff6b6b;}}
+        .md-pill-conf-high{{background:rgba(78,205,196,0.12);border:1px solid rgba(78,205,196,0.35);color:#4ecdc4;}}
+        .md-pill-conf-med{{background:rgba(255,205,60,0.12);border:1px solid rgba(255,205,60,0.35);color:#ffcd3c;}}
+        .md-pill-conf-low{{background:rgba(255,107,107,0.12);border:1px solid rgba(255,107,107,0.35);color:#ff6b6b;}}
+        .md-row-bottom{{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;position:relative;z-index:1;}}
+        .md-direction{{font-family:'Orbitron',monospace;font-weight:900;font-size:clamp(16px,2.8vw,22px);letter-spacing:clamp(0.5px,0.2vw,1.5px);line-height:1;}}
+
+        .logic-box{{background:rgba(79,195,247,0.04);border:1px solid rgba(79,195,247,0.14);border-left:3px solid #4fc3f7;border-radius:10px;padding:10px 16px;margin-top:12px;}}
+        .logic-box-head{{font-family:'Oxanium',sans-serif;font-size:10px;font-weight:700;color:#4fc3f7;letter-spacing:2px;margin-bottom:7px;}}
+        .logic-grid{{display:grid;grid-template-columns:1fr 1fr;gap:5px 20px;}}
+        .logic-item{{display:flex;align-items:center;gap:7px;font-size:clamp(10px,1.3vw,11px);color:rgba(176,190,197,0.6);flex-wrap:wrap;}}
+        .logic-item .lv{{font-family:'JetBrains Mono',monospace;font-size:10px;color:rgba(176,190,197,0.4);}}
+        .lc-bull{{display:inline-flex;align-items:center;font-family:'JetBrains Mono',monospace;font-size:9px;font-weight:600;padding:2px 8px;border-radius:4px;white-space:nowrap;background:rgba(0,230,118,0.1);color:#00e676;border:1px solid rgba(0,230,118,0.28);}}
+        .lc-bear{{display:inline-flex;align-items:center;font-family:'JetBrains Mono',monospace;font-size:9px;font-weight:600;padding:2px 8px;border-radius:4px;white-space:nowrap;background:rgba(255,82,82,0.1);color:#ff5252;border:1px solid rgba(255,82,82,0.28);}}
+        .lc-side{{display:inline-flex;align-items:center;font-family:'JetBrains Mono',monospace;font-size:9px;font-weight:600;padding:2px 8px;border-radius:4px;white-space:nowrap;background:rgba(255,183,77,0.1);color:#ffb74d;border:1px solid rgba(255,183,77,0.28);}}
+        .lc-info{{display:inline-flex;align-items:center;font-family:'JetBrains Mono',monospace;font-size:9px;font-weight:600;padding:2px 8px;border-radius:4px;white-space:nowrap;background:rgba(79,195,247,0.08);color:#4fc3f7;border:1px solid rgba(79,195,247,0.22);}}
+
+        .rl-node-a{{position:absolute;bottom:0;transform:translateX(-50%);text-align:center;}}
+        .rl-node-b{{position:absolute;top:0;transform:translateX(-50%);text-align:center;}}
+        .rl-dot{{width:12px;height:12px;border-radius:50%;border:2px solid rgba(10,20,35,0.9);}}
+        .rl-lbl{{font-size:clamp(7px,1vw,10px);font-weight:700;text-transform:uppercase;letter-spacing:0.4px;line-height:1.3;white-space:nowrap;color:#c8d8e0;}}
+        .rl-val{{font-size:clamp(9px,1.3vw,13px);font-weight:700;color:#fff;white-space:nowrap;margin-top:2px;}}
+        /* Mobile key levels: hide absolute labels, show compact table instead */
+        .kl-mobile-table{{display:none;width:100%;border-collapse:collapse;font-family:'JetBrains Mono',monospace;font-size:11px;margin-top:10px;}}
+        .kl-mobile-table td{{padding:6px 10px;border-bottom:1px solid rgba(79,195,247,0.08);}}
+        .kl-mobile-table td:last-child{{text-align:right;font-weight:700;}}
+        .kl-bar-section{{display:block;}}
+        @media(max-width:520px){{
+            .kl-bar-section{{display:none;}}
+            .kl-mobile-table{{display:table;}}
+        }}
+
+        .pf-live-badge{{display:inline-block;padding:2px 10px;border-radius:10px;font-size:10px;font-weight:700;letter-spacing:1px;}}
+        .pf-live{{background:rgba(0,230,118,0.1);color:#00e676;border:1px solid rgba(0,230,118,0.3);}}
+        .pf-estimated{{background:rgba(255,138,101,0.1);color:#ff8a65;border:1px solid rgba(255,138,101,0.3);}}
+        .pf-date-range{{font-size:11px;color:#80deea;font-weight:400;letter-spacing:1px;}}
+
+        /* ── Option 2: Horizontal Flow Meters ── */
+        .pf2-meter-row{{margin-bottom:16px;}}
+        .pf2-meter-head{{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;flex-wrap:wrap;gap:6px;}}
+        .pf2-meter-labels{{display:flex;align-items:baseline;gap:10px;}}
+        .pf2-lbl{{font-family:'Oxanium',sans-serif;font-size:18px;font-weight:800;color:#e0f7fa;letter-spacing:1px;}}
+        .pf2-sublbl{{font-size:11px;letter-spacing:1.5px;color:rgba(128,222,234,0.6);text-transform:uppercase;font-weight:600;}}
+        .pf2-val{{font-family:'JetBrains Mono',monospace;font-size:clamp(16px,2.5vw,22px);font-weight:700;letter-spacing:-0.5px;}}
+        .pf2-unit{{font-size:10px;color:rgba(128,222,234,0.4);font-weight:400;letter-spacing:1px;}}
+        .pf2-track{{height:10px;background:rgba(0,0,0,0.4);border-radius:5px;overflow:hidden;}}
+        .pf2-fill{{height:100%;border-radius:5px;transition:width 1s ease;}}
+
+        /* Daily net dot chips */
+        .pf2-dots-wrap{{display:grid;grid-template-columns:repeat(10,minmax(0,1fr));gap:6px;margin:16px 0;}}
+        .pf2-dot{{border:1px solid;border-radius:8px;padding:6px 4px;text-align:center;}}
+        .pf2-dot-date{{font-size:9px;letter-spacing:0.5px;color:rgba(128,222,234,0.45);margin-bottom:4px;font-family:'JetBrains Mono',monospace;}}
+        .pf2-dot-net{{font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:700;}}
+
+        .pf-avg-strip{{display:grid;grid-template-columns:1fr auto 1fr auto 1fr;align-items:center;background:rgba(6,13,20,0.75);border:1px solid rgba(79,195,247,0.1);border-radius:14px;padding:18px 24px;margin-bottom:16px;}}
+        .pf-avg-cell{{text-align:center;min-width:0;}}
+        .pf-avg-eyebrow{{font-size:10px;letter-spacing:2px;color:rgba(79,195,247,0.7);text-transform:uppercase;margin-bottom:6px;font-weight:700;}}
+        .pf-avg-val{{font-family:'Oxanium',sans-serif;font-size:clamp(20px,3vw,28px);font-weight:800;line-height:1;letter-spacing:-0.5px;word-break:break-word;}}
+        .pf-avg-unit{{font-size:9px;color:#8899aa;margin-top:3px;letter-spacing:1px;}}
+        .pf-avg-sep{{width:1px;height:48px;background:rgba(79,195,247,0.2);margin:0 16px;flex-shrink:0;}}
+        .pf-insight-box{{border-radius:12px;padding:16px 18px;}}
+        .pf-insight-header{{display:flex;align-items:center;gap:10px;margin-bottom:10px;flex-wrap:wrap;}}
+        .pf-insight-lbl{{font-size:10px;letter-spacing:2px;font-weight:700;text-transform:uppercase;}}
+        .pf-verdict-badge{{display:inline-block;padding:3px 14px;border-radius:20px;font-size:clamp(10px,1.5vw,11px);font-weight:800;letter-spacing:1px;white-space:nowrap;}}
+        .pf-insight-text{{font-size:clamp(12px,1.5vw,13px);color:#cfd8dc;line-height:1.85;font-weight:500;}}
+
+        @media(max-width:768px){{
+            .pf2-dots-wrap{{grid-template-columns:repeat(5,minmax(0,1fr));}}
+            .pf2-lbl{{font-size:16px;}}
+            .pf2-val{{font-size:15px;}}
+            .pf-avg-strip{{grid-template-columns:1fr;gap:0;padding:14px;}}
+            .pf-avg-sep{{display:none;}}
+            .pf-avg-cell{{display:flex;align-items:center;justify-content:space-between;padding:8px 0;border-bottom:1px solid rgba(79,195,247,0.07);}}
+            .pf-avg-cell:last-child{{border-bottom:none;}}
+            .pf-avg-eyebrow{{margin-bottom:0;}}
+        }}
+        @media(max-width:480px){{
+            .pf2-dots-wrap{{grid-template-columns:repeat(5,minmax(0,1fr));gap:4px;}}
+            .pf2-dot{{padding:5px 2px;}}
+            .pf2-dot-net{{font-size:10px;}}
+        }}
+
+        .nc-section-header{{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;margin-bottom:18px;padding-bottom:14px;border-bottom:1px solid rgba(79,195,247,0.14);}}
+        .nc-header-left{{display:flex;align-items:center;gap:14px;}}
+        .nc-header-icon{{width:44px;height:44px;border-radius:10px;background:linear-gradient(135deg,#1e3a5f,#1a3052);border:1px solid rgba(79,195,247,0.3);display:flex;align-items:center;justify-content:center;font-size:20px;flex-shrink:0;box-shadow:0 4px 14px rgba(79,195,247,0.15);}}
+        .nc-header-title{{font-family:'Outfit',sans-serif;font-size:clamp(15px,2vw,19px);font-weight:700;color:#e2eaf5;letter-spacing:0.3px;}}
+        .nc-header-sub{{font-family:'Outfit',sans-serif;font-size:13px;font-weight:500;color:#a8c4d8;margin-top:2px;letter-spacing:0.5px;}}
+        .nc-atm-badge{{background:#1f2a42;color:#60a5fa;font-family:'Outfit',sans-serif;font-size:12px;font-weight:700;padding:6px 16px;border-radius:20px;letter-spacing:1.5px;border:1px solid rgba(96,165,250,0.25);box-shadow:0 2px 10px rgba(96,165,250,0.1);white-space:nowrap;}}
+        .nc-dir-box{{border-radius:14px;padding:clamp(14px,2vw,20px) clamp(14px,2vw,22px);margin-bottom:18px;box-shadow:0 4px 24px rgba(0,0,0,0.3);}}
+        .nc-dir-bar{{width:4px;border-radius:2px;flex-shrink:0;min-height:60px;}}
+        .nc-dir-tag{{font-family:'Outfit',sans-serif;font-size:11px;font-weight:700;letter-spacing:2px;color:#a8c4d8;text-transform:uppercase;margin-bottom:6px;}}
+        .nc-dir-name{{font-family:'Outfit',sans-serif;font-size:clamp(18px,3vw,28px);font-weight:700;line-height:1;margin-bottom:6px;letter-spacing:-0.5px;}}
+        .nc-dir-signal{{font-family:'Outfit',sans-serif;font-size:clamp(10px,1.3vw,12px);font-weight:400;}}
+        .nc-meters-panel{{display:flex;flex-direction:column;gap:14px;min-width:180px;justify-content:center;}}
+        .nc-meter-row{{display:flex;flex-direction:column;gap:5px;}}
+        .nc-meter-head-row{{display:flex;justify-content:space-between;align-items:center;}}
+        .nc-meter-label{{font-family:'Outfit',sans-serif;font-size:9px;font-weight:700;letter-spacing:2px;color:rgba(148,163,184,0.45);text-transform:uppercase;}}
+        .nc-meter-track{{position:relative;height:8px;background:rgba(0,0,0,0.4);border-radius:4px;overflow:visible;width:clamp(120px,20vw,200px);}}
+        .nc-meter-fill{{height:100%;border-radius:4px;}}
+        .nc-meter-head{{position:absolute;top:50%;transform:translate(-50%,-50%);width:14px;height:14px;border-radius:50%;border:2px solid rgba(10,18,30,0.85);}}
+        .nc-meter-pct{{font-family:'Oxanium',sans-serif;font-size:clamp(12px,1.8vw,15px);font-weight:700;letter-spacing:0.5px;}}
+        .nc-cards-grid{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px;}}
+        .nc-card{{background:rgba(20,28,45,0.85);border:1px solid rgba(79,195,247,0.12);border-radius:14px;padding:clamp(12px,2vw,18px) clamp(12px,2vw,18px) 14px;transition:all 0.3s ease;position:relative;overflow:hidden;min-width:0;}}
+        .nc-card::before{{content:'';position:absolute;top:0;left:0;right:0;height:1px;background:linear-gradient(90deg,transparent,rgba(255,255,255,0.1),transparent);}}
+        .nc-card:hover{{border-color:rgba(79,195,247,0.3);background:rgba(25,35,55,0.9);transform:translateY(-3px);box-shadow:0 10px 30px rgba(0,0,0,0.3);}}
+        .nc-card-header{{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;flex-wrap:wrap;gap:4px;}}
+        .nc-card-label{{font-family:'Outfit',sans-serif;font-size:clamp(8px,1.2vw,10px);font-weight:700;letter-spacing:2px;color:rgba(148,163,184,0.6);text-transform:uppercase;}}
+        .nc-card-value{{font-family:'Oxanium',sans-serif;font-size:clamp(20px,3.5vw,30px);font-weight:700;line-height:1;margin-bottom:6px;letter-spacing:-0.5px;word-break:break-word;}}
+        .nc-card-sub{{font-family:'JetBrains Mono',monospace;font-size:10px;color:rgba(100,116,139,0.7);margin-bottom:14px;}}
+        .nc-card-btn{{display:block;width:100%;padding:9px 14px;border-radius:7px;text-align:center;font-family:'Outfit',sans-serif;font-size:clamp(11px,1.5vw,13px);font-weight:700;letter-spacing:0.5px;cursor:default;}}
+
+        .annot-badge{{font-size:9px;padding:2px 10px;border-radius:8px;background:rgba(0,230,118,0.1);border:1px solid rgba(0,230,118,0.25);color:#00e676;font-family:'JetBrains Mono',monospace;letter-spacing:1px;font-weight:700;white-space:nowrap;}}
+        .na-inline{{color:rgba(176,190,197,0.3);font-family:'JetBrains Mono',monospace;font-size:13px;}}
+        .o5-wrap{{border-radius:16px;overflow:hidden;border:1px solid rgba(239,68,68,0.2);background:rgba(6,10,18,0.97);margin-bottom:0;}}
+        .o5-top-banner{{background:linear-gradient(90deg,rgba(239,68,68,0.12),rgba(185,28,28,0.06),transparent);border-bottom:1px solid rgba(239,68,68,0.12);padding:16px 22px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:14px;}}
+        .o5-banner-left{{display:flex;align-items:center;gap:16px;flex-wrap:wrap;}}
+        .o5-score-circle{{width:62px;height:62px;border-radius:50%;background:rgba(239,68,68,0.08);border:2px solid;display:flex;flex-direction:column;align-items:center;justify-content:center;flex-shrink:0;}}
+        .o5-score-num{{font-family:'Orbitron',monospace;font-size:22px;font-weight:900;line-height:1;}}
+        .o5-score-lbl{{font-family:'JetBrains Mono',monospace;font-size:9px;letter-spacing:1.5px;text-transform:uppercase;opacity:0.75;margin-top:2px;}}
+        .o5-verdict{{font-family:'Orbitron',monospace;font-size:clamp(17px,2.4vw,24px);font-weight:900;letter-spacing:2px;}}
+        .o5-sub{{font-size:12px;color:rgba(148,163,184,0.75);margin-top:4px;line-height:1.5;max-width:520px;}}
+        .o5-pills{{display:flex;gap:8px;flex-wrap:wrap;}}
+        .o5-grid{{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:1px;background:rgba(255,255,255,0.04);}}
+        .o5-tile{{padding:16px 16px 18px;position:relative;overflow:hidden;transition:filter 0.2s;}}
+        .o5-tile:hover{{filter:brightness(1.2);}}
+        .o5-bear{{background:rgba(14,4,6,0.97);}}
+        .o5-bull{{background:rgba(4,14,10,0.97);}}
+        .o5-neu{{background:rgba(14,12,4,0.97);}}
+        .o5-na{{background:rgba(8,10,14,0.97);}}
+        .o5-tile-bar{{position:absolute;bottom:0;left:0;right:0;height:2px;}}
+        .o5-tile-top{{display:flex;align-items:flex-start;justify-content:space-between;gap:8px;margin-bottom:10px;}}
+        .o5-tile-label{{font-family:'JetBrains Mono',monospace;font-size:10px;font-weight:700;letter-spacing:1.5px;text-transform:uppercase;line-height:1.5;flex:1;}}
+        .o5-bear .o5-tile-label{{color:rgba(248,113,113,0.85);}}
+        .o5-bull .o5-tile-label{{color:rgba(52,211,153,0.85);}}
+        .o5-neu  .o5-tile-label{{color:rgba(251,191,36,0.85);}}
+        .o5-na   .o5-tile-label{{color:rgba(148,163,184,0.65);}}
+        .o5-chip{{font-family:'Orbitron',monospace;font-size:12px;font-weight:900;min-width:30px;height:28px;border-radius:6px;display:flex;align-items:center;justify-content:center;flex-shrink:0;padding:0 8px;}}
+        .o5-chip-bear{{background:rgba(239,68,68,0.2);color:#f87171;border:1px solid rgba(239,68,68,0.5);}}
+        .o5-chip-bull{{background:rgba(16,185,129,0.2);color:#34d399;border:1px solid rgba(16,185,129,0.5);}}
+        .o5-chip-neu{{background:rgba(245,158,11,0.2);color:#fbbf24;border:1px solid rgba(245,158,11,0.5);}}
+        .o5-chip-na{{background:rgba(100,116,139,0.15);color:rgba(148,163,184,0.7);border:1px solid rgba(100,116,139,0.3);font-size:10px;}}
+        .o5-val{{font-family:'Oxanium',sans-serif;font-size:clamp(15px,2vw,20px);font-weight:700;line-height:1;margin-bottom:6px;}}
+        .o5-msg{{font-size:11px;color:rgba(148,163,184,0.75);line-height:1.4;font-family:'JetBrains Mono',monospace;}}
+        .auto-badge{{font-size:8px;padding:1px 6px;border-radius:4px;background:rgba(0,230,118,0.1);border:1px solid rgba(0,230,118,0.25);color:#00e676;font-weight:700;letter-spacing:0.5px;}}
+        .manual-badge{{font-size:8px;padding:1px 6px;border-radius:4px;background:rgba(79,195,247,0.08);border:1px solid rgba(79,195,247,0.2);color:#4fc3f7;font-weight:700;letter-spacing:0.5px;}}
+        .sc-pill{{font-family:'JetBrains Mono',monospace;font-size:10px;font-weight:700;padding:4px 12px;border-radius:20px;letter-spacing:1px;}}
+        .sc-pill-bull{{background:rgba(0,230,118,0.1);border:1px solid rgba(0,230,118,0.3);color:#00e676;}}
+        .sc-pill-bear{{background:rgba(255,82,82,0.1);border:1px solid rgba(255,82,82,0.3);color:#ff5252;}}
+        .sc-pill-neu{{background:rgba(255,183,77,0.1);border:1px solid rgba(255,183,77,0.3);color:#ffb74d;}}
+        .sc-pill-na{{background:rgba(176,190,197,0.06);border:1px solid rgba(176,190,197,0.15);color:rgba(176,190,197,0.4);}}
+        /* ══ COMPACT STRATEGY WIDGET ══════════════════════════════════════ */
+        .sc-summary-strip{{display:flex;align-items:center;gap:12px;background:rgba(6,13,20,0.8);border:1px solid rgba(79,195,247,0.12);border-radius:10px;padding:10px 16px;margin-bottom:10px;flex-wrap:wrap;}}
+        .sc-ss-item{{display:flex;align-items:center;gap:6px;}}
+        .sc-ss-dot{{width:7px;height:7px;border-radius:50%;flex-shrink:0;}}
+        .sc-ss-lbl{{font-family:'JetBrains Mono',monospace;font-size:11px;letter-spacing:1px;color:rgba(128,222,234,0.7);}}
+        .sc-ss-val{{font-family:'JetBrains Mono',monospace;font-size:13px;font-weight:700;}}
+        .sc-ss-sep{{width:1px;height:18px;background:rgba(79,195,247,0.12);}}
+        /* 2-column compact grid */
+        .sc-compact-grid{{display:grid;grid-template-columns:1fr 1fr;gap:6px;}}
+        /* row card */
+        .sc-row{{display:grid;grid-template-columns:3px 26px 1fr auto 18px;align-items:center;gap:0;background:rgba(10,18,32,0.9);border:1px solid rgba(79,195,247,0.1);border-radius:10px;cursor:pointer;transition:all 0.18s ease;overflow:hidden;min-height:50px;}}
+        .sc-row:hover{{background:rgba(16,28,48,0.95);border-color:rgba(79,195,247,0.3);box-shadow:0 4px 18px rgba(0,0,0,0.4);}}
+        .sc-row.sc-selected{{border-color:#00e5ff;background:rgba(0,229,255,0.06);box-shadow:0 0 0 1px #00e5ff44,0 6px 20px rgba(0,229,255,0.12);}}
+        .sc-row-bar{{width:3px;height:100%;border-radius:10px 0 0 10px;align-self:stretch;min-height:50px;}}
+        .sc-row-num{{font-family:'JetBrains Mono',monospace;font-size:10px;font-weight:700;color:rgba(176,190,197,0.45);text-align:center;padding:0 4px;}}
+        .sc-row-body{{padding:10px 10px 10px 6px;min-width:0;}}
+        .sc-row-name{{font-family:'Oxanium',sans-serif;font-size:14px;font-weight:700;color:#e0f7fa;line-height:1.2;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-bottom:3px;}}
+        .sc-row-strike{{font-family:'JetBrains Mono',monospace;font-size:10px;color:rgba(128,222,234,0.75);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}}
+        .sc-row-strike span{{color:#4fc3f7;}}
+        .sc-row-meta{{display:flex;flex-direction:column;align-items:flex-end;gap:4px;padding:10px 8px 10px 6px;flex-shrink:0;}}
+        .sc-row-tag{{font-size:10px;font-weight:700;letter-spacing:0.5px;padding:3px 8px;border-radius:8px;white-space:nowrap;}}
+        .sc-rb{{font-family:'JetBrains Mono',monospace;font-size:9px;font-weight:700;letter-spacing:0.5px;padding:2px 7px;border-radius:4px;white-space:nowrap;}}
+        .sc-rb-primary{{background:rgba(0,229,255,0.12);border:1px solid rgba(0,229,255,0.4);color:#00e5ff;}}
+        .sc-rb-secondary{{background:rgba(255,183,77,0.12);border:1px solid rgba(255,183,77,0.4);color:#ffb74d;}}
+        .sc-rb-advanced{{background:rgba(124,77,255,0.1);border:1px solid rgba(124,77,255,0.35);color:#b39dff;}}
+        .sc-row-rr{{font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:700;}}
+        .sc-row-chevron{{font-size:16px;color:rgba(79,195,247,0.3);padding-right:8px;transition:transform 0.2s ease;line-height:1;user-select:none;}}
+        .sc-row.sc-selected .sc-row-chevron{{transform:rotate(90deg);color:#00e5ff;}}
+        /* expand detail panel — spans both columns */
+        .sc-dp{{grid-column:1/-1;display:none;background:rgba(4,10,20,0.97);border:1px solid rgba(79,195,247,0.18);border-radius:12px;padding:14px 16px;position:relative;overflow:hidden;animation:scSlide 0.18s ease;}}
+        .sc-dp::before{{content:'';position:absolute;top:0;left:0;right:0;height:1px;background:linear-gradient(90deg,transparent,#4fc3f7,transparent);}}
+        .sc-dp.sc-dp-open{{display:block;}}
+        @keyframes scSlide{{from{{opacity:0;transform:translateY(-5px);}}to{{opacity:1;transform:translateY(0);}}}}
+        .sc-dp-grid{{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-bottom:10px;}}
+        .sc-dp-box{{background:rgba(255,255,255,0.025);border:1px solid rgba(79,195,247,0.1);border-radius:8px;padding:9px 11px;}}
+        .sc-dp-lbl{{font-family:'JetBrains Mono',monospace;font-size:7.5px;letter-spacing:2px;color:rgba(128,222,234,0.35);text-transform:uppercase;margin-bottom:3px;}}
+        .sc-dp-val{{font-family:'Oxanium',sans-serif;font-size:15px;font-weight:700;line-height:1.2;}}
+        .sc-dp-sub{{font-family:'JetBrains Mono',monospace;font-size:9px;color:rgba(176,190,197,0.35);margin-top:2px;}}
+        .sc-dp-rr-track{{height:3px;background:rgba(0,0,0,0.4);border-radius:2px;overflow:hidden;margin-top:5px;}}
+        .sc-dp-rr-fill{{height:100%;border-radius:2px;}}
+        .sc-dp-strike-box{{background:rgba(0,0,0,0.3);border-left:3px solid rgba(79,195,247,0.4);border-radius:0 7px 7px 0;padding:7px 11px;font-family:'JetBrains Mono',monospace;font-size:10px;color:rgba(176,190,197,0.75);line-height:1.65;margin-bottom:10px;word-break:break-word;}}
+        .sc-dp-strike-lbl{{color:#80deea;font-weight:700;}}
+        .sc-dp-actions{{display:flex;gap:8px;justify-content:flex-end;}}
+        .sc-dp-btn{{font-family:'Oxanium',sans-serif;font-size:10px;font-weight:700;letter-spacing:1px;padding:6px 14px;border-radius:6px;cursor:pointer;border:none;transition:all 0.15s ease;}}
+        .sc-dp-btn-load{{background:linear-gradient(135deg,#00bcd4,#006064);color:#fff;}}
+        .sc-dp-btn-load:hover{{filter:brightness(1.2);}}
+        .sc-dp-btn-close{{background:transparent;border:1px solid rgba(79,195,247,0.2);color:rgba(176,190,197,0.5);}}
+        .sc-dp-btn-close:hover{{border-color:rgba(79,195,247,0.4);color:#4fc3f7;}}
+        /* tag colours (reused) */
+        .strat-tag-bull{{background:rgba(0,230,118,0.1);border:1px solid rgba(0,230,118,0.25);color:#00e676;}}
+        .strat-tag-bear{{background:rgba(255,82,82,0.1);border:1px solid rgba(255,82,82,0.25);color:#ff5252;}}
+        .strat-tag-neu{{background:rgba(255,183,77,0.1);border:1px solid rgba(255,183,77,0.25);color:#ffb74d;}}
+        .strat-tag-vol{{background:rgba(124,77,255,0.1);border:1px solid rgba(124,77,255,0.25);color:#b388ff;}}
+        .strat-tag-misc{{background:rgba(79,195,247,0.1);border:1px solid rgba(79,195,247,0.25);color:#4fc3f7;}}
+        /* trade plan badges */
+        .tp-rank-badge{{display:inline-block;font-family:'JetBrains Mono',monospace;font-size:8px;font-weight:700;letter-spacing:1.5px;padding:2px 8px;border-radius:20px;margin-left:8px;vertical-align:middle;}}
+        .tp-rank-primary{{background:rgba(0,230,118,0.15);border:1px solid rgba(0,230,118,0.4);color:#00e676;}}
+        .tp-rank-secondary{{background:rgba(255,183,77,0.15);border:1px solid rgba(255,183,77,0.4);color:#ffb74d;}}
+        .tp-rank-advanced{{background:rgba(179,136,255,0.15);border:1px solid rgba(179,136,255,0.4);color:#b388ff;}}
+        @keyframes tpFlash{{0%{{box-shadow:0 0 0 0 rgba(0,229,255,0.6);}}50%{{box-shadow:0 0 0 8px rgba(0,229,255,0);}}100%{{box-shadow:none;}}}}
+        .tp-banner-flash{{animation:tpFlash 0.6s ease-out;}}
+
+        /* ── TRADE PLAN ─────────────────────────────────────────────── */
+        .tp-wrap{{display:flex;flex-direction:column;gap:16px;}}
+        .tp-banner{{display:flex;justify-content:space-between;align-items:flex-start;background:rgba(79,195,247,0.06);border:1px solid rgba(79,195,247,0.2);border-radius:14px;padding:18px 22px;gap:16px;}}
+        .tp-banner-left{{flex:1;}}
+        .tp-banner-label{{font-family:'JetBrains Mono',monospace;font-size:9px;color:rgba(128,222,234,0.4);letter-spacing:2px;margin-bottom:6px;}}
+        .tp-banner-strat{{font-family:'Oxanium',sans-serif;font-size:clamp(15px,2vw,20px);font-weight:800;color:#80deea;margin-bottom:6px;}}
+        .tp-banner-strike{{font-family:'JetBrains Mono',monospace;font-size:11px;color:rgba(176,190,197,0.7);}}
+        .tp-banner-right{{text-align:right;}}
+        .tp-banner-exp{{font-family:'Oxanium',sans-serif;font-size:16px;font-weight:700;color:#ffb74d;margin-top:6px;}}
+        .tp-exits{{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;}}
+        .tp-exit{{border-radius:14px;padding:18px;display:flex;flex-direction:column;gap:6px;position:relative;overflow:hidden;}}
+        .tp-exit::before{{content:'';position:absolute;top:0;left:0;right:0;height:3px;border-radius:14px 14px 0 0;}}
+        .tp-exit-profit{{background:rgba(0,230,118,0.05);border:1px solid rgba(0,230,118,0.2);}}
+        .tp-exit-profit::before{{background:linear-gradient(90deg,#00e676,#00bfa5);}}
+        .tp-exit-loss{{background:rgba(255,82,82,0.05);border:1px solid rgba(255,82,82,0.2);}}
+        .tp-exit-loss::before{{background:linear-gradient(90deg,#ff5252,#b71c1c);}}
+        .tp-exit-time{{background:rgba(255,183,77,0.05);border:1px solid rgba(255,183,77,0.2);}}
+        .tp-exit-time::before{{background:linear-gradient(90deg,#ffb74d,#f57c00);}}
+        .tp-exit-icon{{font-size:20px;}}
+        .tp-exit-title{{font-family:'JetBrains Mono',monospace;font-size:9px;letter-spacing:2px;color:rgba(176,190,197,0.4);margin-bottom:2px;}}
+        .tp-exit-val{{font-family:'Oxanium',sans-serif;font-size:clamp(14px,1.8vw,18px);font-weight:800;color:#e0f7fa;}}
+        .tp-exit-val2{{font-family:'Oxanium',sans-serif;font-size:13px;font-weight:700;color:rgba(224,247,250,0.6);margin-top:4px;}}
+        .tp-exit-sub{{font-family:'JetBrains Mono',monospace;font-size:9px;color:rgba(176,190,197,0.4);}}
+        .tp-exit-rule{{margin-top:8px;font-size:10px;color:rgba(176,190,197,0.55);line-height:1.5;border-top:1px solid rgba(255,255,255,0.05);padding-top:8px;}}
+        .filter-btn{{padding:6px 14px;border-radius:20px;font-size:10px;font-weight:700;letter-spacing:1px;cursor:pointer;border:1px solid rgba(79,195,247,0.2);background:transparent;color:rgba(176,190,197,0.5);transition:all 0.2s ease;font-family:'Oxanium',sans-serif;}}
+        .filter-btn.active,.filter-btn:hover{{background:rgba(79,195,247,0.1);border-color:rgba(79,195,247,0.4);color:#4fc3f7;}}
+
+        .oi-controls{{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;margin-bottom:20px;}}
+        .oi-interval-btns{{display:flex;gap:0;border:1px solid rgba(79,195,247,0.25);border-radius:10px;overflow:hidden;}}
+        .oi-int-btn{{padding:9px 24px;font-family:'Oxanium',sans-serif;font-size:12px;font-weight:700;letter-spacing:2px;color:rgba(176,190,197,0.5);background:transparent;border:none;cursor:pointer;transition:all 0.2s ease;border-right:1px solid rgba(79,195,247,0.15);}}
+        .oi-int-btn:last-child{{border-right:none;}}
+        .oi-int-btn:hover{{background:rgba(79,195,247,0.12);color:#4fc3f7;}}
+        .oi-int-btn.active{{background:rgba(79,195,247,0.22);color:#00e5ff;box-shadow:inset 0 0 12px rgba(79,195,247,0.1);}}
+        .oi-live-badge{{display:flex;align-items:center;gap:7px;font-family:'JetBrains Mono',monospace;font-size:10px;letter-spacing:2px;color:rgba(0,230,118,0.7);background:rgba(0,230,118,0.08);border:1px solid rgba(0,230,118,0.25);padding:6px 14px;border-radius:8px;}}
+        .oi-live-dot{{width:7px;height:7px;border-radius:50%;background:#00e676;box-shadow:0 0 8px #00e676;animation:sb-pulse 1.5s ease-in-out infinite;}}
+        .oi-summary-strip{{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:20px;}}
+        .oi-sum-card{{background:rgba(255,255,255,0.03);border:1px solid rgba(79,195,247,0.14);border-radius:12px;padding:14px 16px;text-align:center;}}
+        .oi-sum-label{{font-size:9px;letter-spacing:2px;color:rgba(128,222,234,0.9);text-transform:uppercase;font-weight:700;margin-bottom:6px;}}
+        .oi-sum-val{{font-family:'Oxanium',sans-serif;font-size:clamp(16px,2.5vw,22px);font-weight:700;line-height:1;}}
+        .oi-chart-wrap{{background:rgba(6,13,20,0.7);border:1px solid rgba(79,195,247,0.14);border-radius:14px;padding:16px;margin-bottom:20px;}}
+        .oi-chart-label{{font-size:9px;letter-spacing:2px;color:rgba(128,222,234,0.9);text-transform:uppercase;font-weight:700;}}
+        /* ══ OPTION FLOW TABLE — POLISHED UI ════════════════════════════════ */
+        .oi-table-wrap{{background:rgba(6,13,20,0.85);border:1px solid rgba(79,195,247,0.18);border-radius:16px;overflow-x:auto;overflow-y:hidden;-webkit-overflow-scrolling:touch;box-shadow:0 4px 40px rgba(0,0,0,0.5);overflow-anchor:none;}}
+        .oi-table{{width:100%;min-width:1260px;border-collapse:collapse;font-family:'JetBrains Mono',monospace;overflow-anchor:none;}}
+        .oi-table-scroll-hint{{display:none;align-items:center;gap:6px;font-family:'JetBrains Mono',monospace;font-size:9px;letter-spacing:1.5px;color:rgba(79,195,247,0.4);padding:6px 14px 0;text-transform:uppercase;}}
+
+        /* ── Header ── */
+        .oi-table thead tr{{background:rgba(18,26,33,0.95);border-bottom:2px solid rgba(36,53,68,0.9);}}
+        .oi-table thead th{{padding:14px 16px;font-size:13px;letter-spacing:1.5px;color:rgba(178,235,242,1);text-transform:uppercase;font-weight:700;text-align:right;white-space:nowrap;}}
+        .oi-table thead th:first-child{{text-align:left;}}
+        .oi-table thead th.oi-th-divider{{border-left:1px solid rgba(30,45,56,1);}}
+
+        /* ── FOCUS / DETAIL toggle ── */
+        .oi-view-btn{{padding:5px 16px;font-family:'JetBrains Mono',monospace;font-size:10px;font-weight:700;letter-spacing:1.5px;color:rgba(128,222,234,0.4);background:transparent;border:1px solid rgba(79,195,247,0.2);border-radius:20px;cursor:pointer;transition:all 0.2s ease;}}
+        .oi-view-btn:hover{{color:#4fc3f7;border-color:rgba(79,195,247,0.5);background:rgba(79,195,247,0.08);}}
+        .oi-view-active{{color:#00e5ff!important;border-color:rgba(79,195,247,0.6)!important;background:rgba(79,195,247,0.14)!important;box-shadow:0 0 10px rgba(79,195,247,0.12);}}
+        /* FOCUS mode: hide col-detail columns (default) */
+        .col-detail{{display:none;}}
+        /* DETAIL mode: show col-detail columns */
+        .oi-detail-mode .col-detail{{display:table-cell;}}
+
+        /* ── Body rows ── */
+        .oi-table tbody tr{{border-bottom:1px solid rgba(30,45,56,0.8);transition:background 0.15s ease;}}
+        .oi-table tbody tr:last-child{{border-bottom:none;}}
+        .oi-table tbody tr:hover{{background:rgba(18,26,33,0.9);}}
+        .oi-table tbody tr.oi-live-row{{background:linear-gradient(90deg,rgba(0,212,255,0.04) 0%,transparent 60%);border-bottom:1px solid rgba(0,212,255,0.18);}}
+        .oi-table tbody td{{padding:14px 16px;font-size:15px;text-align:right;color:#dce8f0;white-space:nowrap;}}
+        .oi-table tbody td:first-child{{text-align:left;}}
+        .oi-table tbody td.oi-th-divider{{border-left:1px solid rgba(30,45,56,0.8);}}
+
+        /* ── Time cell ── */
+        .oi-time-cell{{display:flex;align-items:center;gap:10px;}}
+        .oi-time-val{{font-size:16px;font-weight:700;color:#fff;letter-spacing:0.5px;}}
+        .oi-live-ind{{display:inline-flex;align-items:center;gap:5px;background:rgba(0,230,118,0.1);border:1px solid rgba(0,230,118,0.5);border-radius:20px;padding:2px 8px;font-size:9px;color:#00e676;letter-spacing:1px;font-weight:700;}}
+        .oi-live-ind::before{{content:'';display:inline-block;width:6px;height:6px;border-radius:50%;background:#00e676;box-shadow:0 0 6px #00e676;animation:sb-pulse 1.2s ease-in-out infinite;}}
+        .oi-elapsed{{display:inline-flex;align-items:center;gap:6px;background:rgba(0,230,118,0.1);border:1px solid rgba(0,230,118,0.45);border-radius:20px;padding:3px 12px;font-size:13px;color:#00e676;letter-spacing:0.5px;font-weight:700;font-family:'JetBrains Mono',monospace;min-width:68px;}}
+        .oi-elapsed::before{{content:'';display:inline-block;width:7px;height:7px;border-radius:50%;background:#00e676;box-shadow:0 0 8px #00e676;animation:sb-pulse 1.2s ease-in-out infinite;}}
+        .nlf-elapsed{{display:inline-flex;align-items:center;gap:4px;background:rgba(0,230,118,0.1);border:1px solid rgba(0,230,118,0.4);border-radius:12px;padding:2px 8px;font-size:11px;color:#00e676;letter-spacing:0.3px;font-weight:700;font-family:'JetBrains Mono',monospace;min-width:54px;}}
+        .nlf-elapsed::before{{content:'';display:inline-block;width:6px;height:6px;border-radius:50%;background:#00e676;box-shadow:0 0 5px #00e676;animation:sb-pulse 1.2s ease-in-out infinite;}}
+
+        /* ── OI value cells ── */
+        .oi-call-val{{color:#00e676;font-weight:500;}}
+        .oi-put-val{{color:#c8dde8;}}
+        .oi-diff-neg{{color:#ff4757;font-weight:700;}}
+        .oi-diff-pos{{color:#00e676;font-weight:700;}}
+
+        /* ── PCR with mini bar ── */
+        .oi-pcr-val{{font-weight:700;font-size:14px;}}
+        .oi-pcr-val.oi-pcr-bull,.oi-pcr-bull{{color:#00e676 !important;}}
+        .oi-pcr-val.oi-pcr-bear,.oi-pcr-bear{{color:#ff4757 !important;}}
+        .oi-pcr-val.oi-pcr-neu,.oi-pcr-neu{{color:#ffd32a !important;}}
+        .oi-pcr-cell{{display:inline-flex;align-items:center;justify-content:flex-end;gap:6px;}}
+        .oi-pcr-bar-wrap{{width:32px;height:4px;background:rgba(36,53,68,0.9);border-radius:2px;overflow:hidden;display:inline-block;vertical-align:middle;}}
+        .oi-pcr-bar{{height:100%;border-radius:2px;}}
+        .oi-pcr-bull-bar{{background:rgba(0,230,118,0.85);}}
+        .oi-pcr-bear-bar{{background:rgba(255,71,87,0.85);}}
+        .oi-pcr-neu-bar{{background:rgba(255,211,42,0.75);}}
+
+        /* ── Signal badges — bigger, glowing ── */
+        .oi-signal-ssell{{display:inline-block;padding:6px 16px;border-radius:7px;font-size:12px;font-weight:800;letter-spacing:1.2px;background:#ff3a4a;color:#fff;box-shadow:0 0 14px rgba(255,58,74,0.55);}}
+        .oi-signal-sell{{display:inline-block;padding:6px 16px;border-radius:7px;font-size:12px;font-weight:800;letter-spacing:1.2px;background:#ff3a4a;color:#fff;box-shadow:0 0 10px rgba(255,58,74,0.35);}}
+        .oi-signal-sbuy{{display:inline-block;padding:6px 16px;border-radius:7px;font-size:12px;font-weight:800;letter-spacing:1.2px;background:#00c853;color:#000;box-shadow:0 0 14px rgba(0,200,83,0.55);}}
+        .oi-signal-buy{{display:inline-block;padding:6px 16px;border-radius:7px;font-size:12px;font-weight:800;letter-spacing:1.2px;background:#00c853;color:#000;box-shadow:0 0 10px rgba(0,200,83,0.35);}}
+        .oi-signal-neutral{{display:inline-block;padding:6px 16px;border-radius:7px;font-size:12px;font-weight:800;letter-spacing:1.2px;background:rgba(245,158,11,0.15);color:#fde68a;border:1px solid rgba(245,158,11,0.3);}}
+
+        /* ── Spot price ── */
+        .oi-vwap-cell{{color:#93c5fd;font-weight:600;}}
+        .oi-fut-cell{{color:#c4b5fd;}}
+        .oi-spot-cell{{color:#fff;font-weight:700;font-size:15px;}}
+
+        /* ── Spot Δ — pill style ── */
+        .oi-sdelta{{display:inline-flex;align-items:center;gap:4px;padding:4px 10px;border-radius:6px;font-size:13px;font-weight:700;font-family:'JetBrains Mono',monospace;white-space:nowrap;}}
+        .oi-sdelta-up{{background:rgba(0,230,118,0.12);color:#00e676;border:1px solid rgba(0,230,118,0.3);}}
+        .oi-sdelta-dn{{background:rgba(255,71,87,0.12);color:#ff4757;border:1px solid rgba(255,71,87,0.3);}}
+        .oi-sdelta-fl{{background:rgba(100,116,139,0.1);color:#64748b;border:1px solid rgba(100,116,139,0.2);}}
+
+        /* ── BankNifty Move % — rounded pill ── */
+        .oi-nifty-move{{display:inline-flex;align-items:center;gap:4px;padding:5px 12px;border-radius:20px;font-size:13px;font-weight:700;font-family:'JetBrains Mono',monospace;white-space:nowrap;letter-spacing:0.3px;}}
+        .oi-nifty-up-strong{{background:rgba(0,230,118,0.18);color:#00e676;border:1px solid rgba(0,230,118,0.35);}}
+        .oi-nifty-up-mid{{background:rgba(0,200,83,0.12);color:#69f0ae;border:1px solid rgba(0,200,83,0.25);}}
+        .oi-nifty-up-weak{{background:rgba(105,240,174,0.07);color:#a7f3d0;border:1px solid rgba(105,240,174,0.18);}}
+        .oi-nifty-dn-strong{{background:rgba(255,71,87,0.18);color:#ff4757;border:1px solid rgba(255,71,87,0.35);}}
+        .oi-nifty-dn-mid{{background:rgba(255,71,87,0.12);color:#fca5a5;border:1px solid rgba(255,71,87,0.25);}}
+        .oi-nifty-dn-weak{{background:rgba(255,71,87,0.07);color:#fecaca;border:1px solid rgba(255,71,87,0.15);}}
+        .oi-nifty-flat{{background:rgba(120,144,156,0.1);color:#a8c0cc;border:1px solid rgba(120,144,156,0.2);}}
+
+        /* ── Signal Streak ── */
+        .oi-streak-int{{display:inline-flex;align-items:center;gap:8px;border-radius:0;padding:6px 12px;white-space:nowrap;}}
+        .oi-streak-int-num{{font-family:'Oxanium',sans-serif;font-size:18px;font-weight:800;line-height:1;}}
+        .oi-streak-int-lbl{{font-size:13px;font-weight:700;letter-spacing:0.5px;text-transform:uppercase;line-height:1;}}
+
+        /* ── Nearest Level badge ── */
+        .oi-nlevel-badge{{display:inline-flex;align-items:center;gap:6px;background:rgba(10,26,37,0.9);border:1px solid rgba(36,53,68,1);border-radius:7px;padding:5px 12px;font-size:13px;font-weight:700;letter-spacing:0.3px;white-space:nowrap;}}
+        .oi-nlevel-badge .oi-nlevel-label{{font-size:10px;font-weight:700;padding:1px 5px;border-radius:3px;letter-spacing:0.5px;}}
+        .oi-nlevel-res{{color:#00d4ff;}}
+        .oi-nlevel-res .oi-nlevel-label{{background:rgba(0,153,204,0.9);color:#000;}}
+        .oi-nlevel-sup{{color:#00d4ff;}}
+        .oi-nlevel-sup .oi-nlevel-label{{background:rgba(0,153,204,0.9);color:#000;}}
+
+        /* ── Distance ── */
+        .oi-dist-val{{display:inline-block;font-size:13px;font-weight:600;font-family:'JetBrains Mono',monospace;}}
+        .oi-dist-res{{color:#ff4757;}}
+        .oi-dist-sup{{color:#ff4757;}}
+
+        /* ── Misc ── */
+        .oi-vsig-sell{{display:inline-block;padding:3px 9px;border-radius:5px;font-size:11px;font-weight:700;background:rgba(239,68,68,0.12);color:#fca5a5;border:1px solid rgba(239,68,68,0.25);}}
+        .oi-vsig-buy{{display:inline-block;padding:3px 9px;border-radius:5px;font-size:11px;font-weight:700;background:rgba(16,185,129,0.12);color:#6ee7b7;border:1px solid rgba(16,185,129,0.25);}}
+        .oi-empty-state{{text-align:center;padding:60px 20px;color:rgba(176,190,197,0.3);font-family:'JetBrains Mono',monospace;font-size:13px;}}
+
+        .disclaimer{{background:rgba(255,183,77,0.08);border:1px solid rgba(255,183,77,0.25);border-left:3px solid #ffb74d;border-radius:8px;padding:9px 16px;display:flex;align-items:center;gap:10px;flex-wrap:wrap;}}
+        .disc-icon{{font-size:13px;flex-shrink:0;line-height:1;}}
+        .disc-label{{font-family:'JetBrains Mono',monospace;font-size:10px;font-weight:700;letter-spacing:1.5px;color:#ffb74d;text-transform:uppercase;flex-shrink:0;}}
+        .disc-sep{{color:rgba(255,183,77,0.3);font-size:11px;flex-shrink:0;}}
+        .disc-text{{font-size:12px;color:rgba(255,183,77,0.75);font-family:'Rajdhani',sans-serif;font-weight:500;white-space:nowrap;}}
+        .disc-text strong{{color:#ffb74d;font-weight:700;}}
+        @media(max-width:700px){{.disc-text{{white-space:normal;}}}}
+        .footer{{text-align:center;padding:24px;color:#8faabe;font-size:clamp(10px,1.3vw,12px);background:rgba(10,20,28,0.4);}}
+
+        /* ══ SIGNAL SUMMARY BAR ═══════════════════════════════════════════ */
+        .ssb-section{{padding:0 clamp(12px,2.5vw,26px) 16px;border-bottom:none!important;}}
+        .ssb-wrap{{background:rgba(6,13,20,0.9);border:1px solid rgba(79,195,247,0.18);border-radius:14px;overflow:hidden;}}
+        .ssb-header{{display:flex;align-items:center;justify-content:space-between;padding:9px 16px;background:rgba(0,0,0,0.35);border-bottom:1px solid rgba(79,195,247,0.1);flex-wrap:wrap;gap:8px;}}
+        .ssb-title{{font-family:'Oxanium',sans-serif;font-size:12px;letter-spacing:2.5px;color:#4fc3f7;text-transform:uppercase;font-weight:700;}}
+        .ssb-ts{{font-size:12px;color:#80deea;letter-spacing:1px;font-family:'JetBrains Mono',monospace;font-weight:600;}}
+        .ssb-grid{{display:grid;grid-template-columns:repeat(5,1fr) 1.5fr;}}
+        .ssb-cell{{padding:14px 10px;border-right:1px solid rgba(79,195,247,0.08);display:flex;flex-direction:column;align-items:center;gap:6px;text-align:center;}}
+        .ssb-cell:last-child{{border-right:none;}}
+        .ssb-cell-lbl{{font-family:'JetBrains Mono',monospace;font-size:11px;letter-spacing:2px;color:#e0f7fa;text-transform:uppercase;font-weight:700;}}
+        .ssb-badge{{display:inline-flex;align-items:center;gap:4px;padding:5px 12px;border-radius:7px;font-family:'Oxanium',sans-serif;font-size:13px;font-weight:800;letter-spacing:0.5px;white-space:nowrap;}}
+        .ssb-sub{{font-family:'JetBrains Mono',monospace;font-size:11px;color:rgba(200,221,232,0.85);letter-spacing:0.3px;max-width:110px;line-height:1.5;text-align:center;}}
+        .ssb-verdict{{display:flex;flex-direction:column;align-items:center;gap:7px;padding:14px 12px;}}
+        .ssb-verdict-lbl{{font-family:'JetBrains Mono',monospace;font-size:10px;letter-spacing:2.5px;text-transform:uppercase;font-weight:700;color:#e0f7fa;}}
+        .ssb-verdict-val{{font-family:'Oxanium',sans-serif;font-size:clamp(13px,1.8vw,17px);font-weight:800;letter-spacing:1px;text-transform:uppercase;text-align:center;line-height:1.2;}}
+        .ssb-score-dots{{display:flex;gap:5px;}}
+        .ssb-dot{{width:10px;height:10px;border-radius:50%;flex-shrink:0;}}
+        .ssb-bar-wrap{{width:100%;display:flex;flex-direction:column;gap:4px;}}
+        .ssb-bar-track{{height:5px;background:rgba(0,0,0,0.5);border-radius:3px;overflow:hidden;width:100%;display:flex;}}
+        .ssb-bar-lbl{{display:flex;justify-content:space-between;font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:700;letter-spacing:0.5px;}}
+        @media(max-width:900px){{
+            .ssb-grid{{grid-template-columns:repeat(3,1fr) !important;}}
+            .ssb-cell:nth-child(3){{border-right:none;}}
+            .ssb-cell:nth-child(4),.ssb-cell:nth-child(5){{border-top:1px solid rgba(79,195,247,0.08);}}
+            .ssb-verdict{{grid-column:1/-1;border-left:none !important;border-top:1px solid rgba(79,195,247,0.1);flex-direction:row;flex-wrap:wrap;justify-content:center;gap:10px;padding:12px;}}
+        }}
+        @media(max-width:600px){{
+            .ssb-grid{{grid-template-columns:repeat(2,1fr) !important;}}
+            .ssb-cell:nth-child(2n){{border-right:none;}}
+            .ssb-cell{{border-top:1px solid rgba(79,195,247,0.07);}}
+            .ssb-cell:nth-child(1),.ssb-cell:nth-child(2){{border-top:none;}}
+            .ssb-verdict-val{{font-size:13px;}}
+        }}
+
+        {heatmap_css}
+        {pretrade_css}
+
+
+        /* ══ OI CHART ENHANCEMENTS ════════════════════════════ */
+        .oi-stat-strip{{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:14px;}}
+        .oi-stat-box{{background:rgba(255,255,255,0.025);border:1px solid rgba(79,195,247,0.1);border-radius:10px;padding:10px 14px;text-align:center;}}
+        .oi-stat-label{{font-size:8px;letter-spacing:2px;color:rgba(128,222,234,0.9);text-transform:uppercase;font-weight:700;margin-bottom:4px;font-family:'JetBrains Mono',monospace;}}
+        .oi-stat-val{{font-family:'Oxanium',monospace;font-size:clamp(14px,2vw,18px);font-weight:700;line-height:1.2;color:#e0f7fa;}}
+        .oi-stat-pos{{color:#34d399!important;}}
+        .oi-stat-neg{{color:#f87171!important;}}
+        .oi-stat-sub{{font-family:'JetBrains Mono',monospace;font-size:9px;color:rgba(176,190,197,0.3);margin-top:3px;}}
+        .oi-y-label{{font-family:'JetBrains Mono',monospace;font-size:9px;text-align:right;padding-right:6px;line-height:1;color:rgba(128,222,234,0.25);}}
+        .oi-x-label{{font-family:'JetBrains Mono',monospace;font-size:9px;color:rgba(128,222,234,0.2);}}
+        @media(max-width:600px){{.oi-stat-strip{{grid-template-columns:repeat(2,1fr);}}}}
+        @media(max-width:380px){{.oi-stat-strip{{grid-template-columns:1fr;}}}}
+
+        /* ══ NIFTY LIVE FEED — Side-by-Side Panel ════════════════════ */
+        .nlf-side-by-side{{display:flex;gap:14px;margin-bottom:20px;align-items:stretch;}}
+        .nlf-left{{flex:1;min-width:0;display:flex;flex-direction:column;}}
+        .nlf-left .oi-chart-wrap{{flex:1;margin-bottom:0;}}
+        .nlf-right{{flex:1;min-width:0;display:flex;}}
+        .nlf-panel{{flex:1;background:rgba(6,13,20,0.85);border:1px solid rgba(79,195,247,0.18);border-radius:14px;padding:16px;display:flex;flex-direction:column;font-family:'JetBrains Mono',monospace;}}
+        .nlf-header{{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:12px;gap:8px;flex-wrap:wrap;}}
+        .nlf-title-row{{display:flex;align-items:center;gap:7px;}}
+        .nlf-live-dot{{width:8px;height:8px;border-radius:50%;background:#00e676;box-shadow:0 0 8px #00e676;animation:sb-pulse 1.5s ease-in-out infinite;flex-shrink:0;}}
+        .nlf-title{{font-family:'Oxanium',sans-serif;font-size:18px;font-weight:700;color:#e0f7fa;letter-spacing:1px;}}
+        .nlf-meta{{text-align:right;font-size:14px;color:rgba(200,221,232,0.7);line-height:1.6;}}
+        .nlf-meta b{{color:#fff;font-weight:700;}}
+        .nlf-meta-spot{{display:block;font-size:15px;}}
+        .nlf-meta-item{{font-size:14px;}}
+        .nlf-meta-sep{{color:rgba(128,222,234,0.3);margin:0 2px;}}
+        .nlf-badges{{display:flex;flex-wrap:wrap;gap:5px;margin-bottom:12px;}}
+        .nlf-badge{{display:inline-flex;align-items:center;gap:4px;padding:5px 12px;border-radius:5px;font-size:13px;font-weight:700;letter-spacing:0.5px;white-space:nowrap;}}
+        .nlf-badge-buy{{background:rgba(0,200,83,0.12);color:#00c853;border:1px solid rgba(0,200,83,0.4);}}
+        .nlf-badge-sell{{background:rgba(255,58,74,0.12);color:#ff3a4a;border:1px solid rgba(255,58,74,0.4);}}
+        .nlf-badge-warn{{background:rgba(255,183,77,0.1);color:#ffb74d;border:1px solid rgba(255,183,77,0.35);}}
+        .nlf-badge-info{{background:rgba(200,221,232,0.06);color:#c8dde8;border:1px solid rgba(200,221,232,0.2);}}
+        .nlf-badge-danger{{background:rgba(255,58,74,0.1);color:#ff6b6b;border:1px solid rgba(255,58,74,0.3);}}
+        .nlf-thead{{display:grid;grid-template-columns:60px 96px 62px 66px 76px 72px 44px 48px;gap:0;font-size:12px;letter-spacing:1.2px;color:rgba(128,222,234,0.7);text-transform:uppercase;font-weight:700;padding:6px 0;border-bottom:1px solid rgba(79,195,247,0.12);}}
+        .nlf-th-mom{{text-align:center;}}
+        .nlf-tbody{{flex:1;display:flex;flex-direction:column;}}
+        .nlf-row{{display:grid;grid-template-columns:60px 96px 62px 66px 76px 72px 44px 48px;gap:0;padding:8px 0;align-items:center;font-size:14px;color:#c8dde8;border-bottom:1px solid rgba(255,255,255,0.03);}}
+        .nlf-row-live{{background:rgba(0,200,83,0.04);border-left:2px solid rgba(0,230,118,0.5);padding-left:4px;}}
+        .nlf-row-time{{color:rgba(176,190,197,0.6);font-size:14px;display:inline-flex;align-items:center;gap:4px;}}
+        .nlf-row-spot{{font-weight:700;color:#fff;font-size:14px;}}
+        .nlf-row-delta{{font-weight:700;font-size:13px;text-align:right;}}
+        .nlf-row-nifty{{font-size:13px;font-weight:700;text-align:right;}}
+        .nlf-row-vwap{{text-align:center;font-size:13px;font-weight:700;}}
+        .nlf-row-netoi{{text-align:right;font-size:13px;font-weight:700;}}
+        .nlf-row-stk{{text-align:right;color:#ffd32a;font-weight:700;font-size:13px;}}
+        .nlf-row-rsi{{text-align:right;font-weight:700;font-size:13px;}}
+        .nlf-footer{{display:flex;justify-content:space-between;padding-top:8px;margin-top:auto;border-top:1px solid rgba(79,195,247,0.08);font-size:13px;}}
+        .nlf-footer-left{{color:rgba(176,190,197,0.45);}}
+        .nlf-footer-right{{font-weight:700;}}
+        @media(max-width:1100px){{
+            .nlf-side-by-side{{flex-direction:column;}}
+            .nlf-right{{width:100%;}}
+        }}
+        @media(max-width:600px){{
+            .nlf-thead,.nlf-row{{grid-template-columns:44px minmax(0,1fr) 48px 52px 60px 58px 34px 38px;}}
+            .nlf-row-spot{{font-size:12px;}}
+            .nlf-panel{{padding:10px;}}
+        }}
+        @media(max-width:1024px){{
+            .grid-5{{grid-template-columns:repeat(3,minmax(0,1fr));}}
+            .grid-4{{grid-template-columns:repeat(2,minmax(0,1fr));}}
+            .pf-grid{{grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;}}
+            .nc-cards-grid{{grid-template-columns:repeat(3,minmax(0,1fr));}}
+            .nc-meter-track{{width:140px;}}
+            .oi-summary-strip{{grid-template-columns:repeat(2,minmax(0,1fr));}}
+        }}
+
+        /* ══ SIDEBAR NAV ══════════════════════════════════════════════ */
+        .page-body{{display:flex;align-items:flex-start;position:relative;min-height:100vh;}}
+        .page-content{{flex:1;min-width:0;width:100%;}}
+        .nav-sidebar{{
+            width:190px;flex-shrink:0;
+            background:#07111a;
+            border-right:1px solid rgba(79,195,247,0.12);
+            position:sticky;top:var(--header-h,0px);
+            height:calc(100vh - var(--header-h,0px));
+            max-height:calc(100vh - var(--header-h,0px));
+            align-self:flex-start;
+            display:flex;flex-direction:column;
+            transition:width 0.22s ease;
+            z-index:100;overflow:hidden;
+        }}
+        .nav-sidebar.collapsed{{width:46px;}}
+        .nsb-header{{display:flex;align-items:center;justify-content:space-between;padding:12px 10px;border-bottom:1px solid rgba(79,195,247,0.1);flex-shrink:0;}}
+        .nsb-logo{{font-family:'Oxanium',sans-serif;font-size:11px;letter-spacing:3px;color:#4fc3f7;font-weight:700;white-space:nowrap;overflow:hidden;transition:opacity 0.2s;}}
+        .nav-sidebar.collapsed .nsb-logo{{opacity:0;pointer-events:none;}}
+        .nsb-toggle{{width:26px;height:26px;border-radius:6px;border:1px solid rgba(79,195,247,0.2);background:transparent;cursor:pointer;display:flex;align-items:center;justify-content:center;flex-shrink:0;}}
+        .nsb-toggle:hover{{background:rgba(79,195,247,0.1);}}
+        .nsb-toggle svg{{transition:transform 0.22s;}}
+        .nav-sidebar.collapsed .nsb-toggle svg{{transform:rotate(180deg);}}
+        .nsb-nav{{flex:1;overflow-y:auto;overflow-x:hidden;padding:8px 0;scrollbar-width:thin;scrollbar-color:rgba(79,195,247,0.15) transparent;}}
+        .nsb-nav::-webkit-scrollbar{{width:3px;}}
+        .nsb-nav::-webkit-scrollbar-thumb{{background:rgba(79,195,247,0.2);border-radius:2px;}}
+        .nsb-group{{font-size:9px;letter-spacing:2px;color:rgba(79,195,247,0.65);padding:10px 12px 4px;text-transform:uppercase;white-space:nowrap;overflow:hidden;transition:opacity 0.2s;font-weight:700;}}
+        .nav-sidebar.collapsed .nsb-group{{opacity:0;}}
+        .nsb-item{{display:flex;align-items:center;gap:9px;padding:8px 12px;cursor:pointer;border-left:2px solid transparent;transition:all 0.15s ease;position:relative;}}
+        .nsb-item:hover{{background:rgba(79,195,247,0.06);border-left-color:rgba(79,195,247,0.3);}}
+        .nsb-item.active{{background:rgba(79,195,247,0.1);border-left-color:#4fc3f7;}}
+        .nsb-icon{{width:18px;height:18px;flex-shrink:0;display:flex;align-items:center;justify-content:center;color:rgba(128,222,234,0.45);}}
+        .nsb-item.active .nsb-icon{{color:#4fc3f7;}}
+        .nsb-icon svg{{width:15px;height:15px;}}
+        .nsb-label{{font-family:'JetBrains Mono',monospace;font-size:10.5px;color:rgba(176,190,197,0.55);white-space:nowrap;overflow:hidden;transition:opacity 0.15s;letter-spacing:0.3px;}}
+        .nsb-item.active .nsb-label{{color:#e0f7fa;}}
+        .nav-sidebar.collapsed .nsb-label{{opacity:0;width:0;pointer-events:none;}}
+        .nav-sidebar.collapsed .nsb-item{{padding:8px 14px;}}
+        .nsb-tip{{display:none;position:absolute;left:48px;top:50%;transform:translateY(-50%);background:#0d1e2a;border:1px solid rgba(79,195,247,0.25);border-radius:6px;padding:4px 11px;font-family:'JetBrains Mono',monospace;font-size:10px;color:#80deea;white-space:nowrap;z-index:999;pointer-events:none;}}
+        .nav-sidebar.collapsed .nsb-item:hover .nsb-tip{{display:block;}}
+
+        /* ── Mobile nav bar + drawer ───────────────────────── */
+        .nsb-mob-bar{{
+            display:none;align-items:center;gap:10px;
+            padding:10px 14px;
+            background:#07111a;
+            border-bottom:1px solid rgba(79,195,247,0.18);
+            position:sticky;top:0;z-index:90;
+            width:100%;
+        }}
+        .nsb-mob-btn{{
+            width:36px;height:36px;border-radius:8px;
+            border:1px solid rgba(79,195,247,0.3);
+            background:rgba(79,195,247,0.06);
+            cursor:pointer;display:flex;align-items:center;justify-content:center;
+            flex-shrink:0;
+        }}
+        .nsb-mob-btn:active{{background:rgba(79,195,247,0.15);}}
+        .nsb-mob-title{{
+            font-family:'JetBrains Mono',monospace;
+            font-size:12px;letter-spacing:1.5px;
+            color:rgba(79,195,247,0.8);
+            text-transform:uppercase;
+            flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+        }}
+        .nsb-drawer{{
+            display:none;position:fixed;
+            top:0;left:0;width:100%;height:100%;
+            background:rgba(4,10,16,0.98);
+            z-index:200;flex-direction:column;
+        }}
+        .nsb-drawer.open{{display:flex;}}
+        .nsb-drawer-head{{
+            display:flex;align-items:center;justify-content:space-between;
+            padding:16px 18px;
+            border-bottom:1px solid rgba(79,195,247,0.15);
+            flex-shrink:0;
+        }}
+        .nsb-drawer-title{{
+            font-family:'JetBrains Mono',monospace;font-size:10px;
+            letter-spacing:3px;color:rgba(79,195,247,0.5);text-transform:uppercase;
+        }}
+        .nsb-drawer-close{{
+            width:36px;height:36px;border-radius:8px;
+            border:1px solid rgba(255,82,82,0.35);
+            background:rgba(255,82,82,0.06);
+            cursor:pointer;color:rgba(255,82,82,0.8);
+            font-size:16px;display:flex;align-items:center;justify-content:center;
+        }}
+        .nsb-drawer-nav{{flex:1;overflow-y:auto;padding:6px 0;}}
+        .nsb-mob-item{{
+            padding:15px 20px;
+            font-family:'JetBrains Mono',monospace;font-size:13px;
+            color:rgba(176,190,197,0.65);
+            cursor:pointer;border-left:3px solid transparent;
+            letter-spacing:0.5px;
+            transition:all 0.15s ease;
+        }}
+        .nsb-mob-item:active,
+        .nsb-mob-item.active{{
+            background:rgba(79,195,247,0.1);
+            border-left-color:#4fc3f7;color:#e0f7fa;
+        }}
+
+        /* ══ MOBILE RESPONSIVE OVERRIDES ════════════════════════════ */
+        @media(max-width:768px){{
+            /* Hide desktop sidebar, show mobile bar */
+            .nav-sidebar{{display:none;}}
+            .nsb-mob-bar{{display:flex;}}
+            .page-body{{flex-direction:column;}}
+            .page-content{{width:100%;min-width:0;}}
+
+            /* Header — Option B mobile */
+            .hb-banner{{padding:10px 12px;gap:8px;}}
+            .hb-chips{{display:none;}}
+            .hb-title-main{{font-size:13px;}}
+            .hb-status{{padding:5px 12px;gap:4px;flex-wrap:wrap;}}
+            .hb-s-item{{font-size:9px;}}
+            .tab-btn{{padding:9px 10px;font-size:9px;letter-spacing:0.8px;gap:5px;}}
+            .tab-badge{{font-size:8px;padding:2px 5px;}}
+
+            /* Sections */
+            .section{{padding:12px 12px;}}
+            .section-title{{font-size:11px;letter-spacing:1px;margin-bottom:12px;padding-bottom:8px;gap:6px;}}
+
+            /* Grids → single or 2-col */
+            .grid-5,.grid-4{{grid-template-columns:1fr 1fr!important;}}
+            .snap-grid{{grid-template-columns:1fr 1fr!important;gap:8px;}}
+            .card-grid{{gap:8px;}}
+
+            /* OI table: full horizontal scroll */
+            .oi-table-wrap{{overflow-x:auto;-webkit-overflow-scrolling:touch;}}
+            .oi-table{{min-width:520px;}}
+            .oi-table thead th,.oi-table tbody td{{padding:7px 8px;font-size:10px;}}
+            .oi-table-scroll-hint{{display:flex;}}
+            .oi-view-btn{{padding:5px 10px;font-size:9px;}}
+
+            /* OI summary strip */
+            .oi-summary-strip{{grid-template-columns:1fr 1fr;gap:8px;}}
+            .oi-stat-strip{{grid-template-columns:1fr 1fr;gap:8px;}}
+            .oi-controls{{flex-direction:column;gap:8px;align-items:flex-start;}}
+            .oi-chart-wrap{{padding:10px;}}
+
+            /* NC / OI navy */
+            .nc-cards-grid{{grid-template-columns:1fr!important;gap:8px;}}
+            .nc-section-header{{flex-direction:column;align-items:flex-start;}}
+            .nc-meters-panel{{width:100%;min-width:unset;}}
+            .nc-meter-track{{width:100%;max-width:100%;}}
+            .nc-dir-name{{font-size:18px;}}
+            .nc-wrap{{padding:0;}}
+
+            /* Key levels */
+            div[style*="grid-template-columns:1fr 1fr"]{{grid-template-columns:1fr!important;}}
+
+            /* FII / DII */
+            .pf-grid{{grid-template-columns:1fr 1fr!important;gap:8px;}}
+            .pf-avg-strip{{grid-template-columns:1fr;gap:0;padding:12px;}}
+            .pf-avg-sep{{display:none;}}
+            .pf-avg-cell{{display:flex;align-items:center;justify-content:space-between;padding:8px 0;border-bottom:1px solid rgba(79,195,247,0.07);}}
+            .pf-avg-cell:last-child{{border-bottom:none;}}
+            .pf-date-range{{display:none;}}
+
+            /* Market direction */
+            .md-row-top,.md-row-bottom{{flex-direction:column;align-items:flex-start;}}
+            .md-direction{{font-size:22px;}}
+
+            /* Strategy checklist */
+            .o5-grid{{grid-template-columns:1fr!important;}}
+            .o5-top-banner{{flex-direction:column;align-items:flex-start;}}
+            .strat-grid-legacy{{grid-template-columns:1fr!important;}}
+            .sc-compact-grid{{grid-template-columns:1fr!important;}}
+            .sc-dp-grid{{grid-template-columns:1fr 1fr;}}
+            .logic-grid{{grid-template-columns:1fr;}}
+
+            /* Pre-trade checklist */
+            .ptc-item{{padding:10px 12px;gap:10px;}}
+            .ptc-text{{font-size:13px;}}
+            .ptc-mindset-box{{flex-direction:column;gap:10px;}}
+
+            /* Heatmap */
+            .hm-grid{{grid-template-columns:repeat(5,minmax(0,1fr))!important;gap:4px;}}
+            .hm-cell{{min-height:56px;padding:6px 4px;}}
+            .hm-cell-sym{{font-size:9px;}}
+            .hm-cell-price{{font-size:7px;}}
+            .hm-cell-chg{{font-size:9px;}}
+            .hm-breadth-strip{{flex-direction:column;gap:12px;padding:14px;}}
+            .hm-bs-donut-wrap{{align-self:center;}}
+
+            /* Disclaimer */
+            .disc-text{{white-space:normal;font-size:11px;}}
+
+            /* Footer */
+            .footer{{padding:16px 12px;font-size:11px;}}
+        }}
+
+        @media(max-width:480px){{
+            .hb-title-main{{font-size:12px;}}
+            .hb-s-item{{font-size:8px;}}
+            .grid-5,.grid-4{{grid-template-columns:1fr!important;}}
+            .snap-grid{{grid-template-columns:1fr!important;}}
+            .pf-grid{{grid-template-columns:1fr!important;}}
+            .oi-summary-strip{{grid-template-columns:1fr 1fr;}}
+            .hm-grid{{grid-template-columns:repeat(4,minmax(0,1fr))!important;}}
+            .tab-btn{{padding:9px 9px;font-size:9px;letter-spacing:0.5px;}}
+        }}
+
+        @media(max-width:360px){{
+            .hb-title-main{{font-size:11px;}}
+            .oi-summary-strip{{grid-template-columns:1fr;}}
+            .hm-grid{{grid-template-columns:repeat(3,minmax(0,1fr))!important;}}
+            .nsb-mob-title{{font-size:11px;}}
+        }}
+    </style>
+    <script>
+    // Instant-hide: if we're restoring from auto-refresh, hide body BEFORE it renders
+    // This prevents the flash/jump to top that occurs when JS runs after first paint
+    try {{
+        if (sessionStorage.getItem('scrollY')) {{
+            document.documentElement.style.opacity = '0';
+            document.documentElement.style.overflow = 'hidden';
+        }}
+    }} catch(e) {{}}
+    </script>
 </head>
 <body>
-<div class="app">
-<header>
-  <div class="logo-wrap" id="logoWrap"></div>
-  <div class="hdr-meta">
-    <div class="live-dot"></div>
-    <span>NSE <span id="hdrInstrumentName">{instrument}</span> Options Dashboard</span>
-    <span style="color:rgba(255,255,255,.15);">|</span>
-    <div class="instrument-switcher">
-      <button class="inst-btn" id="instBtnBN" onclick="switchInstrument('BANKNIFTY')" style="border-color:rgba(0,200,150,.6);color:#00c896;background:rgba(0,200,150,.14);">&#9670; BankNifty</button>
-      <button class="inst-btn" id="instBtnFN" onclick="switchInstrument('FINNIFTY')" style="border-color:rgba(255,255,255,.15);color:rgba(255,255,255,.5);">&#9671; FinNifty</button>
-    </div>
-    <span style="color:rgba(255,255,255,.15);">|</span>
-    <span style="color:rgba(255,255,255,.75);">Last report generated:&nbsp;<span style="color:#00c896;font-weight:600;">{ts}</span></span>
-    <span style="color:rgba(255,255,255,.15);">|</span>
-    <span style="color:rgba(255,255,255,.75);">IST&nbsp;<span id="liveClock" style="font-family:'DM Mono',monospace;color:#ffd166;font-weight:700;letter-spacing:1px;">--:--:--</span></span>
-    <span style="color:rgba(255,255,255,.15);">|</span>
-    <div class="refresh-countdown">
-      <div class="countdown-arc-wrap">
-        <svg width="18" height="18" viewBox="0 0 18 18">
-          <circle cx="9" cy="9" r="7" fill="none" stroke="rgba(255,255,255,.1)" stroke-width="2"/>
-          <circle id="cdArc" cx="9" cy="9" r="7" fill="none" stroke="#00c896" stroke-width="2"
-            stroke-linecap="round" stroke-dasharray="{C:.2f}" stroke-dashoffset="0"
-            style="transform:rotate(-90deg);transform-origin:9px 9px;transition:stroke-dashoffset 1s linear,stroke .3s;"/>
-        </svg>
-      </div>
-      <span class="countdown-num" id="cdNum">30</span>
-      <span class="countdown-lbl" id="cdLbl">s</span>
-      <div class="refresh-ring" id="refreshRing"></div>
-      <span id="refreshStatus"></span>
-    </div>
-  </div>
-</header>
-{ticker_html}
-{gauge_html}
-<div class="main">
-  <aside class="sidebar">
-    <div class="sidebar-sticky-top">
-      <div id="greeksPanel">{greeks_sidebar}</div>
-    </div>
-    <div class="sidebar-scroll">
-    <div class="sb-sec">
-      <div class="sb-lbl">LIVE ANALYSIS</div>
-      <button class="sb-btn active" onclick="go('oi',this)">OI Dashboard</button>
-      <button class="sb-btn"        onclick="go('greeksTable',this)">&#9652; Option Greeks</button>
-      <button class="sb-btn"        onclick="go('kl',this)">Key Levels</button>
-    </div>
-    <div class="sb-sec">
-      <div class="sb-lbl">STRATEGIES</div>
-      <button class="sb-btn" onclick="go('strat',this);filterStrat('bullish',null)">&#9650; Bullish <span class="sb-badge" style="color:var(--bull);">9</span></button>
-      <button class="sb-btn" onclick="go('strat',this);filterStrat('bearish',null)">&#9660; Bearish <span class="sb-badge" style="color:var(--bear);">9</span></button>
-      <button class="sb-btn" onclick="go('strat',this);filterStrat('nondirectional',null)">&#8596; Non-Directional <span class="sb-badge" style="color:var(--neut);">20</span></button>
-    </div>
-    <div class="sb-sec">
-      <div class="sb-lbl">OPTION CHAIN</div>
-      <button class="sb-btn" onclick="go('strikes',this)">Top 5 Strikes</button>
-    </div>
-    </div>
-  </aside>
-  <main class="content">
-    <div class="main-tabs">
-      <button class="main-tab active" id="mainTabOI" onclick="switchMainTab('oi')">&#128202; OI Dashboard</button>
-      <button class="main-tab" id="mainTabStrat" onclick="switchMainTab('strat')">&#128203; Option Strategies Reference</button>
-    </div>
-    <div id="mainPanelOI">
-      <div id="oi">{oi_html}</div>
-      <div id="kl">{kl_html}</div>
-      {greeks_table}
-      <div id="strikes">{strikes_html}</div>
-      <div class="section">
-        <div style="background:rgba(100,128,255,.06);border:1px solid rgba(100,128,255,.18);
-                    border-left:3px solid #6480ff;border-radius:12px;padding:16px 18px;
-                    font-size:18.8px;color:rgba(255,255,255,.75);line-height:1.8;">
-          <strong style="color:rgba(255,255,255,.85);">DISCLAIMER:</strong>&nbsp;Educational only &mdash; NOT financial advice &middot; Smart PoP uses S/R, OI walls, bias &amp; PCR &middot; Use stop losses &middot; Consult a SEBI-registered advisor.
+<div class="container">
+    <div class="header">
+
+        <!-- Banner row: brand + live market chips -->
+        <div class="hb-banner">
+            <div class="hb-left">
+                <span class="hb-nse-badge">BNF</span>
+                <div>
+                    <div class="hb-title-main">&#128202; BankNifty &nbsp;&middot;&nbsp; OI Analysis &amp; Daily Sentiment</div>
+                    <div class="hb-title-sub">Algorithmic &nbsp;&middot;&nbsp; Auto-refresh &nbsp;&middot;&nbsp; IST Timestamps &nbsp;&middot;&nbsp; Deep Ocean v2</div>
+                </div>
+            </div>
+            <div class="hb-chips">
+                <div class="hb-chip">
+                    <div class="hb-chip-lbl">Spot Price</div>
+                    <div class="hb-chip-val" style="color:#00e676;">&#8377;{d['current_price']:,.0f}</div>
+                </div>
+                <div class="hb-chip">
+                    <div class="hb-chip-lbl">ATM Strike</div>
+                    <div class="hb-chip-val" style="color:#4fc3f7;">&#8377;{d['atm_strike']:,}</div>
+                </div>
+                <div class="hb-chip">
+                    <div class="hb-chip-lbl">PCR</div>
+                    <div class="hb-chip-val" style="color:{pcr_col};">{pcr_v:.3f}</div>
+                </div>
+                <div class="hb-chip">
+                    <div class="hb-chip-lbl">India VIX</div>
+                    <div class="hb-chip-val" style="color:{vix_col};">{vix_str}{vix_arrow}</div>
+                </div>
+                <div class="hb-chip">
+                    <div class="hb-chip-lbl">Max Pain</div>
+                    <div class="hb-chip-val" style="color:#ffb74d;">&#8377;{d.get('max_pain',0):,}</div>
+                </div>
+                <div class="hb-chip">
+                    <div class="hb-chip-lbl">Expiry</div>
+                    <div class="hb-chip-val" style="color:#4fc3f7;font-size:11px;">{d.get('expiry','N/A')}</div>
+                </div>
+                <div class="hb-chip">
+                    <div class="hb-chip-lbl">Days Left</div>
+                    <div class="hb-chip-val" style="color:{expiry_days_col};">{expiry_days_str}</div>
+                </div>
+            </div>
         </div>
-      </div>
+
+        <!-- Status row: generated, clock, refresh, global bias, FII/DII -->
+        <div class="hb-status">
+            <div class="hb-s-item">
+                <div class="hb-s-dot" style="background:#00e676;box-shadow:0 0 6px #00e676;"></div>
+                Generated <span class="hb-s-val" id="hb-gen">{d['timestamp']}</span>
+            </div>
+            <div class="hb-s-item">
+                <div class="hb-s-dot" style="background:#4fc3f7;box-shadow:0 0 6px #4fc3f7;"></div>
+                IST Now <span class="hb-s-val" style="color:#4fc3f7;" id="live-ist-clock">--:--:--</span>
+            </div>
+            <div class="hb-s-item" style="display:none;">
+                <div class="hb-s-dot" style="background:#b388ff;box-shadow:0 0 6px #b388ff;"></div>
+                Next Refresh <span class="hb-s-val" style="color:#b388ff;" id="refresh-countdown">30s</span>
+            </div>
+            <div class="hb-s-item">
+                &#127760; Global <span class="hb-s-val" style="color:{gb_col};">{gb_str}</span>
+            </div>
+            <div class="hb-s-item">
+                &#127982; FII <span class="hb-s-val" style="color:{fii_col};">{fii_hdr}</span>
+            </div>
+            <div class="hb-s-item">
+                &#127982; DII <span class="hb-s-val" style="color:{dii_col};">{dii_hdr}</span>
+            </div>
+        </div>
+
+        <!-- Tabs -->
+        <div class="tab-nav" id="tabNav">
+            <button class="tab-btn active" data-tab="main" onclick="switchTab('main')">
+                <span class="tab-dot"></span> &#128200; Main Analysis <span class="tab-badge">LIVE</span>
+            </button>
+            <button class="tab-btn" data-tab="heatmap" onclick="switchTab('heatmap')">
+                <span class="tab-dot"></span> &#127956; Heatmap <span class="tab-badge">LIVE</span>
+            </button>
+            <button class="tab-btn" data-tab="oi-trend" onclick="switchTab('oi-trend')">
+                <span class="tab-dot"></span> &#128202; Intraday OI <span class="tab-badge">IST</span>
+            </button>
+            <button class="tab-btn" data-tab="weekly" onclick="switchTab('weekly')">
+                <span class="tab-dot"></span> &#128197; Weekly Outlook <span class="tab-badge">NEW</span>
+            </button>
+            <button class="tab-btn new-badge" data-tab="checklist" onclick="switchTab('checklist')">
+                <span class="tab-dot"></span> &#129504; Strategy <span class="tab-badge">NEW</span>
+            </button>
+            <button class="tab-btn" data-tab="pretrade" onclick="switchTab('pretrade')">
+                <span class="tab-dot"></span> &#9989; Pre-Trade <span class="tab-badge">23</span>
+            </button>
+        </div>
     </div>
-    <div id="mainPanelStrat" style="display:none;">
-      <div id="stratBN">{strat_html}</div>
-      <div id="stratFN" style="display:none;">{fn_strat_html}</div>
+
+    <!-- ══ PAGE BODY: sidebar + content ══ -->
+    <div class="page-body">
+
+    <!-- LEFT SIDEBAR NAV -->
+    <nav class="nav-sidebar" id="navSidebar">
+        <div class="nsb-header">
+            <span class="nsb-logo">BANKNIFTY</span>
+            <button class="nsb-toggle" id="nsbToggle" onclick="toggleNavSidebar()" title="Collapse">
+                <svg viewBox="0 0 16 16" fill="none" stroke="rgba(79,195,247,0.6)" stroke-width="2" stroke-linecap="round"><polyline points="10,4 6,8 10,12"/></svg>
+            </button>
+        </div>
+        <div class="nsb-nav">
+            <div class="nsb-group">MAIN ANALYSIS</div>
+            <div class="nsb-item active" id="nsi-signals" onclick="navSidebarTo('signals','main')">
+                <div class="nsb-icon"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><polyline points="2,10 5,6 8,8 11,4 14,5"/><circle cx="5" cy="6" r="1.2" fill="currentColor"/><circle cx="8" cy="8" r="1.2" fill="currentColor"/><circle cx="11" cy="4" r="1.2" fill="currentColor"/></svg></div>
+                <span class="nsb-label">Signals</span>
+                <span class="nsb-tip">Signal Summary</span>
+            </div>
+            <div class="nsb-item" id="nsi-oi" onclick="navSidebarTo('oi','main')">
+                <div class="nsb-icon"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><rect x="2" y="10" width="3" height="4"/><rect x="6.5" y="6" width="3" height="8"/><rect x="11" y="2" width="3" height="12"/></svg></div>
+                <span class="nsb-label">OI Analysis</span>
+                <span class="nsb-tip">OI Analysis</span>
+            </div>
+            <div class="nsb-item" id="nsi-keylevels" onclick="navSidebarTo('keylevels','main')">
+                <div class="nsb-icon"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><line x1="2" y1="8" x2="14" y2="8"/><line x1="5" y1="5" x2="5" y2="11"/><line x1="11" y1="5" x2="11" y2="11"/></svg></div>
+                <span class="nsb-label">Key Levels</span>
+                <span class="nsb-tip">Key Levels</span>
+            </div>
+            <div class="nsb-item" id="nsi-fiidii" onclick="navSidebarTo('fiidii','main')">
+                <div class="nsb-icon"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><rect x="2" y="5" width="5" height="9" rx="1"/><rect x="9" y="2" width="5" height="12" rx="1"/></svg></div>
+                <span class="nsb-label">FII / DII</span>
+                <span class="nsb-tip">FII / DII</span>
+            </div>
+            <div class="nsb-item" id="nsi-direction" onclick="navSidebarTo('direction','main')">
+                <div class="nsb-icon"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="8" cy="8" r="5"/><polyline points="8,5 8,8 10,10"/></svg></div>
+                <span class="nsb-label">Direction</span>
+                <span class="nsb-tip">Market Direction</span>
+            </div>
+            <div class="nsb-item" id="nsi-technical" onclick="navSidebarTo('technical','main')">
+                <div class="nsb-icon"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><polyline points="2,12 5,7 8,9 11,5 14,3"/></svg></div>
+                <span class="nsb-label">Technical</span>
+                <span class="nsb-tip">Technical Indicators</span>
+            </div>
+            <div class="nsb-item" id="nsi-optchain" onclick="navSidebarTo('optchain','main')">
+                <div class="nsb-icon"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="8" cy="8" r="5"/><line x1="8" y1="3" x2="8" y2="5"/><line x1="8" y1="11" x2="8" y2="13"/><line x1="3" y1="8" x2="5" y2="8"/><line x1="11" y1="8" x2="13" y2="8"/></svg></div>
+                <span class="nsb-label">Option Chain</span>
+                <span class="nsb-tip">Option Chain</span>
+            </div>
+            <div class="nsb-group">OTHER VIEWS</div>
+            <div class="nsb-item" id="nsi-heatmap" onclick="navSidebarTo('heatmap','heatmap')">
+                <div class="nsb-icon"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><rect x="2" y="2" width="3" height="3" rx="0.5"/><rect x="6.5" y="2" width="3" height="3" rx="0.5"/><rect x="11" y="2" width="3" height="3" rx="0.5"/><rect x="2" y="6.5" width="3" height="3" rx="0.5"/><rect x="6.5" y="6.5" width="3" height="3" rx="0.5"/><rect x="11" y="6.5" width="3" height="3" rx="0.5"/><rect x="2" y="11" width="3" height="3" rx="0.5"/><rect x="6.5" y="11" width="3" height="3" rx="0.5"/><rect x="11" y="11" width="3" height="3" rx="0.5"/></svg></div>
+                <span class="nsb-label">Heatmap</span>
+                <span class="nsb-tip">BankNifty Heatmap</span>
+            </div>
+            <div class="nsb-item" id="nsi-oitrend" onclick="navSidebarTo('oitrend','oi-trend')">
+                <div class="nsb-icon"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><polyline points="2,13 5,8 8,10 11,5 14,7"/><line x1="2" y1="13" x2="14" y2="13"/></svg></div>
+                <span class="nsb-label">Intraday OI</span>
+                <span class="nsb-tip">Intraday OI Trend</span>
+            </div>
+            <div class="nsb-item" id="nsi-weekly" onclick="navSidebarTo('weekly','weekly')">
+                <div class="nsb-icon"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><rect x="2" y="3" width="12" height="11" rx="2"/><line x1="2" y1="7" x2="14" y2="7"/><line x1="5" y1="3" x2="5" y2="1"/><line x1="11" y1="3" x2="11" y2="1"/></svg></div>
+                <span class="nsb-label">Weekly</span>
+                <span class="nsb-tip">Weekly Outlook</span>
+            </div>
+            <div class="nsb-item" id="nsi-checklist" onclick="navSidebarTo('checklist','checklist')">
+                <div class="nsb-icon"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><polyline points="4,8 7,11 12,5"/><rect x="2" y="2" width="12" height="12" rx="2"/></svg></div>
+                <span class="nsb-label">Strategy</span>
+                <span class="nsb-tip">Strategy Checklist</span>
+            </div>
+            <div class="nsb-item" id="nsi-pretrade" onclick="navSidebarTo('pretrade','pretrade')">
+                <div class="nsb-icon"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><line x1="5" y1="5" x2="13" y2="5"/><line x1="5" y1="8" x2="13" y2="8"/><line x1="5" y1="11" x2="13" y2="11"/><circle cx="2.5" cy="5" r="0.8" fill="currentColor"/><circle cx="2.5" cy="8" r="0.8" fill="currentColor"/><circle cx="2.5" cy="11" r="0.8" fill="currentColor"/></svg></div>
+                <span class="nsb-label">Pre-Trade</span>
+                <span class="nsb-tip">Pre-Trade Rules</span>
+            </div>
+        </div>
+    </nav>
+    <!-- MAIN PAGE CONTENT -->
+    <div class="page-content" id="pageContent">
+    <!-- MOBILE NAV BAR sticky top -->
+    <div class="nsb-mob-bar" id="nsbMobBar">
+        <button class="nsb-mob-btn" onclick="openNsbDrawer()">
+            <svg viewBox="0 0 16 16" width="18" height="18" fill="none" stroke="rgba(79,195,247,0.8)" stroke-width="2" stroke-linecap="round"><line x1="2" y1="4" x2="14" y2="4"/><line x1="2" y1="8" x2="14" y2="8"/><line x1="2" y1="12" x2="14" y2="12"/></svg>
+        </button>
+        <span class="nsb-mob-title" id="nsbMobTitle">&#9889; Signal Summary</span>
     </div>
-  </main>
+
+    <!-- TAB 1: MAIN ANALYSIS -->
+    <div class="tab-panel active" id="tab-main">
+"""
+        html += self._signal_summary_bar_html()
+        if d['has_option_data']:
+            html += '<div id="sec-oi">' + self._oi_navy_command_section(d) + '</div>'
+        html += '<div id="sec-keylevels">' + self._key_levels_visual_section(d,_pct_cp,_pts_to_res,_pts_to_sup,_mp_node) + '</div>'
+        html += self._option_chain_pivot_section_html(d)
+        html += '<div id="sec-fiidii">' + self._fiidii_section_html() + '</div>'
+        html += '<div id="sec-direction">' + self._market_direction_widget_html() + '</div>'
+        html += f"""
+        <div class="section" id="sec-technical">
+            <div class="section-title"><span>&#128269;</span> TECHNICAL INDICATORS</div>
+            <div style="display:flex;align-items:center;flex-wrap:wrap;gap:7px;padding:4px 0;">
+                {tech_cards}
+            </div>
+        </div>
+"""
+        if d['has_option_data']:
+            html += f"""
+        <div class="section" id="sec-optchain">
+            <div class="section-title"><span>&#127919;</span> OPTION CHAIN ANALYSIS <span style="font-size:11px;color:#80deea;font-weight:400;letter-spacing:1px;">(ATM \u00b110 Strikes Only)</span></div>
+            {self._top10_oi_widget_html(d)}
+            <div class="card-grid grid-4">{oc_cards}</div>
+        </div>
+"""
+        html += """
+        <div class="section">
+            <div class="disclaimer"><span class="disc-icon">⚠️</span><span class="disc-label">Disclaimer</span><span class="disc-sep">|</span><span class="disc-text">For <strong>EDUCATIONAL purposes only</strong> \u2014 NOT financial advice.</span><span class="disc-sep">|</span><span class="disc-text">Always use stop losses &amp; consult a SEBI registered advisor.</span><span class="disc-sep">|</span><span class="disc-text">Past performance does not guarantee future results.</span></div>
+        </div>
+    </div><!-- /tab-main -->
+"""
+        html += heatmap_tab_html
+        html += intraday_oi_tab_html
+        html += weekly_outlook_tab_html
+        html += checklist_tab_html
+        html += pretrade_tab_html
+        html += """
+    <div class="footer">
+        <p>Automated BankNifty · Option Chain + Technical + Heatmap + Intraday OI Trend + Weekly Outlook + Strategy Checklist</p>
+        <p style="margin-top:6px;">&#169; 2026 · Deep Ocean Theme · Navy Command OI · Pulse Flow FII/DII · IST Timestamps · For Educational Purposes Only</p>
+    </div>
+    </div><!-- /page-content -->
+    </div><!-- /page-body -->
 </div>
-<footer>
-  <span>NiftyCraft &middot; v20.0 &middot; {instrument} &middot; Holiday-Aware Expiry + Intraday P&amp;L Simulator</span>
-  <span>S/R + OI Walls + Bias + PCR &middot; Educational Only &middot; &copy; 2025</span>
-</footer>
+<!-- MOBILE DRAWER — fixed overlay, direct child of body for position:fixed to work on iOS -->
+<div class="nsb-drawer" id="nsbDrawer">
+    <div class="nsb-drawer-head">
+        <span class="nsb-drawer-title">NAVIGATE</span>
+        <button class="nsb-drawer-close" onclick="closeNsbDrawer()">&#10005;</button>
+    </div>
+    <div class="nsb-drawer-nav" id="nsbDrawerNav">
+        <div class="nsb-group" style="padding:10px 18px 4px;">MAIN ANALYSIS</div>
+        <div class="nsb-mob-item active" id="nsmd-signals" onclick="mobNavTo('signals','main','&#9889; Signals')">&#9889; Signals</div>
+        <div class="nsb-mob-item" id="nsmd-oi" onclick="mobNavTo('oi','main','&#128202; OI Analysis')">&#128202; OI Analysis</div>
+        <div class="nsb-mob-item" id="nsmd-keylevels" onclick="mobNavTo('keylevels','main','&#128204; Key Levels')">&#128204; Key Levels</div>
+        <div class="nsb-mob-item" id="nsmd-fiidii" onclick="mobNavTo('fiidii','main','&#127982; FII / DII')">&#127982; FII / DII</div>
+        <div class="nsb-mob-item" id="nsmd-direction" onclick="mobNavTo('direction','main','&#129517; Direction')">&#129517; Direction</div>
+        <div class="nsb-mob-item" id="nsmd-technical" onclick="mobNavTo('technical','main','&#128269; Technical')">&#128269; Technical</div>
+        <div class="nsb-mob-item" id="nsmd-optchain" onclick="mobNavTo('optchain','main','&#127919; Option Chain')">&#127919; Option Chain</div>
+        <div class="nsb-group" style="padding:10px 18px 4px;">OTHER VIEWS</div>
+        <div class="nsb-mob-item" id="nsmd-heatmap" onclick="mobNavTo('heatmap','heatmap','&#127956; Heatmap')">&#127956; Heatmap</div>
+        <div class="nsb-mob-item" id="nsmd-oitrend" onclick="mobNavTo('oitrend','oi-trend','&#128202; Intraday OI')">&#128202; Intraday OI</div>
+        <div class="nsb-mob-item" id="nsmd-weekly" onclick="mobNavTo('weekly','weekly','&#128197; Weekly Outlook')">&#128197; Weekly Outlook</div>
+        <div class="nsb-mob-item" id="nsmd-checklist" onclick="mobNavTo('checklist','checklist','&#129504; Strategy')">&#129504; Strategy</div>
+        <div class="nsb-mob-item" id="nsmd-pretrade" onclick="mobNavTo('pretrade','pretrade','&#9989; Pre-Trade')">&#9989; Pre-Trade</div>
+    </div>
 </div>
+"""
+        # Inject current bias as JS variable so renderOITable can read it
+        bias_val = d.get('bias', 'SIDEWAYS')
+        html += f'\n<script>\nvar _CURRENT_BIAS = "{bias_val}";\n</script>\n'
+        html += all_js
+        html += f"\n<script>\n{heatmap_js}\n</script>\n"
+        html += "\n</body></html>"
+        return html
 
-<iframe id="silentRefreshFrame" src="about:blank"
-  style="position:fixed;width:0;height:0;border:none;visibility:hidden;
-         pointer-events:none;opacity:0;top:-9999px;left:-9999px;"></iframe>
+    def save_html_to_file(self, filename='index_banknifty.html', vol_support=None, vol_resistance=None, global_bias=None, vol_view="normal"):
+        try:
+            print(f"\n📄 Saving HTML to {filename}...")
+            with open(filename,'w',encoding='utf-8') as f:
+                f.write(self.generate_html_email(
+                    vol_support=vol_support, vol_resistance=vol_resistance,
+                    global_bias=global_bias, vol_view=vol_view
+                ))
+            print(f"   ✅ Saved {filename}")
+            metadata = {
+                'timestamp':         self.html_data['timestamp'],
+                'current_price':     float(self.html_data['current_price']),
+                'bias':              self.html_data['bias'],
+                'confidence':        self.html_data['confidence'],
+                'rsi':               float(self.html_data['rsi']),
+                'pcr':               float(self.html_data['pcr']) if self.html_data['has_option_data'] else None,
+                'stop_loss':         float(self.html_data['stop_loss']) if self.html_data['stop_loss'] else None,
+                'risk_reward_ratio': self.html_data.get('risk_reward_ratio', 0),
+                'heatmap_advance':   self.heatmap_advance,
+                'heatmap_decline':   self.heatmap_decline,
+            }
+            with open('latest_report_banknifty.json','w') as f:
+                json.dump(metadata, f, indent=2)
+            print("   ✅ Saved latest_report_banknifty.json")
+            return True
+        except Exception as e:
+            print(f"\n❌ Save failed: {e}"); return False
 
-<script>
-function go(id,btn){{
-  const el=document.getElementById(id);
-  if(el)el.scrollIntoView({{behavior:"smooth",block:"start"}});
-  if(btn){{document.querySelectorAll(".sb-btn").forEach(b=>b.classList.remove("active"));btn.classList.add("active");}}
-}}
+    def send_html_email_report(self, vol_support=None, vol_resistance=None, global_bias=None, vol_view="normal"):
+        gmail_user=os.getenv('GMAIL_USER'); gmail_password=os.getenv('GMAIL_APP_PASSWORD')
+        recipient1=os.getenv('RECIPIENT_EMAIL_1'); recipient2=os.getenv('RECIPIENT_EMAIL_2')
+        if not all([gmail_user,gmail_password,recipient1,recipient2]):
+            print("\n⚠️  Email credentials not set. Skipping."); return False
+        try:
+            ist_now=datetime.now(pytz.timezone('Asia/Kolkata'))
+            msg=MIMEMultipart('alternative')
+            msg['From']=gmail_user; msg['To']=f"{recipient1}, {recipient2}"
+            msg['Subject']=f"📊 BankNifty OI & Technical Report — {ist_now.strftime('%d-%b-%Y %H:%M IST')}"
+            msg.attach(MIMEText(self.generate_html_email(vol_support,vol_resistance,global_bias,vol_view),'html'))
+            with smtplib.SMTP_SSL('smtp.gmail.com',465) as server:
+                server.login(gmail_user,gmail_password); server.send_message(msg)
+            print("   ✅ Email sent!"); return True
+        except Exception as e:
+            print(f"\n❌ Email failed: {e}"); return False
 
-function updateISTClock() {{
-  const el = document.getElementById('liveClock');
-  if (!el) return;
-  const now = new Date();
-  const istOffset = 5.5 * 60 * 60 * 1000;
-  const ist = new Date(now.getTime() + (now.getTimezoneOffset() * 60 * 1000) + istOffset);
-  const hh = String(ist.getHours()).padStart(2,'0');
-  const mm = String(ist.getMinutes()).padStart(2,'0');
-  const ss = String(ist.getSeconds()).padStart(2,'0');
-  el.textContent = hh + ':' + mm + ':' + ss;
-}}
-updateISTClock();
-setInterval(updateISTClock, 1000);
+    def generate_full_report(self):
+        ist_now=datetime.now(pytz.timezone('Asia/Kolkata'))
+        print("="*70)
+        print("BankNifty Open Interest (OI) Analysis & Daily Sentiment Report")
+        print(f"Generated: {ist_now.strftime('%d-%b-%Y %H:%M IST')}")
+        print("="*70)
+        oc_data=self.fetch_nse_option_chain_silent()
+        option_analysis=self.analyze_option_chain_data(oc_data) if oc_data else None
+        if option_analysis:
+            print(f"✅ Option data | Expiry: {option_analysis['expiry']} | Spot: {option_analysis['underlying_value']}")
+        else:
+            print("⚠️  No option data — technical-only mode")
+        print("\nFetching technical data...")
+        technical=self.get_technical_data()
+        self.generate_analysis_data(technical, option_analysis)
 
-function switchMainTab(tab) {{
-  document.getElementById('mainPanelOI').style.display    = tab === 'oi'    ? '' : 'none';
-  document.getElementById('mainPanelStrat').style.display = tab === 'strat' ? '' : 'none';
-  document.getElementById('mainTabOI').classList.toggle('active',    tab === 'oi');
-  document.getElementById('mainTabStrat').classList.toggle('active', tab === 'strat');
-}}
-function filterStrat(cat,btn){{
-  const activePanelId = (typeof _activeInstrument !== 'undefined' && _activeInstrument === 'FINNIFTY') ? 'stratFN' : 'stratBN';
-  const activePanel = document.getElementById(activePanelId) || document;
-  activePanel.querySelectorAll(".sc-card").forEach(c=>{{c.classList.toggle("hidden",c.dataset.cat!==cat);}});
-  const colors={{bullish:"#00c896",bearish:"#ff6b6b",nondirectional:"#6480ff"}};
-  const col=colors[cat]||"#00c896";
-  document.querySelectorAll(".sc-tab").forEach(t=>{{t.style.borderColor="rgba(255,255,255,.15)";t.style.color="rgba(255,255,255,.5)";t.style.background="transparent";}});
-  if(btn){{btn.style.borderColor=col;btn.style.color=col;btn.style.background=col+"20";}}
-  else{{document.querySelectorAll(".sc-tab").forEach(t=>{{
-    if((cat==="bullish"&&t.textContent.includes("BULLISH"))||(cat==="bearish"&&t.textContent.includes("BEARISH"))||(cat==="nondirectional"&&t.textContent.includes("NON")))
-    {{t.style.borderColor=col;t.style.color=col;t.style.background=col+"20";}}
-  }});}}
-}}
-document.addEventListener("click",function(e){{
-  const card=e.target.closest(".sc-card");
-  if(card){{
-    const activePanelId = (typeof _activeInstrument !== 'undefined' && _activeInstrument === 'FINNIFTY') ? 'stratFN' : 'stratBN';
-    const activePanel = document.getElementById(activePanelId) || document;
-    const was=card.classList.contains("expanded");
-    activePanel.querySelectorAll(".sc-card.expanded").forEach(c=>c.classList.remove("expanded"));
-    if(!was){{
-      card.classList.add("expanded");
-      const mel=card.querySelector('.sc-metrics-live');
-      if(mel&&mel.querySelector('.sc-loading')){{
-        try{{
-          const shape=card.dataset.shape, cat=card.dataset.cat;
-          const scoreResult=smartPoP(shape,cat);
-          const m=calcMetrics(shape,scoreResult.pop);
-          if (m === null) {{
-            mel.innerHTML='<div style="padding:18px 14px;color:#ff9a3c;font-family:DM Mono,monospace;font-size:13px;">⚠ Live LTP unavailable for one or more legs of this strategy.<br><span style="opacity:.7;font-size:12px;">This strike has not traded today. The card will reappear once NSE reports a live price.</span></div>';
-          }} else {{
-            mel.innerHTML=renderMetrics(m, scoreResult);
-          }}
-        }}catch(err){{mel.innerHTML='<div class="sc-loading">Could not calculate metrics</div>';}}
-      }}
-    }}
-  }}
-}});
-</script>
+        # ── Fetch BankNifty Heatmap data ────────────────────────────────
+        print("\n🌡️  Fetching BankNifty heatmap data...")
+        (self.heatmap_data,
+         self.heatmap_timestamp,
+         self.heatmap_advance,
+         self.heatmap_decline,
+         self.heatmap_neutral) = fetch_heatmap_data()
 
+        # ── Log OI snapshot for Intraday OI Trend tab ─────────────────
+        print("\n📊 Logging OI snapshot to oi_log_banknifty.json...")
+        key_levels = {
+            "support":           self.html_data.get("support"),
+            "resistance":        self.html_data.get("resistance"),
+            "strong_support":    self.html_data.get("strong_support"),
+            "strong_resistance": self.html_data.get("strong_resistance"),
+        }
+        log_oi_snapshot(option_analysis, technical, key_levels=key_levels,
+                        bias=self.html_data.get('bias', 'SIDEWAYS'))
 
-<script>
-const INSTRUMENT_PANELS = {{
-  BANKNIFTY: {{
-    oi:           `{bn_oi_html_str}`,
-    kl:           `{bn_kl_html_str}`,
-    greeksPanel:  `{bn_greeks_panel_str}`,
-    greeksTable:  `{bn_greeks_table_str}`,
-    strikes:      `{bn_strikes_html_str}`,
-  }},
-  FINNIFTY: {{
-    oi:           `{fn_oi_html_str}`,
-    kl:           `{fn_kl_html_str}`,
-    greeksPanel:  `{fn_greeks_panel_str}`,
-    greeksTable:  `{fn_greeks_table_str}`,
-    strikes:      `{fn_strikes_html_str}`,
-  }}
-}};
-const INSTRUMENT_DATA = {{
-  BANKNIFTY: {{
-    name:"BankNifty", lotSize:{lot_size_bn}, strikeStep:100,
-    spot:{bn_spot:.2f}, atm:{bn_atm}, pcr:{bn_pcr:.3f},
-    maxPain:{bn_maxpain}, maxCeStrike:{bn_max_ce}, maxPeStrike:{bn_max_pe},
-    support:{bn_sup:.2f}, resistance:{bn_res:.2f}, strongSup:{bn_ssup:.2f}, strongRes:{bn_sres:.2f},
-    bias:"{bn_bias}", biasConf:"{bn_conf}", bullScore:{bn_bull}, bearScore:{bn_bear},
-    diff:{bn_diff},
-    oiDir:"{bn_oi_dir}", oiSig:"{bn_oi_sig}", pcr_col_cls:"{bn_pcr_cls}",
-    rawOiDir:"{bn_raw_oi_dir}", rawOiSig:"{bn_raw_oi_sig}", rawOiCls:"{bn_raw_oi_cls}",
-    chgBull:{bn_chg_bull}, chgBear:{bn_chg_bear},
-    bullPct:{bn_bull_pct}, bearPct:{bn_bear_pct},
-    expiry:"{bn_expiry}", strikes:{bn_strikes_json}, allExpiry:{bn_all_expiry_json}
-  }},
-  FINNIFTY: {{
-    name:"FinNifty", lotSize:{lot_size_fn}, strikeStep:50,
-    spot:{fn_spot_js}, atm:{fn_atm_js}, pcr:{fn_pcr:.3f},
-    maxPain:{fn_maxpain}, maxCeStrike:{fn_max_ce}, maxPeStrike:{fn_max_pe},
-    support:{fn_sup:.2f}, resistance:{fn_res:.2f}, strongSup:{fn_ssup:.2f}, strongRes:{fn_sres:.2f},
-    bias:"{fn_bias}", biasConf:"{fn_conf}", bullScore:{fn_bull}, bearScore:{fn_bear},
-    diff:{fn_diff},
-    oiDir:"{fn_oi_dir}", oiSig:"{fn_oi_sig}", pcr_col_cls:"{fn_pcr_cls}",
-    rawOiDir:"{fn_raw_oi_dir}", rawOiSig:"{fn_raw_oi_sig}", rawOiCls:"{fn_raw_oi_cls}",
-    chgBull:{fn_chg_bull}, chgBear:{fn_chg_bear},
-    bullPct:{fn_bull_pct}, bearPct:{fn_bear_pct},
-    expiry:"{fn_expiry}", strikes:{fn_strikes_json}, allExpiry:{fn_all_expiry_json}
-  }}
-}};
-let _activeInstrument = "BANKNIFTY";
-function switchInstrument(sym) {{
-  if (sym === _activeInstrument) return;
-  const d = INSTRUMENT_DATA[sym];
-  if (!d || !d.spot) {{
-    alert(sym + ' data unavailable. Please re-run the script.');
-    return;
-  }}
-  _activeInstrument = sym;
+        # Fetch India VIX and store in html_data
+        vix_val, vix_trend = fetch_india_vix()
+        self.html_data['vix_val']   = vix_val
+        self.html_data['vix_trend'] = vix_trend
+        
+        return option_analysis
 
-  // ── Swap HTML panels (fixes OI, KeyLevels, Greeks, Strikes) ──
-  const panels = INSTRUMENT_PANELS[sym];
-  if (panels) {{
-    const oiEl = document.getElementById('oi');
-    if (oiEl && panels.oi) oiEl.innerHTML = panels.oi;
-    const klEl = document.getElementById('kl');
-    if (klEl && panels.kl) klEl.innerHTML = panels.kl;
-    const gpEl = document.getElementById('greeksPanel');
-    if (gpEl && panels.greeksPanel) gpEl.innerHTML = panels.greeksPanel;
-    const gtEl = document.getElementById('greeksTable');
-    if (gtEl) gtEl.outerHTML = panels.greeksTable || '';
-    const skEl = document.getElementById('strikes');
-    if (skEl && panels.strikes) skEl.innerHTML = panels.strikes;
-  }}
-  // Reinitialise the greeks strike selector with new instrument data
-  if (sym === 'FINNIFTY' && typeof _fnGreeksUpdate === 'function') {{
-    var sel = document.getElementById('greeksStrikeSelect');
-    if (sel) _fnGreeksUpdate(sel.value);
-  }} else if (sym === 'BANKNIFTY' && typeof greeksUpdateStrike === 'function') {{
-    var sel = document.getElementById('greeksStrikeSelect');
-    if (sel) greeksUpdateStrike(sel.value);
-  }}
-
-  const sBN = document.getElementById('stratBN');
-  const sFN = document.getElementById('stratFN');
-  if (sBN) sBN.style.display = sym==='BANKNIFTY' ? '' : 'none';
-  if (sFN) sFN.style.display = sym==='FINNIFTY'  ? '' : 'none';
-  const bnBtn = document.getElementById('instBtnBN');
-  const fnBtn = document.getElementById('instBtnFN');
-  if (bnBtn && fnBtn) {{
-    if (sym==='BANKNIFTY') {{
-      bnBtn.style.cssText='border-color:rgba(0,200,150,.6);color:#00c896;background:rgba(0,200,150,.14);padding:5px 14px;border-radius:20px;border:1px solid;cursor:pointer;';
-      fnBtn.style.cssText='border-color:rgba(255,255,255,.15);color:rgba(255,255,255,.5);background:transparent;padding:5px 14px;border-radius:20px;border:1px solid;cursor:pointer;';
-    }} else {{
-      fnBtn.style.cssText='border-color:rgba(100,128,255,.6);color:#8aa0ff;background:rgba(100,128,255,.14);padding:5px 14px;border-radius:20px;border:1px solid;cursor:pointer;';
-      bnBtn.style.cssText='border-color:rgba(255,255,255,.15);color:rgba(255,255,255,.5);background:transparent;padding:5px 14px;border-radius:20px;border:1px solid;cursor:pointer;';
-    }}
-  }}
-  const hdr = document.getElementById('hdrInstrumentName');
-  if (hdr) hdr.textContent = d.name;
-
-  // ── Update Hero Gauge Widget ──────────────────────────────────
-  const C263 = 263.9;
-  function clamp(v,lo,hi){{ return Math.max(lo,Math.min(hi,v)); }}
-  function fmtChgOI(n) {{
-    if (Math.abs(n) >= 1000000) return (n>0?'+':'')+( n/1000000).toFixed(1)+'M';
-    if (Math.abs(n) >= 1000)    return (n>0?'+':'')+(n/1000).toFixed(0)+'K';
-    return (n>0?'+':'')+n;
-  }}
-  // Gauge arcs
-  const bullOffset = C263 * (1 - clamp(d.bullPct,10,97)/100);
-  const bearOffset = C263 * (1 - clamp(d.bearPct,10,97)/100);
-  document.querySelectorAll('circle[stroke="url(#bull-g)"]').forEach(el=>{{
-    el.style.strokeDashoffset = bullOffset.toFixed(1);
-  }});
-  document.querySelectorAll('circle[stroke="url(#bear-g)"]').forEach(el=>{{
-    el.style.strokeDashoffset = bearOffset.toFixed(1);
-  }});
-  // CHG BULL / CHG BEAR labels inside gauges
-  document.querySelectorAll('.g-val').forEach(el=>{{
-    const lbl = el.nextElementSibling;
-    if (!lbl) return;
-    if (lbl.textContent.trim() === 'CHG BULL') {{
-      el.textContent = fmtChgOI(d.chgBull);
-      el.style.color = '#00c896';
-    }} else if (lbl.textContent.trim() === 'CHG BEAR') {{
-      el.textContent = fmtChgOI(d.chgBear);
-      el.style.color = '#ff6b6b';
-    }}
-  }});
-  // OI signal text & colour
-  const dirColMap = {{ bullish:'#00c896', bearish:'#ff6b6b', neutral:'#6480ff' }};
-  const dirCol = dirColMap[d.rawOiCls] || '#6480ff';
-  const glowMap = {{ '#00c896':'0,200,150', '#ff6b6b':'255,107,107', '#6480ff':'100,128,255' }};
-  const glowRgb = glowMap[dirCol] || '100,128,255';
-  const sigEl = document.querySelector('.h-signal');
-  if (sigEl) {{
-    sigEl.textContent = d.rawOiDir;
-    sigEl.style.color = dirCol;
-    sigEl.style.textShadow = `0 0 20px rgba(${{glowRgb}},.6),0 0 40px rgba(${{glowRgb}},.3)`;
-  }}
-  const subEl = document.querySelector('.h-sub');
-  if (subEl) {{
-    const pcrCol = d.pcr > 1.2 ? '#00c896' : d.pcr < 0.7 ? '#ff6b6b' : '#6480ff';
-    subEl.innerHTML = d.rawOiSig + ' · PCR <span style="color:'+pcrCol+';font-weight:700;">'+d.pcr.toFixed(3)+'</span>';
-  }}
-  const eyeEl = document.querySelector('.h-eyebrow');
-  if (eyeEl) eyeEl.textContent = 'OI NET SIGNAL · ' + d.expiry + ' · SPOT ₹' + Math.round(d.spot).toLocaleString('en-IN');
-  // Bull/Bear strength bars
-  const pillRows = document.querySelectorAll('.pill-row');
-  pillRows.forEach(row => {{
-    const lbl  = row.querySelector('.pill-lbl');
-    const fill = row.querySelector('.pill-fill');
-    const num  = row.querySelector('.pill-num');
-    if (!lbl) return;
-    if (lbl.textContent.trim() === 'BULL STRENGTH') {{
-      const bPct = clamp(d.bullPct,10,97);
-      if (fill) fill.style.width = bPct + '%';
-      if (num)  {{ num.textContent = d.bullPct + '%'; num.style.color = '#00c896'; }}
-    }} else if (lbl.textContent.trim() === 'BEAR STRENGTH') {{
-      const bPct = clamp(d.bearPct,10,97);
-      if (fill) fill.style.width = bPct + '%';
-      if (num)  {{ num.textContent = d.bearPct + '%'; num.style.color = '#ff6b6b'; }}
-    }}
-  }});
-  // Bias chip & scores in h-stat-bottom
-  const bColMap = {{ BULLISH:'#00c896', BEARISH:'#ff6b6b', SIDEWAYS:'#6480ff' }};
-  const bCol  = bColMap[d.bias] || '#6480ff';
-  const bBg   = d.bias==='BULLISH'?'rgba(0,200,150,.08)': d.bias==='BEARISH'?'rgba(255,107,107,.08)':'rgba(100,128,255,.08)';
-  const bBdr  = d.bias==='BULLISH'?'rgba(0,200,150,.22)': d.bias==='BEARISH'?'rgba(255,107,107,.22)':'rgba(100,128,255,.22)';
-  const bArrow= d.bias==='BULLISH'?'▲': d.bias==='BEARISH'?'▼':'◆';
-  const chips = document.querySelectorAll('.h-chip');
-  chips.forEach(chip=>{{
-    if (chip.textContent.includes('▲')||chip.textContent.includes('▼')||chip.textContent.includes('◆')||
-        chip.textContent.includes('BULLISH')||chip.textContent.includes('BEARISH')||chip.textContent.includes('SIDEWAYS')) {{
-      chip.textContent = bArrow + '\u00a0' + d.bias;
-      chip.style.color  = bCol; chip.style.background = bBg; chip.style.borderColor = bBdr;
-    }} else if (chip.textContent.includes('CONF')) {{
-      chip.textContent = d.biasConf + '\u00a0CONF';
-    }}
-  }});
-  const scoreEl = document.querySelector('.h-score');
-  if (scoreEl) scoreEl.textContent = 'Bull\u00a0'+d.bullScore+' · Bear\u00a0'+d.bearScore+' · Diff\u00a0'+(d.diff>=0?'+':'')+d.diff;
-  // ─────────────────────────────────────────────────────────────
-  OC.spot=d.spot; OC.atm=d.atm; OC.pcr=d.pcr; OC.maxPain=d.maxPain;
-  OC.maxCeStrike=d.maxCeStrike; OC.maxPeStrike=d.maxPeStrike;
-  OC.support=d.support; OC.resistance=d.resistance;
-  OC.strongSup=d.strongSup; OC.strongRes=d.strongRes;
-  OC.bias=d.bias; OC.biasConf=d.biasConf;
-  OC.bullScore=d.bullScore; OC.bearScore=d.bearScore;
-  OC.lotSize=d.lotSize; OC.strikeStep=d.strikeStep; OC.instName=d.name; OC.strikes=d.strikes; OC.expiry=d.expiry;
-  Object.keys(STRIKE_MAP).forEach(k=>delete STRIKE_MAP[k]);
-  OC.strikes.forEach(s=>{{ STRIKE_MAP[s.strike]=s; }});
-  Object.keys(ALL_EXPIRY_DATA).forEach(k=>delete ALL_EXPIRY_DATA[k]);
-  if (d.allExpiry) Object.assign(ALL_EXPIRY_DATA, d.allExpiry);
-  document.querySelectorAll('.h-stat-val[data-stat="spot"]').forEach(el=>{{el.textContent='\u20b9'+d.spot.toLocaleString('en-IN',{{minimumFractionDigits:2}});}});
-  document.querySelectorAll('.h-stat-val[data-stat="atm"]').forEach(el=>{{el.textContent='\u20b9'+d.atm.toLocaleString('en-IN');}});
-  document.querySelectorAll('.h-stat-val[data-stat="expiry"]').forEach(el=>{{el.textContent=d.expiry;}});
-  document.querySelectorAll('.h-stat-val[data-stat="pcr"]').forEach(el=>{{el.textContent=d.pcr.toFixed(3);}});
-  document.querySelectorAll('.h-stat-val[data-stat="maxpain"]').forEach(el=>{{el.textContent='\u20b9'+d.maxPain.toLocaleString('en-IN');}});
-  document.querySelectorAll('.h-stat-lbl[data-stat="spot"]').forEach(el=>{{el.textContent=d.name+' SPOT';}});
-  document.querySelectorAll('.sc-card.expanded').forEach(c=>c.classList.remove('expanded'));
-  if (typeof initAllCards==='function') initAllCards();
-  ['bullish','bearish','nondirectional'].forEach(c=>{{if(typeof sortGridByPoP==='function') sortGridByPoP(c);}});
-  if (hdr) {{ hdr.style.color=sym==='BANKNIFTY'?'#00c896':'#8aa0ff'; setTimeout(()=>{{hdr.style.color='';}},1200); }}
-}}
-</script>
-{greeks_script}
-{fn_greeks_script_str.replace('window.greeksUpdateStrike', 'window._fnGreeksUpdate') if fn_greeks_script_str else ""}
-{ANIMATED_JS}
-</body>
-</html>"""
-
-
-# =================================================================
-#  SECTION 11 -- MAIN
-# =================================================================
 
 def main():
-    ts = ist_timestamp_str()
-    print("=" * 65)
-    print("  NSE OPTIONS DASHBOARD — v20.0 · BankNifty + FinNifty")
-    print("  Expiry: LAST TUESDAY OF THE MONTH (monthly cycle)")
-    print(f"  {ts}")
-    print(f"  IST Date: {today_ist()}  IST Weekday: {ist_weekday()}")
-    print("=" * 65)
-
-    import calendar as _cal
-    from datetime import date as _date2
-    today = today_ist()
-
-    def _last_tue(year, month):
-        last_day = _cal.monthrange(year, month)[1]
-        d = _date2(year, month, last_day)
-        while d.weekday() != 1:
-            d -= timedelta(days=1)
-        return d
-
-    this_last_tue = _last_tue(today.year, today.month)
-    if today > this_last_tue:
-        nm = today.month + 1 if today.month < 12 else 1
-        ny = today.year if today.month < 12 else today.year + 1
-        this_last_tue = _last_tue(ny, nm)
-
-    print("\n[0/6] Holiday Awareness Check...")
-    if is_nse_holiday(this_last_tue):
-        reason = NSE_HOLIDAYS_2026.get(this_last_tue.strftime("%d-%b-%Y"), "Holiday")
-        prev_td = get_prev_trading_day(this_last_tue)
-        print(f"  ⚠ {this_last_tue.strftime('%d-%b-%Y')} (Last Tue) = {reason}")
-        print(f"  ✓ Expiry shifted to {prev_td.strftime('%d-%b-%Y')} ({prev_td.strftime('%A')})")
-    else:
-        print(f"  ✓ {this_last_tue.strftime('%d-%b-%Y')} (Last Tue of month) is a normal trading day.")
-
-    # ═══════════════════════════════════════════════
-    # STEP 1 — BANKNIFTY
-    # ═══════════════════════════════════════════════
-    print("\n[1/6] Fetching BankNifty Option Chain...")
-    nse_bn = NSEOptionChain(symbol="BANKNIFTY")
-    bn_oc_raw, nse_session, nse_headers = nse_bn.fetch()
-
-    print("\n[2/6] Fetching India VIX...")
-    vix_data = fetch_india_vix(nse_session, nse_headers)
-    live_vix = vix_data["value"] if vix_data else 18.0
-
-    print("\n  Fetching BankNifty multi-expiry data...")
-    time.sleep(1.5)
-    bn_multi_raw, bn_expiry_list = nse_bn.fetch_multiple_expiries(nse_session, nse_headers, n=15)
-    print(f"  BN Expiry list: {bn_expiry_list}")
-
-    bn_multi_analyzed = {}
-    for exp, raw in bn_multi_raw.items():
-        analyzed = analyze_option_chain(raw, vix=live_vix)
-        if analyzed:
-            bn_multi_analyzed[exp] = analyzed
-            print(f"    BN {exp}: ATM={analyzed['atm_strike']} PCR={analyzed['pcr_oi']:.3f}")
-
-    bn_analysis = analyze_option_chain(bn_oc_raw, vix=live_vix) if bn_oc_raw else None
-    if bn_analysis:
-        print(f"  BN OK Spot={bn_analysis['underlying']:.2f} ATM={bn_analysis['atm_strike']} PCR={bn_analysis['pcr_oi']:.3f}")
-
-    print("\n[3/6] BankNifty Technical Indicators...")
-    bn_tech = get_technical_data(yf_ticker="^NSEBANK")
-    if bn_tech:
-        print(f"  BN Support={bn_tech['support']:.0f}  Resistance={bn_tech['resistance']:.0f}")
-
-    print("\n[4/6] BankNifty Market Direction...")
-    bn_md = compute_market_direction(bn_tech, bn_analysis)
-    print(f"  BN Bias={bn_md['bias']}  Conf={bn_md['confidence']}  Bull={bn_md['bull']}  Bear={bn_md['bear']}")
-
-    # ═══════════════════════════════════════════════
-    # STEP 2 — FINNIFTY
-    # ═══════════════════════════════════════════════
-    print("\n[5/6] Fetching FinNifty Option Chain...")
-    fn_analysis = None
-    fn_tech = None
-    fn_md = None
-    fn_multi_analyzed = {}
-    fn_expiry_list = []
     try:
-        nse_fn = NSEOptionChain(symbol="FINNIFTY")
-        fn_oc_raw, fn_session, fn_headers = nse_fn.fetch()
-        time.sleep(1.5)
-        fn_multi_raw, fn_expiry_list = nse_fn.fetch_multiple_expiries(fn_session, fn_headers, n=15)
-        print(f"  FN Expiry list: {fn_expiry_list}")
-        for exp, raw in fn_multi_raw.items():
-            analyzed = analyze_option_chain(raw, vix=live_vix)
-            if analyzed:
-                fn_multi_analyzed[exp] = analyzed
-                print(f"    FN {exp}: ATM={analyzed['atm_strike']} PCR={analyzed['pcr_oi']:.3f}")
-        fn_analysis = analyze_option_chain(fn_oc_raw, vix=live_vix) if fn_oc_raw else None
-        if fn_analysis:
-            print(f"  FN OK Spot={fn_analysis['underlying']:.2f} ATM={fn_analysis['atm_strike']} PCR={fn_analysis['pcr_oi']:.3f}")
-        fn_tech = get_technical_data(yf_ticker="^CNXFIN")
-        if fn_tech:
-            print(f"  FN Support={fn_tech['support']:.0f}  Resistance={fn_tech['resistance']:.0f}")
-        fn_md = compute_market_direction(fn_tech, fn_analysis)
-        print(f"  FN Bias={fn_md['bias']}  Conf={fn_md['confidence']}  Bull={fn_md['bull']}  Bear={fn_md['bear']}")
+        print("\n🚀 Starting BankNifty Analysis...\n")
+        analyzer = BankNiftyHTMLAnalyzer()
+        analyzer.generate_full_report()
+
+        # ── AUTO-calculate volume at support/resistance ────────────
+        print("\n📦 Auto-calculating volume at key levels...")
+        vol_support, vol_resistance = fetch_volume_at_levels(analyzer.html_data)
+        global_bias = fetch_global_bias()
+        vol_view    = "normal"
+        # ──────────────────────────────────────────────────────────
+
+        print("\n" + "=" * 70)
+        save_ok = analyzer.save_html_to_file(
+            'index_banknifty.html',
+            vol_support=vol_support, vol_resistance=vol_resistance,
+            global_bias=global_bias, vol_view=vol_view
+        )
+        if save_ok:
+            analyzer.send_html_email_report(vol_support, vol_resistance, global_bias, vol_view)
+        else:
+            print("\n⚠️  Skipping email due to save failure")
+        print("\n✅ Done! Open index_banknifty.html in your browser.")
+        print("\n💡 AUTO-REFRESH (Option 2) is active.")
+        print("   ➤ Serve the folder with:  python -m http.server 8000")
+        print("   ➤ Then open:              http://localhost:8000")
+        print("   ➤ Page will auto-reload whenever you re-run this script.\n")
     except Exception as e:
-        print(f"  WARNING FinNifty fetch failed: {e}. Dashboard will still show BankNifty data.")
-
-    # Use BN as primary for OI dashboard / charts / hero widget
-    tech       = bn_tech
-    oc_analysis= bn_analysis
-    md         = bn_md
-    multi_expiry_analyzed = bn_multi_analyzed
-    expiry_list = bn_expiry_list
-
-    print("\n[6/6] Generating Dual-Instrument Dashboard...")
-    html = generate_html(
-        tech, oc_analysis, md, ts,
-        vix_data=vix_data,
-        multi_expiry_analyzed=multi_expiry_analyzed,
-        expiry_list=expiry_list,
-        instrument="BANKNIFTY",
-        lot_size=30,
-        fn_oc=fn_analysis,
-        fn_md=fn_md,
-        fn_tech=fn_tech,
-        fn_multi_expiry=fn_multi_analyzed,
-        fn_expiry_list=fn_expiry_list,
-    )
-
-    os.makedirs("docs", exist_ok=True)
-    out = os.path.join("docs", "index.html")
-    with open(out, "w", encoding="utf-8") as f:
-        f.write(html)
-    print(f"  Saved: {out}  ({len(html)/1024:.1f} KB)")
-
-    meta = {
-        "timestamp":       ts,
-        "generated_at":    int(time.time()),
-        "ist_date":        str(today_ist()),
-        "ist_weekday":     ist_weekday(),
-        # BankNifty
-        "bn_bias":         bn_md["bias"],
-        "bn_confidence":   bn_md["confidence"],
-        "bn_price":        round(bn_tech["price"], 2)          if bn_tech     else None,
-        "bn_expiry":       bn_analysis["expiry"]               if bn_analysis else None,
-        "bn_pcr":          bn_analysis["pcr_oi"]               if bn_analysis else None,
-        "bn_atm_strike":   bn_analysis["atm_strike"]           if bn_analysis else None,
-        # FinNifty
-        "fn_bias":         fn_md["bias"]                       if fn_md       else None,
-        "fn_confidence":   fn_md["confidence"]                 if fn_md       else None,
-        "fn_price":        round(fn_tech["price"], 2)          if fn_tech     else None,
-        "fn_expiry":       fn_analysis["expiry"]               if fn_analysis else None,
-        "fn_pcr":          fn_analysis["pcr_oi"]               if fn_analysis else None,
-        "fn_atm_strike":   fn_analysis["atm_strike"]           if fn_analysis else None,
-        # Shared
-        "india_vix":       vix_data["value"]                   if vix_data    else None,
-    }
-    with open(os.path.join("docs", "latest.json"), "w") as f:
-        json.dump(meta, f, indent=2)
-    print("  Saved: docs/latest.json")
-    print("\n" + "=" * 65)
-    print(f"  DONE  |  v20.0 · BankNifty + FinNifty · Holiday-Aware Expiry")
-    print(f"  BN Bias: {bn_md['bias']}  |  FN Bias: {fn_md['bias'] if fn_md else 'N/A'}")
-    print("  Holiday list: 2026 NSE official holidays pre-loaded")
-    print("  Logic: Last Tuesday holiday → Monday → Friday (fallback)")
-    print("=" * 65 + "\n")
+        print(f"\n❌ Critical Error: {e}")
+        import traceback; traceback.print_exc()
 
 
 if __name__ == "__main__":
