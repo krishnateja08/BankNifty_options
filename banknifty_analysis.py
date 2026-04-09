@@ -3256,21 +3256,34 @@ class BankNiftyHTMLAnalyzer:
             print(f"  ⚠️  Session warm-up warning: {e}")
         return session, headers
 
-    def get_upcoming_expiry_wednesday(self):
+    def get_upcoming_expiry_tuesday(self):
+        """BankNifty monthly expiry = LAST TUESDAY of the month.
+        If that Tuesday is an NSE holiday, shift to previous trading day."""
+        import calendar
         ist_tz      = pytz.timezone('Asia/Kolkata')
         now_ist     = datetime.now(ist_tz)
         today_ist   = now_ist.date()
-        weekday     = today_ist.weekday()
         past_cutoff = (now_ist.hour, now_ist.minute) >= (16, 0)
-        if weekday == 2 and not past_cutoff:
-            days_ahead = 0
-        elif weekday == 2 and past_cutoff:
-            days_ahead = 7
-        elif weekday < 2:
-            days_ahead = 2 - weekday
-        else:
-            days_ahead = 9 - weekday
-        raw_tuesday = today_ist + timedelta(days=days_ahead)
+
+        def last_tuesday_of_month(year, month):
+            """Find the last Tuesday (weekday=1) of the given month."""
+            last_day = calendar.monthrange(year, month)[1]
+            d = date(year, month, last_day)
+            while d.weekday() != 1:  # 1 = Tuesday
+                d -= timedelta(days=1)
+            return d
+
+        # Get last Tuesday of current month
+        raw_tuesday = last_tuesday_of_month(today_ist.year, today_ist.month)
+
+        # If today is past this month's expiry (or it's expiry day past cutoff), use next month
+        if today_ist > raw_tuesday or (today_ist == raw_tuesday and past_cutoff):
+            if today_ist.month == 12:
+                raw_tuesday = last_tuesday_of_month(today_ist.year + 1, 1)
+            else:
+                raw_tuesday = last_tuesday_of_month(today_ist.year, today_ist.month + 1)
+
+        # Holiday adjustment: if last Tuesday is an NSE holiday, shift to previous trading day
         candidate = raw_tuesday
         for _ in range(6):
             cstr       = candidate.strftime('%d-%b-%Y')
@@ -3278,11 +3291,12 @@ class BankNiftyHTMLAnalyzer:
             if cstr not in NSE_FO_HOLIDAYS and not is_weekend:
                 break
             candidate -= timedelta(days=1)
+
         expiry_str = candidate.strftime('%d-%b-%Y')
         holiday_shifted = (candidate != raw_tuesday)
         shift_note = f" ⚠️ HOLIDAY SHIFT from {raw_tuesday.strftime('%d-%b-%Y')}" if holiday_shifted else ""
         print(f"  📅 Now (IST): {now_ist.strftime('%A %d-%b-%Y %H:%M')} | "
-              f"Raw Tue: {raw_tuesday.strftime('%d-%b-%Y')} | "
+              f"Last Tue: {raw_tuesday.strftime('%d-%b-%Y')} | "
               f"Adjusted expiry: {expiry_str}{shift_note} | "
               f"Past 4PM: {past_cutoff}")
         return expiry_str
@@ -3310,7 +3324,7 @@ class BankNiftyHTMLAnalyzer:
             if result:
                 return result
             print(f"  ⚠️  Chain data empty for live expiry {real_expiry}. Trying fallback...")
-        computed_expiry = self.get_upcoming_expiry_wednesday()
+        computed_expiry = self.get_upcoming_expiry_tuesday()
         if computed_expiry != real_expiry:
             print(f"  🔄 Fallback computed expiry: {computed_expiry}")
             result = self._fetch_chain_for_expiry(session, headers, computed_expiry)
