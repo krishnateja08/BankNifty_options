@@ -53,45 +53,29 @@ NSE_FO_HOLIDAYS = {
 #  BANKNIFTY ANALYSIS — DATA & HTML
 # ═══════════════════════════════════════════════════════════════════════════════
 
-NIFTY50_SYMBOLS = [
-    ("ADANIPORTS", "ADANIPORTS.NS"), ("APOLLOHOSP", "APOLLOHOSP.NS"),
-    ("ASIANPAINT", "ASIANPAINT.NS"), ("AXISBANK",   "AXISBANK.NS"),
-    ("BAJAJ-AUTO","BAJAJ-AUTO.NS"),  ("BAJAJFINSV", "BAJAJFINSV.NS"),
-    ("BAJFINANCE","BAJFINANCE.NS"),  ("BEL",        "BEL.NS"),
-    ("BHARTIARTL","BHARTIARTL.NS"), ("CIPLA",       "CIPLA.NS"),
-    ("COALINDIA", "COALINDIA.NS"),  ("DRREDDY",     "DRREDDY.NS"),
-    ("EICHERMOT", "EICHERMOT.NS"),  ("ETERNAL",     "ETERNAL.NS"),
-    ("GRASIM",    "GRASIM.NS"),     ("HCLTECH",     "HCLTECH.NS"),
-    ("HDFCBANK",  "HDFCBANK.NS"),   ("HDFCLIFE",    "HDFCLIFE.NS"),
-    ("HEROMOTOCO","HEROMOTOCO.NS"), ("HINDALCO",    "HINDALCO.NS"),
-    ("HINDUNILVR","HINDUNILVR.NS"), ("ICICIBANK",   "ICICIBANK.NS"),
-    ("INDIGO",    "INDIGO.NS"),     ("INFY",        "INFY.NS"),
-    ("ITC",       "ITC.NS"),        ("JIOFIN",      "JIOFIN.NS"),
-    ("JSWSTEEL",  "JSWSTEEL.NS"),   ("KOTAKBANK",   "KOTAKBANK.NS"),
-    ("LT",        "LT.NS"),         ("M&M",         "M&M.NS"),
-    ("MARUTI",    "MARUTI.NS"),     ("MAXHEALTH",   "MAXHEALTH.NS"),
-    ("NESTLEIND", "NESTLEIND.NS"),  ("NTPC",        "NTPC.NS"),
-    ("ONGC",      "ONGC.NS"),       ("POWERGRID",   "POWERGRID.NS"),
-    ("RELIANCE",  "RELIANCE.NS"),   ("SBILIFE",     "SBILIFE.NS"),
-    ("SBIN",      "SBIN.NS"),       ("SHRIRAMFIN",  "SHRIRAMFIN.NS"),
-    ("SUNPHARMA", "SUNPHARMA.NS"),  ("TATAMOTORS",  "TMCV.NS"),
-    ("TATAMOTORS",  "TMPV.NS"),
-    ("TATACONSUM","TATACONSUM.NS"), ("TATASTEEL",   "TATASTEEL.NS"),
-    ("TCS",       "TCS.NS"),        ("TECHM",       "TECHM.NS"),
-    ("TITAN",     "TITAN.NS"),      ("TRENT",       "TRENT.NS"),
-    ("ULTRACEMCO","ULTRACEMCO.NS"), ("WIPRO",       "WIPRO.NS"),
+BANKNIFTY_SYMBOLS = [
+    ("HDFCBANK",    "HDFCBANK.NS"),
+    ("ICICIBANK",   "ICICIBANK.NS"),
+    ("SBIN",        "SBIN.NS"),
+    ("AXISBANK",    "AXISBANK.NS"),
+    ("KOTAKBANK",   "KOTAKBANK.NS"),
+    ("BANKBARODA",  "BANKBARODA.NS"),
+    ("UNIONBANK",   "UNIONBANK.NS"),
+    ("PNB",         "PNB.NS"),
+    ("CANBK",       "CANBK.NS"),
+    ("FEDERALBNK",  "FEDERALBNK.NS"),
+    ("AUBANK",      "AUBANK.NS"),
+    ("INDUSINDBK",  "INDUSINDBK.NS"),
 ]
 
-# High-weightage stocks (top 15 by approximate Nifty weight)
+# High-weightage stocks (top 5 by BankNifty weight)
 HIGH_WEIGHTAGE = {
-    "RELIANCE", "HDFCBANK", "ICICIBANK", "INFY", "TCS",
-    "BHARTIARTL", "LT", "AXISBANK", "KOTAKBANK", "SBIN"
+    "HDFCBANK", "ICICIBANK", "SBIN", "AXISBANK", "KOTAKBANK"
 }
 
-# Fixed display order by Nifty index weight
+# Fixed display order by BankNifty index weight
 HIGH_WEIGHTAGE_ORDER = [
-    "RELIANCE", "HDFCBANK", "ICICIBANK", "INFY", "TCS",
-    "BHARTIARTL", "LT", "AXISBANK", "KOTAKBANK", "SBIN"
+    "HDFCBANK", "ICICIBANK", "SBIN", "AXISBANK", "KOTAKBANK"
 ]
 
 def fetch_heatmap_data():
@@ -99,18 +83,18 @@ def fetch_heatmap_data():
     Fetches live % change data for all 50 Nifty stocks using yfinance.
     Returns a list of dicts: {symbol, name, price, prev_close, change_pct, change_abs, volume}
     """
-    print("  📊 Fetching BankNifty heatmap data via yfinance...")
+    print("  📊 Fetching BankNifty 12 constituent data via yfinance...")
     results = []
-    tickers_str = " ".join([sym for _, sym in NIFTY50_SYMBOLS])
+    tickers_str = " ".join([sym for _, sym in BANKNIFTY_SYMBOLS])
     try:
         data = yf.download(tickers_str, period="5d", interval="1d",
                    group_by="ticker", auto_adjust=True, progress=False)
         ist_tz = pytz.timezone('Asia/Kolkata')
         timestamp = datetime.now(ist_tz).strftime('%d-%b-%Y %H:%M IST')
 
-        for name, sym in NIFTY50_SYMBOLS:
+        for name, sym in BANKNIFTY_SYMBOLS:
             try:
-                if len(NIFTY50_SYMBOLS) == 1:
+                if len(BANKNIFTY_SYMBOLS) == 1:
                     df = data
                 else:
                     df = data[sym] if sym in data.columns.get_level_values(0) else None
@@ -1039,8 +1023,8 @@ def build_heatmap_tab_html(heatmap_data, timestamp, advance, decline, neutral):
           <div class="hm-bs-donut-wrap">
             <canvas id="hmDonutCanvas" width="110" height="110"></canvas>
             <div class="hm-bs-donut-center">
-              <div class="hm-bs-donut-num">50</div>
-              <div class="hm-bs-donut-sub">STOCKS</div>
+              <div class="hm-bs-donut-num">12</div>
+              <div class="hm-bs-donut-sub">BANKS</div>
             </div>
           </div>
           <div class="hm-bs-right">
@@ -1179,16 +1163,9 @@ def get_heatmap_javascript():
 
     // Full BankNifty weight order — descending by approximate index weight
     var NIFTY_WEIGHT_ORDER = [
-        "HDFCBANK","RELIANCE","ICICIBANK","INFY","TCS",
-        "BHARTIARTL","LT","AXISBANK","SBIN","KOTAKBANK",
-        "BAJFINANCE","HINDUNILVR","MARUTI","SUNPHARMA","HCLTECH",
-        "TITAN","WIPRO","NTPC","M&M","ONGC",
-        "ULTRACEMCO","POWERGRID","TATAMOTORS","COALINDIA","ADANIPORTS",
-        "BAJAJ-AUTO","BAJAJFINSV","ETERNAL","GRASIM","ITC",
-        "JSWSTEEL","TATACONSUM","TATASTEEL","TECHM","DRREDDY",
-        "CIPLA","HINDALCO","EICHERMOT","SBILIFE","HDFCLIFE",
-        "JIOFIN","HEROMOTOCO","TRENT","MAXHEALTH","INDIGO",
-        "NESTLEIND","ASIANPAINT","SHRIRAMFIN","BEL","APOLLOHOSP"
+        "HDFCBANK","ICICIBANK","SBIN","AXISBANK","KOTAKBANK",
+        "BANKBARODA","UNIONBANK","PNB","CANBK","FEDERALBNK",
+        "AUBANK","INDUSINDBK"
     ];
 
     function renderHeatmap() {
@@ -1243,8 +1220,7 @@ def get_heatmap_javascript():
         // Update mover table
         // Update mover table — fixed Nifty weight order
         var WEIGHT_ORDER = [
-            "RELIANCE","HDFCBANK","ICICIBANK","INFY","TCS",
-            "BHARTIARTL","LT","AXISBANK","KOTAKBANK","SBIN"
+            "HDFCBANK","ICICIBANK","SBIN","AXISBANK","KOTAKBANK"
         ];
         var hwLookup = {};
         data.forEach(function(s){ if(s.high_wt) hwLookup[s.symbol] = s; });
@@ -1430,7 +1406,7 @@ def get_heatmap_css():
         .hm-br-bar-wrap{flex:1;height:4px;background:rgba(0,0,0,0.35);border-radius:2px;overflow:hidden;}
         .hm-br-bar{height:100%;border-radius:2px;transition:width 1s ease;}
         .hm-br-val{font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:700;width:20px;text-align:right;flex-shrink:0;}
-        .hm-grid{display:grid;grid-template-columns:repeat(10,minmax(0,1fr));gap:6px;margin-bottom:16px;}
+        .hm-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:6px;margin-bottom:16px;}
         .hm-cell{border-radius:10px;padding:10px 8px;cursor:default;transition:all 0.2s ease;position:relative;overflow:hidden;display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:72px;text-align:center;}
         .hm-cell:hover{transform:scale(1.06);z-index:10;box-shadow:0 8px 24px rgba(0,0,0,0.5);filter:brightness(1.15);}
         .hm-cell-sym{font-family:'Oxanium',sans-serif;font-size:clamp(8px,1.2vw,11px);font-weight:700;letter-spacing:0.3px;line-height:1.2;word-break:break-word;}
@@ -1455,15 +1431,15 @@ def get_heatmap_css():
         .hm-idx-btn{padding:7px 18px;font-family:'Oxanium',sans-serif;font-size:11px;font-weight:700;letter-spacing:2px;color:rgba(176,190,197,0.5);background:transparent;border:1px solid rgba(79,195,247,0.2);border-radius:8px;cursor:pointer;transition:all 0.2s ease;}
         .hm-idx-btn:hover{color:#4fc3f7;border-color:rgba(79,195,247,0.5);background:rgba(79,195,247,0.08);}
         .hm-idx-btn.active{color:#00e5ff;border-color:rgba(79,195,247,0.6);background:rgba(79,195,247,0.15);box-shadow:0 0 10px rgba(79,195,247,0.1);}
-        @media(max-width:900px){.hm-grid{grid-template-columns:repeat(7,minmax(0,1fr));}}
+        @media(max-width:900px){.hm-grid{grid-template-columns:repeat(4,minmax(0,1fr));}}
         @media(max-width:600px){
-          .hm-grid{grid-template-columns:repeat(5,minmax(0,1fr));gap:4px;}
+          .hm-grid{grid-template-columns:repeat(3,minmax(0,1fr));gap:4px;}
           .hm-cell{min-height:58px;padding:8px 4px;}
           .hm-breadth-strip{flex-direction:column;align-items:flex-start;}
           div[style*="grid-template-columns:1fr 1fr"]{grid-template-columns:1fr!important;}
           .hm-bs-donut-wrap{align-self:center;}
         }
-        @media(max-width:400px){.hm-grid{grid-template-columns:repeat(4,minmax(0,1fr));}}
+        @media(max-width:400px){.hm-grid{grid-template-columns:repeat(2,minmax(0,1fr));}}
 """
 
 
@@ -7828,7 +7804,7 @@ function mobNavTo(secId, tabId, label) {
                 <span class="tab-dot"></span> &#128200; Main Analysis <span class="tab-badge">LIVE</span>
             </button>
             <button class="tab-btn" data-tab="heatmap" onclick="switchTab('heatmap')">
-                <span class="tab-dot"></span> &#127956; Heatmap <span class="tab-badge">LIVE</span>
+                <span class="tab-dot"></span> &#127956; Bank Stocks <span class="tab-badge">LIVE</span>
             </button>
             <button class="tab-btn" data-tab="oi-trend" onclick="switchTab('oi-trend')">
                 <span class="tab-dot"></span> &#128202; Intraday OI <span class="tab-badge">IST</span>
@@ -7992,7 +7968,7 @@ function mobNavTo(secId, tabId, label) {
         <div class="nsb-mob-item" id="nsmd-technical" onclick="mobNavTo('technical','main','&#128269; Technical')">&#128269; Technical</div>
         <div class="nsb-mob-item" id="nsmd-optchain" onclick="mobNavTo('optchain','main','&#127919; Option Chain')">&#127919; Option Chain</div>
         <div class="nsb-group" style="padding:10px 18px 4px;">OTHER VIEWS</div>
-        <div class="nsb-mob-item" id="nsmd-heatmap" onclick="mobNavTo('heatmap','heatmap','&#127956; Heatmap')">&#127956; Heatmap</div>
+        <div class="nsb-mob-item" id="nsmd-heatmap" onclick="mobNavTo('heatmap','heatmap','&#127956; Bank Stocks')">&#127956; Bank Stocks</div>
         <div class="nsb-mob-item" id="nsmd-oitrend" onclick="mobNavTo('oitrend','oi-trend','&#128202; Intraday OI')">&#128202; Intraday OI</div>
         <div class="nsb-mob-item" id="nsmd-weekly" onclick="mobNavTo('weekly','weekly','&#128197; Weekly Outlook')">&#128197; Weekly Outlook</div>
         <div class="nsb-mob-item" id="nsmd-checklist" onclick="mobNavTo('checklist','checklist','&#129504; Strategy')">&#129504; Strategy</div>
